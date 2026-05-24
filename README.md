@@ -1,5 +1,7 @@
 # opaque
 
+> **Status:** v0.1.0 — alpha. Linux only for now; macOS Keychain backend planned for v1.1.
+
 An **AI-safe secrets CLI** — stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
 
 ```
@@ -110,6 +112,14 @@ v1 ships with the Secret Service backend (libsecret over D-Bus) for Linux. The `
 ## Audit log
 
 `${XDG_STATE_HOME:-$HOME/.local/state}/opq/audit.log`, mode 0600. One JSON object per line. Actions: `set`, `get`, `delete`, `list`, `exec_inject`, `mcp_run`, `redaction_disabled`, `denied`.
+
+Example entry:
+
+```json
+{"ts":"2026-05-24T15:50:17.189Z","action":"exec_inject","secret_name":"openai_api_key","caller":"cli","pid":50770,"ppid":50701}
+```
+
+`caller` is `cli` for direct CLI invocations and `mcp` when the request came through the MCP server, so you can distinguish AI-driven access from human-driven access at a glance.
 
 ## Memory hygiene
 
