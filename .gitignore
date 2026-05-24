@@ -1,0 +1,4 @@
+/opq
+*.test
+*.out
+coverage.txt
