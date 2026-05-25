@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/99designs/keyring"
+	"github.com/awnumar/memguard"
 )
 
 // Backend abstracts a secrets store. v1 ships one implementation
@@ -79,7 +80,7 @@ func (b *keyringBackend) Set(_ context.Context, name string, value *Buffer) erro
 	plain := value.Bytes()
 	local := make([]byte, len(plain))
 	copy(local, plain)
-	defer wipe(local)
+	defer memguard.WipeBytes(local)
 
 	err := b.kr.Set(keyring.Item{
 		Key:         name,
@@ -112,10 +113,20 @@ func (b *keyringBackend) List(_ context.Context) ([]string, error) {
 	return keys, nil
 }
 
-// wipe overwrites s with zeros. Best-effort — Go's compiler may still optimize
-// some cases, which is why secrets never live in plain []byte for long.
-func wipe(s []byte) {
-	for i := range s {
-		s[i] = 0
+// sanitizeBackendErr maps any backend error to one of a fixed
+// taxonomy of strings safe to write to the audit log. We deliberately
+// never put raw err.Error() into the audit Message, because:
+//
+//	(a) a buggy or future malicious backend could embed secret bytes
+//	    in its error text, which would then be visible via the
+//	    AI-callable audit_tail MCP tool;
+//	(b) operators parsing audit messages benefit from a stable taxonomy.
+//
+// The wrapped error returned to the caller still carries the full
+// detail — only the audit-log Message goes through this filter.
+func sanitizeBackendErr(err error) string {
+	if errors.Is(err, ErrSecretNotFound) {
+		return "not_found"
 	}
+	return "backend_error"
 }

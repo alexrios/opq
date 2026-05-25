@@ -40,9 +40,9 @@ func TestCheckInteractiveGate_AllowsHappyPath(t *testing.T) {
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	err, reason := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
 	if err != nil {
-		t.Fatalf("expected gate pass, got err=%v reason=%q", err, reason)
+		t.Fatalf("expected gate pass, got err=%v userReason=%q auditReason=%q", err, userReason, auditReason)
 	}
 	if !strings.Contains(tty.outBuf.String(), confirmInputPrompt) {
 		t.Errorf("prompt not written: %q", tty.outBuf.String())
@@ -59,12 +59,15 @@ func TestCheckInteractiveGate_RefusesNonTTYStdout(t *testing.T) {
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	err, reason := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
-	if !strings.Contains(reason, "stdout") {
-		t.Errorf("reason should mention stdout, got %q", reason)
+	if !strings.Contains(userReason, "stdout") {
+		t.Errorf("user reason should mention stdout, got %q", userReason)
+	}
+	if auditReason != GateReasonStdoutNoTTY {
+		t.Errorf("audit reason = %q, want %q", auditReason, GateReasonStdoutNoTTY)
 	}
 }
 
@@ -75,12 +78,15 @@ func TestCheckInteractiveGate_RefusesMissingEnvVar(t *testing.T) {
 		envHumanFlag:   "",
 		openConfirmTTY: open,
 	}
-	err, reason := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
-	if !strings.Contains(reason, envHumanConfirm) {
-		t.Errorf("reason should mention env var, got %q", reason)
+	if !strings.Contains(userReason, envHumanConfirm) {
+		t.Errorf("user reason should mention env var, got %q", userReason)
+	}
+	if auditReason != GateReasonEnvMissing {
+		t.Errorf("audit reason = %q, want %q", auditReason, GateReasonEnvMissing)
 	}
 }
 
@@ -93,7 +99,7 @@ func TestCheckInteractiveGate_RefusesNonOneEnvVar(t *testing.T) {
 			envHumanFlag:   val,
 			openConfirmTTY: open,
 		}
-		err, _ := checkInteractiveGate("api_key", cfg)
+		_, _, err := checkInteractiveGate("api_key", cfg)
 		if err == nil {
 			t.Errorf("expected refusal for env value %q", val)
 		}
@@ -109,12 +115,15 @@ func TestCheckInteractiveGate_RefusesWhenTTYUnavailable(t *testing.T) {
 		envHumanFlag:   "1",
 		openConfirmTTY: openFail,
 	}
-	err, reason := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
-	if !strings.Contains(reason, "no controlling tty") {
-		t.Errorf("reason should mention missing tty, got %q", reason)
+	if !strings.Contains(userReason, "no controlling tty") {
+		t.Errorf("user reason should mention missing tty, got %q", userReason)
+	}
+	if auditReason != GateReasonNoTTY {
+		t.Errorf("audit reason = %q, want %q", auditReason, GateReasonNoTTY)
 	}
 }
 
@@ -125,12 +134,15 @@ func TestCheckInteractiveGate_RefusesOnNameMismatch(t *testing.T) {
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	err, reason := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
-	if !strings.Contains(reason, "mismatch") {
-		t.Errorf("reason should mention mismatch, got %q", reason)
+	if !strings.Contains(userReason, "mismatch") {
+		t.Errorf("user reason should mention mismatch, got %q", userReason)
+	}
+	if auditReason != GateReasonConfirmMismatch {
+		t.Errorf("audit reason = %q, want %q", auditReason, GateReasonConfirmMismatch)
 	}
 }
 
@@ -143,8 +155,8 @@ func TestCheckInteractiveGate_AcceptsCRLF(t *testing.T) {
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	if err, reason := checkInteractiveGate("api_key", cfg); err != nil {
-		t.Fatalf("expected gate pass with CRLF, got err=%v reason=%q", err, reason)
+	if userReason, auditReason, err := checkInteractiveGate("api_key", cfg); err != nil {
+		t.Fatalf("expected gate pass with CRLF, got err=%v userReason=%q auditReason=%q", err, userReason, auditReason)
 	}
 }
 
@@ -160,7 +172,7 @@ func TestCheckInteractiveGate_RefusesOnEOFBeforeNewline(t *testing.T) {
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	err, _ := checkInteractiveGate("api_key", cfg)
+	_, _, err := checkInteractiveGate("api_key", cfg)
 	if err == nil {
 		t.Fatal("expected refusal on empty TTY input")
 	}

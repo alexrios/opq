@@ -56,7 +56,7 @@ func (c *SetCmd) Run() error {
 	defer value.Destroy()
 
 	if err := backend.Set(ctx, c.Name, value); err != nil {
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Message: err.Error()})
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 		return err
 	}
 	_ = AppendAudit(AuditEvent{Action: ActionSet, SecretName: c.Name, Caller: callerTag()})

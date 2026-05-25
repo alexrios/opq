@@ -17,7 +17,7 @@ func (c *DeleteCmd) Run() error {
 		return err
 	}
 	if err := backend.Delete(ctx, c.Name); err != nil {
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: err.Error()})
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 		return err
 	}
 	_ = AppendAudit(AuditEvent{Action: ActionDelete, SecretName: c.Name, Caller: callerTag()})

@@ -1,10 +1,48 @@
+// Package main — audit log writer.
+//
+// LOCKING SCHEME (see also TestAppendAudit_MultiprocessFlock).
+//
+// Two layers protect the audit log from interleaved writes:
+//
+//	auditMu                       in-process serialization of the cached fd
+//	flock(auditLockFile, LOCK_EX) cross-process serialization
+//
+// The cross-process lock is held on a SEPARATE, never-rotated file at
+// ${audit_dir}/audit.lock, not on the audit.log fd itself. This matters
+// because rotation closes the audit.log fd and reopens a new one; Linux
+// flock is fd-bound, so a lock held on the audit.log fd would be silently
+// released the moment Close() runs, opening a window where a second
+// process can rotate over our partial state. The audit.lock fd is opened
+// once per process and never closed during normal operation, so the lock
+// it carries survives across as many audit.log rotations as we like.
+//
+// Reader symmetry: tailAudit takes auditMu (in-process write barrier)
+// AND LOCK_SH on a FRESHLY-OPENED fd of audit.lock for the duration of
+// BOTH file reads (active log plus, if needed, the rotated .log.1).
+// Without holding both across both reads, a concurrent writer could
+// rotate audit.log into audit.log.1 in the window between tailAudit's
+// two reads, causing the same physical inode to be read once as
+// audit.log and again as audit.log.1 — producing duplicate lines.
+//
+// Why a FRESH lock fd for the reader rather than the cached writer fd:
+// Linux flock locks are per-open-file-description. Two flock calls on
+// the SAME open-file-description (e.g., the process-global cached fd
+// shared by reader and writer code paths) do not block each other — the
+// writer could atomically upgrade LOCK_SH→LOCK_EX while the reader
+// believes it holds LOCK_SH. Opening a fresh fd gives the reader a
+// distinct open-file-description whose LOCK_SH properly competes with
+// the writer's LOCK_EX. The in-process auditMu handles the same-process
+// case; the cross-process case is what flock is for.
 package main
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -14,13 +52,14 @@ import (
 // AuditEvent is one line in the audit log. Designed to be JSON-stable so it
 // can be tailed and parsed by other tools.
 type AuditEvent struct {
-	Timestamp  time.Time `json:"ts"`
-	Action     string    `json:"action"`
-	SecretName string    `json:"secret_name,omitempty"`
-	Caller     string    `json:"caller,omitempty"`
-	PID        int       `json:"pid"`
-	PPID       int       `json:"ppid"`
-	Message    string    `json:"msg,omitempty"`
+	Timestamp   time.Time `json:"ts"`
+	Action      string    `json:"action"`
+	SecretName  string    `json:"secret_name,omitempty"`
+	SecretNames []string  `json:"secret_names,omitempty"`
+	Caller      string    `json:"caller,omitempty"`
+	PID         int       `json:"pid"`
+	PPID        int       `json:"ppid"`
+	Message     string    `json:"msg,omitempty"`
 }
 
 // Audit actions.
@@ -36,15 +75,35 @@ const (
 	ActionNetworkAllowed    = "network_allowed"
 )
 
+// Gate-failure reason taxonomy. Mirrors sanitizeBackendErr: only stable
+// keys ever reach the operator-facing (and AI-readable via audit_tail)
+// audit log Message. The user-facing error string keeps the verbose
+// form.
+const (
+	GateReasonNoTTY           = "tty_open_failed"
+	GateReasonTTYWrite        = "tty_write_failed"
+	GateReasonTTYRead         = "tty_read_failed"
+	GateReasonStdoutNoTTY     = "stdout_not_a_tty"
+	GateReasonEnvMissing      = "missing_human_confirm_env"
+	GateReasonConfirmMismatch = "confirmation_mismatch"
+)
+
 // auditRotateThreshold is the size in bytes at which the active audit log is
 // renamed to audit.log.1 and a fresh file is opened. Only one historical
 // rotation is kept; on rotation, any existing .log.1 is overwritten.
-const auditRotateThreshold = 10 * 1024 * 1024 // 10 MiB
+// Declared as var (not const) solely so race-condition tests can lower the
+// threshold to trigger rotations on demand; production code must not mutate it.
+var auditRotateThreshold int64 = 10 * 1024 * 1024 // 10 MiB
+
+// auditLockFileName is the name (relative to the audit dir) of the
+// rotation-immune lock file used for cross-process serialization.
+const auditLockFileName = "audit.lock"
 
 var (
-	auditMu        sync.Mutex
-	auditFile      *os.File
-	auditWarnOnce  sync.Once
+	auditMu       sync.Mutex
+	auditFile     *os.File
+	auditLockFile *os.File
+	auditWarnOnce sync.Once
 )
 
 // auditLogPath returns ${XDG_STATE_HOME:-$HOME/.local/state}/opq/audit.log.
@@ -68,10 +127,6 @@ func prepareAuditDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir audit dir: %w", err)
 	}
-	// Pre-check: if the bare path is a symlink (even one pointing to a
-	// directory), refuse explicitly. With O_NOFOLLOW|O_DIRECTORY, the open
-	// below returns ENOTDIR rather than ELOOP for a symlink-to-dir, which is
-	// a less obvious diagnostic.
 	if li, err := os.Lstat(dir); err == nil && li.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("audit dir %q is a symlink, refusing", dir)
 	}
@@ -93,7 +148,6 @@ func prepareAuditDir(dir string) error {
 	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
 		return fmt.Errorf("audit dir %q is not a directory, refusing", dir)
 	}
-	// Tighten pre-existing wide permissions via the open fd (no path race).
 	if err := syscall.Fchmod(fd, 0o700); err != nil {
 		return fmt.Errorf("fchmod audit dir: %w", err)
 	}
@@ -103,7 +157,7 @@ func prepareAuditDir(dir string) error {
 // rotateIfTooLargeLocked checks the size of the open audit file and, if it
 // exceeds the threshold, closes it, renames it to <path>.1 (atomically
 // overwriting any existing .1), and reopens a fresh file. Must be called
-// with auditMu held.
+// with auditMu held AND with LOCK_EX on auditLockFile.
 func rotateIfTooLargeLocked(path string) error {
 	if auditFile == nil {
 		return nil
@@ -116,12 +170,10 @@ func rotateIfTooLargeLocked(path string) error {
 		return nil
 	}
 	if err := auditFile.Close(); err != nil {
-		// Best-effort: clear and continue; reopen will fail loudly if path is wedged.
 		auditFile = nil
 		return fmt.Errorf("close audit log for rotation: %w", err)
 	}
 	auditFile = nil
-	// Rename is atomic on POSIX and overwrites the destination.
 	if err := os.Rename(path, path+".1"); err != nil {
 		return fmt.Errorf("rotate audit log: %w", err)
 	}
@@ -144,7 +196,6 @@ func openAuditFileLocked(path string) (*os.File, error) {
 		}
 		return nil, fmt.Errorf("open audit log: %w", err)
 	}
-	// Tighten pre-existing wide perms via fd (no path TOCTOU).
 	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("fchmod audit log: %w", err)
@@ -152,12 +203,9 @@ func openAuditFileLocked(path string) (*os.File, error) {
 	return f, nil
 }
 
-// openAuditFile opens (and caches) the audit log. Returns the cached handle
-// after the first successful call. Uses O_NOFOLLOW and fchmod to avoid
-// symlink-swap and TOCTOU races.
-func openAuditFile() (*os.File, error) {
-	auditMu.Lock()
-	defer auditMu.Unlock()
+// ensureAuditFileLocked returns the cached audit-log fd, opening it if
+// needed. Caller MUST hold auditMu.
+func ensureAuditFileLocked() (*os.File, error) {
 	if auditFile != nil {
 		return auditFile, nil
 	}
@@ -176,8 +224,49 @@ func openAuditFile() (*os.File, error) {
 	return f, nil
 }
 
-// appendAuditInternal performs the actual write. Split out so AppendAudit can
-// own the sync.Once warning policy without duplicating error paths.
+// ensureAuditLockFileLocked opens (and caches, process-global) the
+// rotation-immune lock file used by writers for cross-process
+// serialization. Caller MUST hold auditMu. The fd is intentionally
+// never closed during process lifetime; O_CLOEXEC ensures it does not
+// leak across exec. Readers use openAuditLockReaderLocked instead — see
+// the note there about Linux flock semantics on the same
+// open-file-description.
+func ensureAuditLockFileLocked() (*os.File, error) {
+	if auditLockFile != nil {
+		return auditLockFile, nil
+	}
+	path, err := auditLogPath()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(path)
+	if err := prepareAuditDir(dir); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(dir, auditLockFileName)
+	flags := os.O_CREATE | os.O_RDWR | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	f, err := os.OpenFile(lockPath, flags, 0o600)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("audit lock %q is a symlink, refusing", lockPath)
+		}
+		return nil, fmt.Errorf("open audit lock: %w", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("fchmod audit lock: %w", err)
+	}
+	auditLockFile = f
+	return f, nil
+}
+
+// appendAuditInternal performs the actual write. Locking layers:
+//
+//	auditMu                       in-process serialization
+//	flock(auditLockFile, LOCK_EX) cross-process serialization
+//
+// The lock fd is independent of the audit.log fd, so rotation (which
+// closes the audit.log fd) does not release our cross-process lock.
 func appendAuditInternal(ev AuditEvent) error {
 	if ev.Timestamp.IsZero() {
 		ev.Timestamp = time.Now().UTC()
@@ -194,9 +283,6 @@ func appendAuditInternal(ev AuditEvent) error {
 	}
 	line = append(line, '\n')
 
-	if _, err := openAuditFile(); err != nil {
-		return err
-	}
 	path, err := auditLogPath()
 	if err != nil {
 		return err
@@ -204,8 +290,21 @@ func appendAuditInternal(ev AuditEvent) error {
 
 	auditMu.Lock()
 	defer auditMu.Unlock()
-	// Check size before each write — long-running processes (MCP server) hold
-	// the fd open for the whole process lifetime.
+
+	lockFile, err := ensureAuditLockFileLocked()
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock audit lock: %w", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+
+	if _, err := ensureAuditFileLocked(); err != nil {
+		return err
+	}
 	if err := rotateIfTooLargeLocked(path); err != nil {
 		return err
 	}
@@ -215,7 +314,6 @@ func appendAuditInternal(ev AuditEvent) error {
 	if _, err := auditFile.Write(line); err != nil {
 		return fmt.Errorf("write audit log: %w", err)
 	}
-	// fsync after each write: secret-access events must survive crash/kill.
 	if err := auditFile.Sync(); err != nil {
 		return fmt.Errorf("fsync audit log: %w", err)
 	}
@@ -236,15 +334,106 @@ func AppendAudit(ev AuditEvent) error {
 	return err
 }
 
+// auditReadCap bounds a single audit-file read. The active log is capped
+// at auditRotateThreshold (10 MiB) and the rotated copy at the same; a
+// healthy install will never approach this. Hitting the cap implies an
+// externally planted or pre-rotation-bug file.
+const auditReadCap = 32 * 1024 * 1024
+
 // tailAudit returns the last n lines of the audit log as raw JSON strings.
-// Reads the entire file (audit logs stay small for an interactive tool); if
-// growth becomes a problem, switch to a reverse-seek implementation. Uses
-// O_NOFOLLOW to refuse symlinked paths.
+// Reads the active log first; if that alone cannot satisfy the request, it
+// prepends entries from the rotated .log.1 (if present).
+//
+// Locking: holds auditMu for the duration of both reads (in-process
+// serialization against concurrent writers) AND takes LOCK_SH on a
+// FRESHLY-OPENED fd of the lock file (cross-process serialization). The
+// cached process-global auditLockFile fd is NOT reused for the reader's
+// flock because Linux flock locks held on the same open-file-description
+// do not block each other within the same process — the writer could
+// then atomically upgrade LOCK_SH→LOCK_EX and rotate mid-read. A separate
+// open obtains a distinct open-file-description whose flock semantics
+// properly compete with the writer's. Audit logs stay small for an
+// interactive tool — if growth becomes a problem, switch to a
+// reverse-seek implementation.
 func tailAudit(n int) ([]string, error) {
 	path, err := auditLogPath()
 	if err != nil {
 		return nil, err
 	}
+	auditMu.Lock()
+	defer auditMu.Unlock()
+
+	readerLock, err := openAuditLockReaderLocked()
+	if err != nil {
+		return nil, err
+	}
+	// Close runs LAST (LIFO); LOCK_UN below must release the lock before the
+	// fd is closed, otherwise Close would release it implicitly.
+	defer readerLock.Close()
+	if err := syscall.Flock(int(readerLock.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, fmt.Errorf("flock audit lock: %w", err)
+	}
+	defer syscall.Flock(int(readerLock.Fd()), syscall.LOCK_UN)
+
+	lines, err := readAuditFileLinesLocked(path)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 && len(lines) >= n {
+		return lines[len(lines)-n:], nil
+	}
+	rotated, err := readAuditFileLinesLocked(path + ".1")
+	if err != nil {
+		return nil, err
+	}
+	combined := append(rotated, lines...)
+	if n > 0 && len(combined) > n {
+		combined = combined[len(combined)-n:]
+	}
+	return combined, nil
+}
+
+// openAuditLockReaderLocked opens a FRESH fd to the rotation-immune lock
+// file for the duration of one read. Distinct from the cached writer fd
+// so flock(LOCK_SH) on this fd properly competes with flock(LOCK_EX) on
+// the writer's fd (Linux flock is per-open-file-description; locks held
+// on the same description do not block within the same process). Caller
+// MUST hold auditMu and is responsible for closing the returned fd.
+func openAuditLockReaderLocked() (*os.File, error) {
+	path, err := auditLogPath()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Dir(path)
+	if err := prepareAuditDir(dir); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(dir, auditLockFileName)
+	// O_RDONLY is sufficient for flock(LOCK_SH); Linux open(2) accepts
+	// O_CREAT with O_RDONLY (the created file is empty and never written
+	// through this fd — the lock is the only purpose).
+	flags := os.O_CREATE | os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	f, err := os.OpenFile(lockPath, flags, 0o600)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("audit lock %q is a symlink, refusing", lockPath)
+		}
+		return nil, fmt.Errorf("open audit lock: %w", err)
+	}
+	// fchmod for symmetry with the writer path (defends against an existing
+	// lock file with looser perms; the create-mode only applies on creation).
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("fchmod audit lock: %w", err)
+	}
+	return f, nil
+}
+
+// readAuditFileLinesLocked opens path with O_NOFOLLOW|O_CLOEXEC, reads up
+// to auditReadCap bytes, and returns the split lines. Caller MUST already
+// hold auditMu and LOCK_SH (or LOCK_EX) on a reader lock fd. A missing
+// file returns (nil, nil); a file exceeding the cap returns an error.
+func readAuditFileLinesLocked(path string) ([]string, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -253,17 +442,39 @@ func tailAudit(n int) ([]string, error) {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("audit log %q is a symlink, refusing to read", path)
 		}
-		return nil, fmt.Errorf("open audit log: %w", err)
+		return nil, fmt.Errorf("open audit log %q: %w", path, err)
 	}
 	defer f.Close()
-	info, err := f.Stat()
+	data, err := io.ReadAll(io.LimitReader(f, auditReadCap+1))
 	if err != nil {
-		return nil, fmt.Errorf("stat audit log: %w", err)
-	}
-	data := make([]byte, info.Size())
-	if _, err := f.Read(data); err != nil && info.Size() > 0 {
 		return nil, fmt.Errorf("read audit log: %w", err)
 	}
+	if int64(len(data)) > auditReadCap {
+		return nil, fmt.Errorf("audit log too large (>%d bytes), refusing to read", auditReadCap)
+	}
+	return splitAuditLines(data), nil
+}
+
+// sanitizeExecStartErr maps os/exec start errors to a fixed audit-log
+// taxonomy. The wrapped error returned to the AI keeps the full text;
+// only the audit Message is sanitized to prevent caller-controlled
+// strings from polluting the operator-visible log.
+func sanitizeExecStartErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return "exec_not_found"
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return "exec_permission_denied"
+	}
+	return "exec_start_failed"
+}
+
+// splitAuditLines splits raw bytes into JSON-line records. Empty lines
+// are dropped; a final unterminated line (if any) is kept.
+func splitAuditLines(data []byte) []string {
 	var lines []string
 	start := 0
 	for i, b := range data {
@@ -277,8 +488,5 @@ func tailAudit(n int) ([]string, error) {
 	if start < len(data) {
 		lines = append(lines, string(data[start:]))
 	}
-	if n > 0 && len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return lines, nil
+	return lines
 }

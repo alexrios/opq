@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 
 	"golang.org/x/term"
 )
@@ -47,39 +48,37 @@ type getGateConfig struct {
 }
 
 // checkInteractiveGate runs the layered checks. On success, returns
-// (nil, ""). On failure, returns errInteractiveGate plus a short reason
-// string suitable for the audit log message.
-func checkInteractiveGate(name string, cfg getGateConfig) (error, string) {
+// ("", "", nil). On failure, returns a verbose user-facing reason, a
+// stable audit-log taxonomy key, and errInteractiveGate. Splitting
+// the user reason from the audit reason keeps verbose, possibly
+// caller-influenced text (e.g. raw /dev/tty errno strings) out of
+// the AI-readable audit log while still giving the operator at the
+// terminal an actionable message.
+func checkInteractiveGate(name string, cfg getGateConfig) (userReason, auditReason string, err error) {
 	if !cfg.stdoutIsTTY {
-		return errInteractiveGate, "stdout not a tty"
+		return "stdout not a tty", GateReasonStdoutNoTTY, errInteractiveGate
 	}
 	if cfg.envHumanFlag != "1" {
-		return errInteractiveGate, "missing OPQ_I_AM_HUMAN=1"
+		return "missing OPQ_I_AM_HUMAN=1", GateReasonEnvMissing, errInteractiveGate
 	}
-	r, w, closer, err := cfg.openConfirmTTY()
-	if err != nil {
-		return errInteractiveGate, "no controlling tty: " + err.Error()
+	r, w, closer, openErr := cfg.openConfirmTTY()
+	if openErr != nil {
+		return "no controlling tty: " + openErr.Error(), GateReasonNoTTY, errInteractiveGate
 	}
 	defer closer.Close()
-	// Prompt and read a line from the controlling terminal. The /dev/tty
-	// detour means redirected stdin (e.g. </dev/null) cannot satisfy this.
-	// In an interactive PTY the AI master can still see the prompt and
-	// reply, but combined with the inline env-var override the bar is
-	// "AI must explicitly prepend an env var AND type the secret name" —
-	// both visible in shell history and audit log.
-	if _, err := fmt.Fprintf(w, "%s", confirmInputPrompt); err != nil {
-		return errInteractiveGate, "tty write: " + err.Error()
+	if _, werr := fmt.Fprintf(w, "%s", confirmInputPrompt); werr != nil {
+		return "tty write: " + werr.Error(), GateReasonTTYWrite, errInteractiveGate
 	}
 	br := bufio.NewReader(r)
-	line, err := br.ReadString('\n')
-	if err != nil && err != io.EOF {
-		return errInteractiveGate, "tty read: " + err.Error()
+	line, rerr := br.ReadString('\n')
+	if rerr != nil && rerr != io.EOF {
+		return "tty read: " + rerr.Error(), GateReasonTTYRead, errInteractiveGate
 	}
 	got := strings.TrimRight(line, "\r\n")
 	if got != name {
-		return errInteractiveGate, "confirmation mismatch"
+		return "confirmation mismatch", GateReasonConfirmMismatch, errInteractiveGate
 	}
-	return nil, ""
+	return "", "", nil
 }
 
 // openControllingTTY opens /dev/tty for read/write. It returns an error if
@@ -87,7 +86,7 @@ func checkInteractiveGate(name string, cfg getGateConfig) (error, string) {
 // some CI runners). On systems without /dev/tty (Windows) this will fail —
 // acceptable because opaque's production target is linux.
 func openControllingTTY() (io.Reader, io.Writer, io.Closer, error) {
-	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	f, err := os.OpenFile("/dev/tty", os.O_RDWR|syscall.O_NOCTTY, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -104,13 +103,13 @@ func (c *GetCmd) Run() error {
 		envHumanFlag:   os.Getenv(envHumanConfirm),
 		openConfirmTTY: openControllingTTY,
 	}
-	if err, reason := checkInteractiveGate(c.Name, cfg); err != nil {
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: "get plaintext refused: " + reason})
+	if userReason, auditReason, err := checkInteractiveGate(c.Name, cfg); err != nil {
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: "get_plaintext_refused:" + auditReason})
 		return fmt.Errorf("refusing to release plaintext secret (%s). "+
 			"This command is gated to human operators: stdout must be a TTY, "+
 			"%s=1 must be set inline on the command (do NOT export it), and you "+
 			"must retype the secret name on the controlling terminal. "+
-			"Use `opq exec` to use the secret without exposing the value", reason, envHumanConfirm)
+			"Use `opq exec` to use the secret without exposing the value", userReason, envHumanConfirm)
 	}
 
 	ctx := context.Background()
@@ -120,7 +119,7 @@ func (c *GetCmd) Run() error {
 	}
 	val, err := backend.Get(ctx, c.Name)
 	if err != nil {
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: err.Error()})
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 		return err
 	}
 	defer val.Destroy()

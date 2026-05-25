@@ -58,7 +58,7 @@ func (c *ExecCmd) Run() error {
 		c.Command = c.Command[1:]
 	}
 	if len(c.Command) == 0 {
-		return errors.New("missing command to run; example: opq exec --env OPENAI_API_KEY=openai_api_key -- curl ...")
+		return errors.New("missing command to run (example: opq exec --env OPENAI_API_KEY=openai_api_key -- curl https://api.openai.com)")
 	}
 
 	envMappings, err := parseEnvMappings(c.Env)
@@ -88,7 +88,7 @@ func (c *ExecCmd) Run() error {
 	for _, m := range envMappings {
 		buf, err := backend.Get(ctx, m.secretName)
 		if err != nil {
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: m.secretName, Caller: callerTag(), Message: err.Error()})
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: m.secretName, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 			return fmt.Errorf("resolve %s: %w", m.secretName, err)
 		}
 		resolvedSecrets = append(resolvedSecrets, resolved{envName: m.envName, buf: buf})
@@ -158,7 +158,7 @@ func (c *ExecCmd) Run() error {
 
 	// Forward signals to the child so users can ^C cleanly.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 
 	if err := cmd.Start(); err != nil {
@@ -218,6 +218,9 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 		envName, secretName := s[:eq], s[eq+1:]
 		if !validEnvName(envName) {
 			return nil, fmt.Errorf("invalid env var name %q", envName)
+		}
+		if isBlockedEnvName(envName) {
+			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go); cannot be injected via --env", envName)
 		}
 		if seen[envName] {
 			return nil, fmt.Errorf("env var %q specified twice", envName)

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/awnumar/memguard"
 )
 
 func TestBuffer_RoundTrip(t *testing.T) {
@@ -68,5 +70,19 @@ func TestBuffer_FromReaderEmpty(t *testing.T) {
 	_, err := NewBufferFromReader(r)
 	if err == nil {
 		t.Error("expected error for empty value")
+	}
+}
+
+// TestWipeBytes_MemguardReplacement locks in the contract used by
+// backend.Set: WipeBytes overwrites the buffer in place with zeros.
+// If memguard ever changes this semantics, the transient-copy wipe in
+// keyringBackend.Set would silently degrade.
+func TestWipeBytes_MemguardReplacement(t *testing.T) {
+	b := []byte("sk-wipe-me-please")
+	memguard.WipeBytes(b)
+	for i, v := range b {
+		if v != 0 {
+			t.Fatalf("byte %d not zero after WipeBytes: %#x (full: %v)", i, v, b)
+		}
 	}
 }

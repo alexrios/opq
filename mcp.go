@@ -49,6 +49,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -258,13 +259,6 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			return errResult(fmt.Errorf("sandbox required but unavailable: %w", err)), runWithSecretsOutput{}, nil
 		}
 	}
-	if input.AllowNetwork {
-		_ = AppendAudit(AuditEvent{
-			Action:  ActionNetworkAllowed,
-			Caller:  callerTag(),
-			Message: fmt.Sprintf("command=%s args=%d", filepath.Base(input.Command), len(input.Args)),
-		})
-	}
 
 	backend, err := OpenDefaultBackend()
 	if err != nil {
@@ -283,13 +277,22 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}()
 
 	resolvedSecretNames := make([]string, 0, len(input.Env))
-	for envName, secretName := range input.Env {
+	envNames := make([]string, 0, len(input.Env))
+	for k := range input.Env {
+		envNames = append(envNames, k)
+	}
+	sort.Strings(envNames)
+	for _, envName := range envNames {
+		secretName := input.Env[envName]
 		if !validEnvName(envName) {
 			return errResult(fmt.Errorf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
 		}
+		if isBlockedEnvName(envName) {
+			return errResult(fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.)", envName)), runWithSecretsOutput{}, nil
+		}
 		buf, err := backend.Get(ctx, secretName)
 		if err != nil {
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: err.Error()})
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 			return errResult(fmt.Errorf("resolve %s: %w", secretName, err)), runWithSecretsOutput{}, nil
 		}
 		bufs = append(bufs, resolved{envName: envName, buf: buf})
@@ -333,6 +336,14 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		return errResult(fmt.Errorf("wrap command for sandbox: %w", err)), runWithSecretsOutput{}, nil
 	}
 
+	if input.AllowNetwork {
+		_ = AppendAudit(AuditEvent{
+			Action:  ActionNetworkAllowed,
+			Caller:  callerTag(),
+			Message: fmt.Sprintf("command=%s args=%d", filepath.Base(input.Command), len(input.Args)),
+		})
+	}
+
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, execCmd, execArgs...)
 	cmd.Env = childEnv
@@ -360,9 +371,10 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			// Still emit the audit entry below, then return an MCP error
 			// so the AI sees a clean failure.
 			_ = AppendAudit(AuditEvent{
-				Action:  ActionMCPRun,
-				Caller:  callerTag(),
-				Message: auditMCPRunMessage(resolvedSecretNames, -1, stdoutCap.Truncated(), stderrCap.Truncated(), false, elapsed, "start failed: "+runErr.Error()),
+				Action:      ActionMCPRun,
+				Caller:      callerTag(),
+				SecretNames: resolvedSecretNames,
+				Message:     auditMCPRunMessage(-1, stdoutCap.Truncated(), stderrCap.Truncated(), false, elapsed, sanitizeExecStartErr(runErr)),
 			})
 			return errResult(runErr), runWithSecretsOutput{}, nil
 		}
@@ -388,9 +400,10 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}
 
 	_ = AppendAudit(AuditEvent{
-		Action:  ActionMCPRun,
-		Caller:  callerTag(),
-		Message: auditMCPRunMessage(resolvedSecretNames, rawExit, out.StdoutTruncated, out.StderrTruncated, timedOut, elapsed, ""),
+		Action:      ActionMCPRun,
+		Caller:      callerTag(),
+		SecretNames: resolvedSecretNames,
+		Message:     auditMCPRunMessage(rawExit, out.StdoutTruncated, out.StderrTruncated, timedOut, elapsed, ""),
 	})
 
 	exitLabel := "success"
@@ -416,10 +429,10 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 // auditMCPRunMessage formats the human-operator-facing summary written
 // to the audit log after a run_with_secrets call. Includes the raw
 // exit code (so operators retain debugging signal that the AI never
-// sees), elapsed wall-clock, and any truncation/timeout flags.
-func auditMCPRunMessage(secrets []string, rawExit int, stdoutTrunc, stderrTrunc, timedOut bool, elapsed time.Duration, extra string) string {
+// sees), elapsed wall-clock, and any truncation/timeout flags. Secret
+// names live in AuditEvent.SecretNames, not in this message.
+func auditMCPRunMessage(rawExit int, stdoutTrunc, stderrTrunc, timedOut bool, elapsed time.Duration, extra string) string {
 	parts := []string{
-		fmt.Sprintf("secrets=%s", strings.Join(secrets, ",")),
 		fmt.Sprintf("raw_exit=%d", rawExit),
 		fmt.Sprintf("elapsed_ms=%d", elapsed.Milliseconds()),
 	}
@@ -459,8 +472,8 @@ type cappedWriter struct {
 	truncated bool
 }
 
-func newCappedWriter(inner io.Writer, cap int) *cappedWriter {
-	return &cappedWriter{inner: inner, remaining: cap}
+func newCappedWriter(inner io.Writer, limit int) *cappedWriter {
+	return &cappedWriter{inner: inner, remaining: limit}
 }
 
 func (c *cappedWriter) Write(p []byte) (int, error) {

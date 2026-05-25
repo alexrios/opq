@@ -6,11 +6,11 @@ import (
 )
 
 type AuditCmd struct {
-	Tail int `name:"tail" short:"n" default:"20" help:"Number of trailing entries to show. 0 = all."`
+	Tail int `name:"tail" short:"n" default:"20" help:"Number of trailing entries to show. Negative or 0 falls back to default (20)."`
 }
 
 func (c *AuditCmd) Run() error {
-	lines, err := tailAudit(c.Tail)
+	lines, err := tailAudit(clampAuditTailN(c.Tail))
 	if err != nil {
 		return err
 	}

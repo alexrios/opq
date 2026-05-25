@@ -189,6 +189,39 @@ func TestFilterParentEnv(t *testing.T) {
 	}
 }
 
+func TestParseEnvMappings_RejectsBlockedNames(t *testing.T) {
+	cases := []string{
+		"PATH=some_secret",
+		"LD_PRELOAD=some_secret",
+		"BASH_ENV=some_secret",
+		"GLIBC_TUNABLES=some_secret",
+		"NSS_HOSTS=some_secret",
+		"GIO_USE_VFS=some_secret",
+	}
+	for _, spec := range cases {
+		t.Run(spec, func(t *testing.T) {
+			_, err := parseEnvMappings([]string{spec})
+			if err == nil {
+				t.Fatalf("expected error for blocked spec %q, got nil", spec)
+			}
+			if !strings.Contains(err.Error(), "deny-list") {
+				t.Fatalf("expected deny-list in error, got %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestParseEnvMappings_LegitimateNameStillParses(t *testing.T) {
+	got, err := parseEnvMappings([]string{"OPENAI_API_KEY=openai_api_key"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []envMapping{{envName: "OPENAI_API_KEY", secretName: "openai_api_key"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mismatch:\n  got:  %#v\n  want: %#v", got, want)
+	}
+}
+
 func TestExitCodeError(t *testing.T) {
 	// Sanity check that the typed error reports the expected code and
 	// carries a non-empty message (kong.FatalIfErrorf would otherwise
