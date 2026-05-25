@@ -51,6 +51,7 @@ import (
 	"io/fs"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -292,7 +293,17 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}()
 
 	resolvedSecretNames := make([]string, 0, len(input.Env))
-	for envName, secretName := range input.Env {
+	// Sort env names so the "first failure" is stable across calls. Go's
+	// map iteration is randomized; without the sort the audit log would
+	// show a different first-rejected secret on every invocation, making
+	// failures non-reproducible.
+	envNames := make([]string, 0, len(input.Env))
+	for k := range input.Env {
+		envNames = append(envNames, k)
+	}
+	sort.Strings(envNames)
+	for _, envName := range envNames {
+		secretName := input.Env[envName]
 		if !validEnvName(envName) {
 			// H1: envName is AI-supplied but we already validated it is a
 			// simple identifier; safe to echo back for diagnostics.
@@ -353,7 +364,17 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 
 	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
 	if err != nil {
-		// H1: WrapCommand may include sandbox binary paths; sanitize.
+		// H1: WrapCommand may include sandbox binary paths; sanitize. But
+		// distinguish caller-fixable cases (binary missing / not executable)
+		// from infrastructure problems so the AI can act on its own input.
+		// WrapCommand's exec.LookPath wraps ErrNotFound and ErrPermission;
+		// errors.Is sees through the wrap.
+		if errors.Is(err, exec.ErrNotFound) {
+			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		if errors.Is(err, fs.ErrPermission) {
+			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
 		return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
 	}
 

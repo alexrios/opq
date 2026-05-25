@@ -293,15 +293,17 @@ func TestHandleRunWithSecrets_RejectsBlockedEnvNames(t *testing.T) {
 }
 
 // TestHandleRunWithSecrets_DeterministicEnvOrder verifies that the
-// env-name iteration is sorted so the "first resolve failure" is
-// stable across calls. Without sort.Strings, Go's randomized map
-// iteration would pick a different first key on most invocations,
-// turning the audit log into noise and making failures non-reproducible.
+// env-name iteration order is stable across calls. Without deterministic
+// iteration, Go's randomized map order would pick a different first key
+// on most invocations, turning the audit log into noise and making
+// failures non-reproducible.
 //
-// This test requires the env-iteration code path to actually run, which
-// in turn requires OpenDefaultBackend to succeed. In a sandboxed CI
-// without a Secret Service session that won't happen, so we skip when
-// the error text doesn't reach the "resolve" stage.
+// After H1 the AI-visible error for a missing secret is "not_found: <name>"
+// (was "resolve <name>: ..."). The test must accept either taxonomy form
+// to remain valid under both backend states. We require the result to be
+// IsError; if a backend setup fault yields a generic backend_error (no
+// per-name diagnostic), we skip — the env-iteration code path was reached
+// but doesn't surface a per-name signal we can compare.
 func TestHandleRunWithSecrets_DeterministicEnvOrder(t *testing.T) {
 	env := map[string]string{
 		"AAA": "no_such_a",
@@ -325,8 +327,12 @@ func TestHandleRunWithSecrets_DeterministicEnvOrder(t *testing.T) {
 			t.Skipf("expected IsError result; got %+v", res)
 		}
 		text := mcpResultText(res)
-		if !strings.HasPrefix(text, "resolve ") {
-			t.Skipf("backend unavailable in this environment (got %q); env-iteration path not exercised", text)
+		// Per-name diagnostic shapes after H1:
+		//   "not_found: <name>" (ErrSecretNotFound)
+		//   "resolve <name>: ..." (legacy text — kept for back-compat tests)
+		hasPerName := strings.HasPrefix(text, "not_found: ") || strings.HasPrefix(text, "resolve ")
+		if !hasPerName {
+			t.Skipf("backend yields no per-name diagnostic in this environment (got %q); env-iteration order not observable", text)
 		}
 		if i == 0 {
 			first = text

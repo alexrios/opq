@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -204,9 +205,14 @@ func TestSandboxNet_SiblingProcIsolation(t *testing.T) {
 
 	// Give A time to settle in its sandbox.
 	time.Sleep(500 * time.Millisecond)
-	// Verify A is still running; if it already exited the test would pass vacuously.
-	if cmdA.ProcessState != nil {
-		t.Fatalf("subprocess A exited before B could run (code %d) — isolation not tested", cmdA.ProcessState.ExitCode())
+	// Verify A is still running. cmd.ProcessState is only populated after
+	// Wait() returns, so cannot be used here; signal 0 on a live pid is a
+	// no-op that returns nil, on a dead pid it returns ESRCH. A live A is
+	// load-bearing for this test: without it, B's "canary not found in
+	// /proc" would pass vacuously because A's environ has already
+	// disappeared.
+	if err := cmdA.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("subprocess A is not alive (signal 0 failed: %v) — isolation not tested", err)
 	}
 
 	// Run B and collect output.
