@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -236,9 +237,8 @@ func TestHandleRunWithSecrets_RequiresCommand(t *testing.T) {
 }
 
 func TestAuditMCPRunMessage(t *testing.T) {
-	msg := auditMCPRunMessage([]string{"a", "b"}, 137, true, false, true, 1234*time.Millisecond, "")
+	msg := auditMCPRunMessage(137, true, false, true, 1234*time.Millisecond, "")
 	for _, want := range []string{
-		"secrets=a,b",
 		"raw_exit=137", // raw status preserved for operator
 		"elapsed_ms=1234",
 		"stdout_truncated=true",
@@ -250,6 +250,97 @@ func TestAuditMCPRunMessage(t *testing.T) {
 	}
 	if strings.Contains(msg, "stderr_truncated=true") {
 		t.Errorf("audit message should not contain stderr_truncated when false: %s", msg)
+	}
+	// Secret names now live on AuditEvent.SecretNames (not in the
+	// message); confirm they serialize under the expected JSON key.
+	ev := AuditEvent{Action: ActionMCPRun, SecretNames: []string{"a", "b"}, Message: msg}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"secret_names":["a","b"]`) {
+		t.Errorf("expected secret_names array in event JSON, got %s", raw)
+	}
+}
+
+func TestHandleRunWithSecrets_RejectsBlockedEnvNames(t *testing.T) {
+	cases := []string{
+		// exact-map entries
+		"PATH", "BASH_ENV",
+		// LD_ prefix
+		"LD_PRELOAD",
+		// ERL_ prefix (newly added)
+		"ERL_FLAGS",
+		"ERL_NEW_FUTURE_VAR",
+		// BASH_FUNC_ prefix (newly added); use a name valid per validEnvName
+		// (no %%) since validEnvName runs before isBlockedEnvName.
+		"BASH_FUNC_ls",
+		// GIT_CONFIG_ prefix (newly added)
+		"GIT_CONFIG_KEY_0",
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+				Command: "/bin/true",
+				Env:     map[string]string{name: "some_secret"},
+			})
+			if err != nil {
+				t.Fatalf("unexpected transport error: %v", err)
+			}
+			if res == nil || !res.IsError {
+				t.Fatalf("expected IsError result for blocked env %q, got %+v", name, res)
+			}
+			text := mcpResultText(res)
+			if !strings.Contains(text, "deny-list") {
+				t.Fatalf("expected deny-list message for %q, got %q", name, text)
+			}
+		})
+	}
+}
+
+// TestHandleRunWithSecrets_DeterministicEnvOrder verifies that the
+// env-name iteration is sorted so the "first resolve failure" is
+// stable across calls. Without sort.Strings, Go's randomized map
+// iteration would pick a different first key on most invocations,
+// turning the audit log into noise and making failures non-reproducible.
+//
+// This test requires the env-iteration code path to actually run, which
+// in turn requires OpenDefaultBackend to succeed. In a sandboxed CI
+// without a Secret Service session that won't happen, so we skip when
+// the error text doesn't reach the "resolve" stage.
+func TestHandleRunWithSecrets_DeterministicEnvOrder(t *testing.T) {
+	env := map[string]string{
+		"AAA": "no_such_a",
+		"BBB": "no_such_b",
+		"CCC": "no_such_c",
+		"DDD": "no_such_d",
+		"EEE": "no_such_e",
+	}
+
+	const trials = 10
+	var first string
+	for i := 0; i < trials; i++ {
+		res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+			Command: "/bin/true",
+			Env:     env,
+		})
+		if err != nil {
+			t.Fatalf("unexpected transport error: %v", err)
+		}
+		if res == nil || !res.IsError {
+			t.Skipf("expected IsError result; got %+v", res)
+		}
+		text := mcpResultText(res)
+		if !strings.HasPrefix(text, "resolve ") {
+			t.Skipf("backend unavailable in this environment (got %q); env-iteration path not exercised", text)
+		}
+		if i == 0 {
+			first = text
+			continue
+		}
+		if text != first {
+			t.Fatalf("nondeterministic env order across calls:\n  first: %q\n  got:   %q", first, text)
+		}
 	}
 }
 
