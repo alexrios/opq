@@ -219,6 +219,9 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 		if !validEnvName(envName) {
 			return nil, fmt.Errorf("invalid env var name %q", envName)
 		}
+		if isBlockedEnvName(envName) {
+			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go); cannot be injected via --env", envName)
+		}
 		if seen[envName] {
 			return nil, fmt.Errorf("env var %q specified twice", envName)
 		}

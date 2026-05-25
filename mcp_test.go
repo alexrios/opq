@@ -240,8 +240,9 @@ func TestHandleRunWithSecrets_RequiresCommand(t *testing.T) {
 }
 
 func TestAuditMCPRunMessage(t *testing.T) {
-	msg := auditMCPRunMessage(137, true, false, true, 1234*time.Millisecond, "")
+	msg := auditMCPRunMessage([]string{"a", "b"}, 137, true, false, true, 1234*time.Millisecond, "")
 	for _, want := range []string{
+		"secrets=a,b",
 		"raw_exit=137", // raw status preserved for operator
 		"elapsed_ms=1234",
 		"stdout_truncated=true",
@@ -253,16 +254,6 @@ func TestAuditMCPRunMessage(t *testing.T) {
 	}
 	if strings.Contains(msg, "stderr_truncated=true") {
 		t.Errorf("audit message should not contain stderr_truncated when false: %s", msg)
-	}
-	// Secret names now live on AuditEvent.SecretNames (not in the
-	// message); confirm they serialize under the expected JSON key.
-	ev := AuditEvent{Action: ActionMCPRun, SecretNames: []string{"a", "b"}, Message: msg}
-	raw, err := json.Marshal(ev)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !strings.Contains(string(raw), `"secret_names":["a","b"]`) {
-		t.Errorf("expected secret_names array in event JSON, got %s", raw)
 	}
 }
 

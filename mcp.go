@@ -298,6 +298,13 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			// simple identifier; safe to echo back for diagnostics.
 			return aiUserErr(fmt.Sprintf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
 		}
+		if isBlockedEnvName(envName) {
+			// M1: refuse to inject a secret value into a loader/interpreter
+			// env var name (PATH, LD_*, BASH_ENV, MAVEN_OPTS, NODE_OPTIONS,
+			// GIT_CONFIG_*, etc.). The envName is AI-supplied; echoing it
+			// for the deny-list diagnostic is safe and actionable.
+			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go)", envName)), runWithSecretsOutput{}, nil
+		}
 		buf, err := backend.Get(ctx, secretName)
 		if err != nil {
 			// Audit with full error detail for the operator; AI sees only taxonomy.
