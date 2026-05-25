@@ -115,9 +115,15 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 	var bwArgs []string
 	switch profile {
 	case SandboxNet:
+		// --unshare-pid + --proc /proc (after dev-bind): private PID namespace prevents
+		// sibling run_with_secrets calls from reading each other's /proc/<pid>/environ.
+		// --proc must come after --dev-bind / / so it masks the host procfs (bwrap applies
+		// mounts left-to-right). Abstract Unix sockets are already isolated by --unshare-net.
 		bwArgs = []string{
 			"--dev-bind", "/", "/",
 			"--unshare-net",
+			"--unshare-pid",
+			"--proc", "/proc",
 			"--tmpfs", "/dev/shm",
 			"--die-with-parent",
 			"--new-session",
