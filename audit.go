@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -234,6 +236,26 @@ func AppendAudit(ev AuditEvent) error {
 		})
 	}
 	return err
+}
+
+// sanitizeExecStartErr maps os/exec start errors to a fixed audit-log
+// taxonomy. It is used for the audit Message (operator-visible) when a
+// subprocess fails to start; it is NOT the AI-facing path (that uses
+// sanitizeErrForAI in mcp.go).
+//
+// Taxonomy:
+//
+//	exec_not_found          — binary not found on PATH
+//	exec_permission_denied  — binary exists but not executable
+//	exec_start_failed       — any other start failure
+func sanitizeExecStartErr(err error) string {
+	if errors.Is(err, exec.ErrNotFound) {
+		return "exec_not_found"
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return "exec_permission_denied"
+	}
+	return "exec_start_failed"
 }
 
 // tailAudit returns the last n lines of the audit log as raw JSON strings.

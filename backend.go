@@ -119,3 +119,20 @@ func wipe(s []byte) {
 		s[i] = 0
 	}
 }
+
+// sanitizeBackendErr maps any backend error to one of a fixed set of taxonomy
+// keys that are safe to write to the audit log (and therefore safe for
+// audit_tail to expose to an AI client). This prevents a buggy or
+// future-malicious keyring backend from leaking secret bytes via the audit
+// Message field.
+//
+// Taxonomy:
+//
+//	not_found      — ErrSecretNotFound
+//	backend_error  — any other backend failure
+func sanitizeBackendErr(err error) string {
+	if errors.Is(err, ErrSecretNotFound) {
+		return "not_found"
+	}
+	return "backend_error"
+}
