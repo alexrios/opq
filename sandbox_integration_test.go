@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -208,6 +209,90 @@ func TestSandboxNet_DBusUnreachable(t *testing.T) {
 	// /tmp must be an empty tmpfs (ls -A on empty dir prints nothing).
 	if tmpOut != "" {
 		t.Errorf("/tmp not empty under SandboxNet (cross-call channel open): %q", tmpOut)
+	}
+}
+
+// TestSandboxNet_AuditLogUnreachable (J-12 regression) — SandboxNet must
+// tmpfs-mask the audit directory so an AI subprocess under
+// run_with_secrets cannot bypass filterAuditLineForAI /
+// filterAuditMessageForAI by `cat`ing audit.log directly. We set
+// XDG_STATE_HOME to a fresh tmpdir, plant a canary line in
+// <tmp>/opq/audit.log on the host, then attempt to read it from inside
+// the sandbox. The canary must NOT appear in the child's output, and the
+// tmpfs-masked directory must be empty (or the read must fail outright).
+func TestSandboxNet_AuditLogUnreachable(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not available")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("/bin/sh required")
+	}
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	const canary = "CANARY_J12_AUDIT_LOG_CONTENT"
+	auditDir := filepath.Join(tmp, "opq")
+	if err := os.MkdirAll(auditDir, 0o700); err != nil {
+		t.Fatalf("mkdir audit dir: %v", err)
+	}
+	logPath := filepath.Join(auditDir, "audit.log")
+	if err := os.WriteFile(logPath, []byte(canary+"\n"), 0o600); err != nil {
+		t.Fatalf("plant canary: %v", err)
+	}
+
+	// The audit dir under WrapCommand goes through filepath.EvalSymlinks.
+	// On macOS /tmp -> /private/tmp; on Linux t.TempDir() is typically
+	// already canonical but resolve anyway for robustness.
+	canonDir := auditDir
+	if resolved, err := filepath.EvalSymlinks(auditDir); err == nil {
+		canonDir = resolved
+	}
+
+	// Hand the canonical absolute path to the inner shell. runUnderSandbox
+	// sets the child env to a minimal {PATH, HOME=/tmp} and does NOT
+	// forward XDG_STATE_HOME, so `$XDG_STATE_HOME` would expand to empty
+	// in the child. Using the literal path keeps the test focused on the
+	// tmpfs mask, not on env propagation.
+	//
+	// Kimi P0: also exercise /proc/self/root/<auditPath> — a broken PID
+	// or mount namespace could leave /proc/self/root pointing to the
+	// pre-mask host view. With --unshare-pid + --proc /proc this should
+	// resolve to the sandboxed FS, so the cat must fail or return empty.
+	script := "cat " + canonDir + "/audit.log 2>&1; echo ---; " +
+		"ls -A " + canonDir + " 2>&1; echo ---; " +
+		"cat /proc/self/root" + canonDir + "/audit.log 2>&1"
+	out, _, err := runUnderSandbox(t, SandboxNet, "sh", "-c", script)
+	if err != nil {
+		t.Fatalf("wrap err: %v", err)
+	}
+	// bwrap setup failure (e.g. missing dir target) would surface as
+	// "bwrap: ..." before the script runs; that is itself a regression of
+	// the audit-dir resolver, so fail loudly rather than skip.
+	if strings.HasPrefix(strings.TrimSpace(out), "bwrap:") {
+		t.Fatalf("bwrap setup failed under SandboxNet (J-12 regression — audit-dir tmpfs broke mount layout): %q", out)
+	}
+	if strings.Contains(out, canary) {
+		t.Fatalf("J-12 regression: canary %q reachable inside SandboxNet:\n%s", canary, out)
+	}
+	parts := strings.SplitN(out, "---", 3)
+	if len(parts) != 3 {
+		t.Fatalf("expected two '---' dividers in output, got: %q", out)
+	}
+	lsOut := strings.TrimSpace(parts[1])
+	procRootOut := strings.TrimSpace(parts[2])
+	// Accept either: empty tmpfs (ls -A prints nothing) OR a "no such
+	// file" error. A non-empty listing means the host directory survived
+	// the mask.
+	lower := strings.ToLower(lsOut)
+	if lsOut != "" &&
+		!strings.Contains(lower, "no such") &&
+		!strings.Contains(lower, "cannot access") {
+		t.Errorf("audit dir not masked under SandboxNet (expected empty tmpfs or ENOENT, got %q)", lsOut)
+	}
+	// /proc/self/root escape — must not surface the canary either.
+	if strings.Contains(procRootOut, canary) {
+		t.Fatalf("J-12 /proc/self/root escape: canary reachable via /proc/self/root%s/audit.log:\n%s",
+			canonDir, procRootOut)
 	}
 }
 

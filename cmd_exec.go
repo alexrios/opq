@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/term"
 )
 
 // exitCodeError carries a child process exit code back to main() without
@@ -31,7 +35,7 @@ func (e *exitCodeError) ExitCode() int { return e.code }
 
 type ExecCmd struct {
 	Env      []string `name:"env" short:"e" help:"Inject a secret as an environment variable for the child. Format: VAR=secret_name. Repeatable."`
-	NoRedact bool     `name:"no-redact" help:"DISABLE output redaction. Subprocess stdout/stderr passes through unchanged. Logged loudly to the audit log."`
+	NoRedact bool     `name:"no-redact" help:"DISABLE output redaction. HUMAN-ONLY: refuses unless stdout is a TTY AND OPQ_I_AM_HUMAN=1 is set inline AND you retype 'no-redact' on the controlling terminal. Logged loudly to the audit log."`
 	Sandbox  string   `name:"sandbox" enum:"none,net,full" default:"none" help:"Subprocess sandbox profile: none (default, no isolation), net (block network), full (block network + tmpfs /home /tmp + minimal ro-binds)."`
 	Command  []string `arg:"" passthrough:"" help:"Command and arguments to run. Use -- to separate from opq flags."`
 }
@@ -51,6 +55,65 @@ func parseSandboxFlag(s string) (SandboxProfile, error) {
 	}
 }
 
+// noRedactConfirmInputPrompt is the canonical prompt copy. Exported as a
+// constant so tests don't have to mirror it.
+const noRedactConfirmInputPrompt = "Type 'no-redact' to confirm release without redaction: "
+
+// noRedactConfirmInputLiteral is the literal string the operator must type
+// on the controlling terminal. A fixed literal (rather than the secret name)
+// is used because --no-redact is not scoped to a single secret — the flag
+// disables the redactor for every secret injected via --env in this run.
+const noRedactConfirmInputLiteral = "no-redact"
+
+// errNoRedactGate is returned when any of the layered --no-redact gates
+// fail. Run() converts it into the user-facing error and audit message.
+var errNoRedactGate = errors.New("no-redact release gate")
+
+// noRedactGateConfig holds the dependencies that the gate uses, factored
+// out so tests can drive the logic without touching real TTYs or env vars.
+type noRedactGateConfig struct {
+	stdoutIsTTY  bool
+	envHumanFlag string // value of OPQ_I_AM_HUMAN as read by caller
+	// openConfirmTTY returns a reader/writer pair representing the
+	// controlling terminal (/dev/tty in production), plus a closer the
+	// caller must invoke. If the TTY cannot be opened, err is returned and
+	// the gate fails — humans always have a /dev/tty even when stdin is
+	// redirected; AI runtimes that redirect both ends do not.
+	openConfirmTTY func() (io.Reader, io.Writer, io.Closer, error)
+}
+
+// checkNoRedactGate runs the layered checks before --no-redact disables
+// the RedactingWriter. The bypass it closes: an AI calls MCP run_with_secrets
+// with `opq exec --no-redact --env X=key -- sh -c 'printf %s "$X"'`; the
+// outer MCP RedactingWriter has no secrets registered for the inner exec's
+// argv, so the resolved plaintext flows straight back to the AI.
+func checkNoRedactGate(cfg noRedactGateConfig) (userReason, auditReason string, err error) {
+	if !cfg.stdoutIsTTY {
+		return "stdout not a tty", GateReasonStdoutNoTTY, errNoRedactGate
+	}
+	if cfg.envHumanFlag != "1" {
+		return "missing OPQ_I_AM_HUMAN=1", GateReasonEnvMissing, errNoRedactGate
+	}
+	r, w, closer, openErr := cfg.openConfirmTTY()
+	if openErr != nil {
+		return "no controlling tty: " + openErr.Error(), GateReasonNoTTY, errNoRedactGate
+	}
+	defer closer.Close()
+	if _, werr := fmt.Fprintf(w, "%s", noRedactConfirmInputPrompt); werr != nil {
+		return "tty write: " + werr.Error(), GateReasonTTYWrite, errNoRedactGate
+	}
+	br := bufio.NewReader(r)
+	line, rerr := br.ReadString('\n')
+	if rerr != nil && rerr != io.EOF {
+		return "tty read: " + rerr.Error(), GateReasonTTYRead, errNoRedactGate
+	}
+	got := strings.TrimRight(line, "\r\n")
+	if got != noRedactConfirmInputLiteral {
+		return "confirmation mismatch", GateReasonConfirmMismatch, errNoRedactGate
+	}
+	return "", "", nil
+}
+
 func (c *ExecCmd) Run() error {
 	// kong's passthrough captures "--" literally as the first positional;
 	// strip it so users can write the conventional `opq exec ... -- cmd`.
@@ -59,6 +122,25 @@ func (c *ExecCmd) Run() error {
 	}
 	if len(c.Command) == 0 {
 		return errors.New("missing command to run (example: opq exec --env OPENAI_API_KEY=openai_api_key -- curl https://api.openai.com)")
+	}
+
+	if c.NoRedact {
+		cfg := noRedactGateConfig{
+			stdoutIsTTY:    term.IsTerminal(int(os.Stdout.Fd())),
+			envHumanFlag:   os.Getenv(envHumanConfirm),
+			openConfirmTTY: openControllingTTY,
+		}
+		if userReason, auditReason, err := checkNoRedactGate(cfg); err != nil {
+			_ = AppendAudit(AuditEvent{
+				Action:  ActionDenied,
+				Caller:  callerTag(),
+				Message: "no_redact_refused:" + auditReason,
+			})
+			return fmt.Errorf("refusing to run --no-redact (%s). "+
+				"This flag is gated to human operators: stdout must be a TTY, "+
+				"%s=1 must be set inline on the command (do NOT export it), and you "+
+				"must retype 'no-redact' on the controlling terminal", userReason, envHumanConfirm)
+		}
 	}
 
 	envMappings, err := parseEnvMappings(c.Env)

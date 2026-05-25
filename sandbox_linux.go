@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -110,6 +111,33 @@ func checkUnprivilegedUserns() error {
 	return nil
 }
 
+// resolveAuditDirForMask returns the absolute, symlink-resolved path of
+// the audit directory so SandboxNet can tmpfs-mask it. The directory is
+// created first (with prepareAuditDir's 0700 + symlink-refusal semantics)
+// because bwrap's --tmpfs requires the mount target to already exist.
+func resolveAuditDirForMask() (string, error) {
+	p, err := auditLogPath()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(p)
+	// Ensure dir exists (bwrap --tmpfs requires the target dir to exist).
+	// Use prepareAuditDir which already handles symlink refusal + 0700 mode.
+	if err := prepareAuditDir(dir); err != nil {
+		return "", fmt.Errorf("prepare audit dir for sandbox mask: %w", err)
+	}
+	// Defense-in-depth: resolve symlinks so the tmpfs lands on the real
+	// inode. Mount semantics already follow the path lookup at mount(2)
+	// time, so a symlink-prefixed dir is masked correctly today; resolving
+	// here insulates against future bwrap behavior changes and TOCTOU
+	// shenanigans where the symlink is swapped between resolve and mount.
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("evalsymlinks audit dir: %w", err)
+	}
+	return real, nil
+}
+
 // WrapCommand returns the argv to feed to exec.Command for running
 // `cmd args...` under the chosen profile. For SandboxNone the call
 // is a no-op passthrough. For SandboxNet / SandboxFull, the command
@@ -135,6 +163,14 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 	var bwArgs []string
 	switch profile {
 	case SandboxNet:
+		// Resolve the audit directory inside the SandboxNet branch only.
+		// SandboxFull tmpfs-masks /home, which covers the default audit-log
+		// location, so it does not need the explicit mask and should not
+		// pay the prepareAuditDir / EvalSymlinks side-effects.
+		auditDir, err := resolveAuditDirForMask()
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve audit dir for sandbox mask: %w", err)
+		}
 		// --unshare-pid + --proc /proc (after dev-bind): private PID namespace prevents
 		// sibling run_with_secrets calls from reading each other's /proc/<pid>/environ.
 		// --proc must come after --dev-bind / / so it masks the host procfs (bwrap applies
@@ -160,6 +196,14 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 			"--tmpfs", "/dev/shm",
 			"--tmpfs", "/run/user",
 			"--tmpfs", "/tmp",
+			// J-12/post-v1.1.2: audit log lives at $XDG_STATE_HOME/opq/ or
+			// $HOME/.local/state/opq/. Under --dev-bind / / the AI subprocess
+			// could cat audit.log and read caller="cli" entries (which
+			// filterAuditLineForAI strips for MCP audit_tail) plus raw_exit /
+			// elapsed_ms tokens (which filterAuditMessageForAI strips). Masking
+			// the whole audit directory with tmpfs closes that bypass. SandboxFull
+			// already tmpfs-masks /home so it is covered there incidentally.
+			"--tmpfs", auditDir,
 			"--die-with-parent",
 			"--new-session",
 		}

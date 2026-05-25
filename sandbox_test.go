@@ -292,6 +292,164 @@ func TestParseSandboxFlag(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// SandboxNet tmpfs-masks the audit directory (J-12 / P0-2).
+//
+// Background: under SandboxNet, --dev-bind / / makes the host filesystem
+// visible to the child. Without an explicit mask, the AI-spawned subprocess
+// could read $XDG_STATE_HOME/opq/audit.log (or the HOME fallback) and recover
+// raw_exit / elapsed_ms tokens that filterAuditMessageForAI strips from the
+// MCP audit_tail response. The fix in sandbox_linux.go appends
+// `--tmpfs <auditDir>` to the SandboxNet argv. These tests lock down:
+//   - the argv includes the tmpfs after --dev-bind / /
+//   - the HOME fallback works when XDG_STATE_HOME is unset
+//   - the wrapper fails CLOSED (no argv produced) if neither path resolves
+//   - SandboxFull does NOT reach the audit-dir resolver (it tmpfs-masks /home
+//     wholesale, so the resolver must not be a hard dependency there)
+// -----------------------------------------------------------------------------
+
+// TestSandboxNet_TmpfsMasksAuditDir locks the canonical XDG_STATE_HOME path.
+// With XDG_STATE_HOME=<tmp>, the resolved audit dir is <tmp>/opq and the
+// argv must carry "--tmpfs <tmp>/opq" after --dev-bind / /.
+func TestSandboxNet_TmpfsMasksAuditDir(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	wantDir := filepath.Join(tmp, "opq")
+	// EvalSymlinks resolves /tmp -> /private/tmp on macOS, but we already
+	// skipped non-linux above. On linux, t.TempDir under /tmp may already be
+	// canonical; if not, mirror resolveAuditDirForMask's EvalSymlinks step.
+	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
+		wantDir = resolved
+	}
+
+	if !hasSeq(gotArgs, []string{"--tmpfs", wantDir}) {
+		t.Fatalf("SandboxNet argv missing '--tmpfs %s': %v", wantDir, gotArgs)
+	}
+	devBindIdx := indexOf(gotArgs, "--dev-bind")
+	if devBindIdx < 0 {
+		t.Fatalf("--dev-bind missing from SandboxNet argv: %v", gotArgs)
+	}
+	// The audit-dir tmpfs must come AFTER --dev-bind / / so it shadows the
+	// inherited bind-mount (bwrap applies left-to-right).
+	for i := 0; i+1 < len(gotArgs); i++ {
+		if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == wantDir {
+			if i < devBindIdx {
+				t.Errorf("--tmpfs %s (idx %d) must come AFTER --dev-bind (idx %d): %v",
+					wantDir, i, devBindIdx, gotArgs)
+			}
+			return
+		}
+	}
+}
+
+// TestSandboxNet_TmpfsMasksAuditDir_HonorsHomeFallback covers the second
+// auditLogPath branch: when XDG_STATE_HOME is empty, the audit dir is
+// $HOME/.local/state/opq. The argv must carry that path as a tmpfs mask.
+func TestSandboxNet_TmpfsMasksAuditDir_HonorsHomeFallback(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	home := t.TempDir()
+	// Explicitly clear XDG_STATE_HOME so auditLogPath falls back to HOME.
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", home)
+
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	wantDir := filepath.Join(home, ".local", "state", "opq")
+	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
+		wantDir = resolved
+	}
+
+	if !hasSeq(gotArgs, []string{"--tmpfs", wantDir}) {
+		t.Errorf("SandboxNet argv missing '--tmpfs %s' from HOME fallback: %v", wantDir, gotArgs)
+	}
+}
+
+// TestSandboxNet_FailsClosedOnUnresolvableAuditDir locks the regression for
+// the silent-skip variant: if the audit directory cannot be resolved (e.g.
+// neither XDG_STATE_HOME nor HOME is set), WrapCommand must return a non-nil
+// error and an empty argv rather than silently omit the tmpfs mask and run
+// the child without it.
+func TestSandboxNet_FailsClosedOnUnresolvableAuditDir(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+
+	gotCmd, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err == nil {
+		t.Fatalf("expected WrapCommand to fail closed with no XDG_STATE_HOME / HOME, got cmd=%q args=%v", gotCmd, gotArgs)
+	}
+	if gotCmd != "" || len(gotArgs) != 0 {
+		t.Errorf("on failure WrapCommand must return empty cmd/args, got cmd=%q args=%v", gotCmd, gotArgs)
+	}
+}
+
+// TestSandboxFull_DoesNotInvokeAuditDirResolver — the audit-dir resolution
+// branch is intentionally scoped to SandboxNet. SandboxFull tmpfs-masks /home
+// wholesale, so it must not gain a transitive failure mode on a missing HOME.
+// We blank XDG_STATE_HOME and HOME and assert WrapCommand(SandboxFull, ...)
+// still produces a valid argv.
+func TestSandboxFull_DoesNotInvokeAuditDirResolver(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+
+	_, gotArgs, err := WrapCommand(SandboxFull, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand(SandboxFull) must not depend on audit-dir resolution; got err=%v", err)
+	}
+	// Sanity: SandboxFull still emits its own argv shape, including the
+	// --setenv HOME /tmp pair that's irrelevant to the resolver but useful
+	// as evidence the SandboxFull branch ran.
+	if !hasSeq(gotArgs, []string{"--setenv", "HOME", "/tmp"}) {
+		t.Errorf("SandboxFull argv missing '--setenv HOME /tmp': %v", gotArgs)
+	}
+	if !hasSeq(gotArgs, []string{"--tmpfs", "/home"}) {
+		t.Errorf("SandboxFull argv missing '--tmpfs /home': %v", gotArgs)
+	}
+}
+
 // ----- helpers -----
 
 func slicesEqual(a, b []string) bool {
