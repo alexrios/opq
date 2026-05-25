@@ -44,9 +44,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -133,11 +135,13 @@ type listSecretsOutput struct {
 func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecretsInput) (*mcp.CallToolResult, listSecretsOutput, error) {
 	backend, err := OpenDefaultBackend()
 	if err != nil {
-		return errResult(err), listSecretsOutput{}, nil
+		// H1: backend errors may contain keyring/D-Bus text; sanitize.
+		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
 	names, err := backend.List(ctx)
 	if err != nil {
-		return errResult(err), listSecretsOutput{}, nil
+		// H1: backend errors may contain keyring/D-Bus text; sanitize.
+		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
 	_ = AppendAudit(AuditEvent{Action: ActionList, Caller: callerTag()})
 	return &mcp.CallToolResult{
@@ -244,25 +248,30 @@ func clampAuditTailN(requested int) int {
 
 func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input runWithSecretsInput) (*mcp.CallToolResult, runWithSecretsOutput, error) {
 	if input.Command == "" {
-		return errResult(errors.New("command is required")), runWithSecretsOutput{}, nil
+		// H1: user-controlled input validation — safe to return as-is.
+		return aiUserErr("command is required"), runWithSecretsOutput{}, nil
 	}
 	if len(input.Env) > mcpMaxEnvCount {
-		return errResult(fmt.Errorf("too many env vars in one call (%d > %d)", len(input.Env), mcpMaxEnvCount)), runWithSecretsOutput{}, nil
+		// H1: user-controlled input validation — safe to return as-is.
+		return aiUserErr(fmt.Sprintf("too many env vars in one call (%d > %d)", len(input.Env), mcpMaxEnvCount)), runWithSecretsOutput{}, nil
 	}
 
 	profile, err := resolveMCPSandbox(input.AllowNetwork, input.Isolation)
 	if err != nil {
-		return errResult(err), runWithSecretsOutput{}, nil
+		// H1: validation text is entirely our own literals; safe.
+		return aiUserErr(err.Error()), runWithSecretsOutput{}, nil
 	}
 	if profile != SandboxNone {
 		if err := VerifySandboxAvailable(); err != nil {
-			return errResult(fmt.Errorf("sandbox required but unavailable: %w", err)), runWithSecretsOutput{}, nil
+			// H1: may contain bwrap binary path or OS error; sanitize.
+			return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
 		}
 	}
 
 	backend, err := OpenDefaultBackend()
 	if err != nil {
-		return errResult(err), runWithSecretsOutput{}, nil
+		// H1: may contain keyring/D-Bus text; sanitize.
+		return aiErr("backend_error"), runWithSecretsOutput{}, nil
 	}
 
 	type resolved struct {
@@ -277,6 +286,10 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}()
 
 	resolvedSecretNames := make([]string, 0, len(input.Env))
+	// Sort env names so the "first failure" is stable across calls. Go's
+	// map iteration is randomized; without the sort the audit log would
+	// show a different first-rejected secret on every invocation, making
+	// failures non-reproducible.
 	envNames := make([]string, 0, len(input.Env))
 	for k := range input.Env {
 		envNames = append(envNames, k)
@@ -285,15 +298,26 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	for _, envName := range envNames {
 		secretName := input.Env[envName]
 		if !validEnvName(envName) {
-			return errResult(fmt.Errorf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
+			// H1: envName is AI-supplied but we already validated it is a
+			// simple identifier; safe to echo back for diagnostics.
+			return aiUserErr(fmt.Sprintf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
 		}
 		if isBlockedEnvName(envName) {
-			return errResult(fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.)", envName)), runWithSecretsOutput{}, nil
+			// M1: refuse to inject a secret value into a loader/interpreter
+			// env var name (PATH, LD_*, BASH_ENV, MAVEN_OPTS, NODE_OPTIONS,
+			// GIT_CONFIG_*, etc.). The envName is AI-supplied; echoing it
+			// for the deny-list diagnostic is safe and actionable.
+			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go)", envName)), runWithSecretsOutput{}, nil
 		}
 		buf, err := backend.Get(ctx, secretName)
 		if err != nil {
+			// Audit with full error detail for the operator; AI sees only taxonomy.
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizeBackendErr(err)})
-			return errResult(fmt.Errorf("resolve %s: %w", secretName, err)), runWithSecretsOutput{}, nil
+			// H1: include secretName (AI supplied it) but not the backend error.
+			if errors.Is(err, ErrSecretNotFound) {
+				return aiErr("not_found: " + secretName), runWithSecretsOutput{}, nil
+			}
+			return aiErr("backend_error"), runWithSecretsOutput{}, nil
 		}
 		bufs = append(bufs, resolved{envName: envName, buf: buf})
 		resolvedSecretNames = append(resolvedSecretNames, secretName)
@@ -333,7 +357,18 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 
 	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
 	if err != nil {
-		return errResult(fmt.Errorf("wrap command for sandbox: %w", err)), runWithSecretsOutput{}, nil
+		// H1: WrapCommand may include sandbox binary paths; sanitize. But
+		// distinguish caller-fixable cases (binary missing / not executable)
+		// from infrastructure problems so the AI can act on its own input.
+		// WrapCommand's exec.LookPath wraps ErrNotFound and ErrPermission;
+		// errors.Is sees through the wrap.
+		if errors.Is(err, exec.ErrNotFound) {
+			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		if errors.Is(err, fs.ErrPermission) {
+			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
 	}
 
 	if input.AllowNetwork {
@@ -368,15 +403,16 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			rawExit = -1
 		} else {
 			// Process never started (bad path, permission denied, ...).
-			// Still emit the audit entry below, then return an MCP error
-			// so the AI sees a clean failure.
+			// Still emit the audit entry below, then return a sanitized MCP
+			// error so the AI sees a clean failure without OS error text.
 			_ = AppendAudit(AuditEvent{
 				Action:      ActionMCPRun,
 				Caller:      callerTag(),
 				SecretNames: resolvedSecretNames,
 				Message:     auditMCPRunMessage(-1, stdoutCap.Truncated(), stderrCap.Truncated(), false, elapsed, sanitizeExecStartErr(runErr)),
 			})
-			return errResult(runErr), runWithSecretsOutput{}, nil
+			// H1: runErr may contain binary paths or OS error text; sanitize.
+			return aiErr(sanitizeErrForAI(runErr)), runWithSecretsOutput{}, nil
 		}
 	}
 
@@ -517,19 +553,149 @@ type auditTailOutput struct {
 }
 
 func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailInput) (*mcp.CallToolResult, auditTailOutput, error) {
+	// Over-fetch from the log so that after the MCP-caller filter is applied
+	// we still return up to n entries. In the worst case all entries are CLI
+	// entries and we return an empty list — that is correct behaviour.
 	n := clampAuditTailN(input.N)
-	lines, err := tailAudit(n)
+	lines, err := tailAudit(mcpMaxAuditTailN)
 	if err != nil {
-		return errResult(err), auditTailOutput{}, nil
+		// H1: tailAudit error may contain file-system paths; sanitize.
+		return aiErr("internal_error"), auditTailOutput{}, nil
 	}
+
+	// Apply MCP-specific filters (M3 caller filter, C1 raw_exit strip).
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if out, ok := filterAuditLineForAI(line); ok {
+			filtered = append(filtered, out)
+		}
+	}
+	// Return at most the requested n entries (last n after filter).
+	if len(filtered) > n {
+		filtered = filtered[len(filtered)-n:]
+	}
+
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(lines, "\n")}},
-	}, auditTailOutput{Entries: lines}, nil
+		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(filtered, "\n")}},
+	}, auditTailOutput{Entries: filtered}, nil
 }
 
-func errResult(err error) *mcp.CallToolResult {
+// sanitizeErrForAI converts any error into a fixed-taxonomy string that is
+// safe to surface to an MCP caller. The original error is preserved for the
+// audit log; only the AI-visible CallToolResult uses the sanitized form.
+//
+// Call context: this helper is reached from handleRunWithSecrets ONLY for
+// process-start failures (cmd.Run errors not matching *exec.ExitError and
+// not timed out). The fallthrough is therefore exec_start_failed, not a
+// generic catch-all. Backend errors and sandbox-unavailable errors are
+// mapped to fixed strings at their own call sites (see "backend_error" and
+// "sandbox_unavailable" literals in this file).
+//
+// Taxonomy keys (stable interface — do not change without a version bump):
+//
+//	not_found                 — named secret does not exist
+//	exec_not_found            — command binary not found on PATH
+//	exec_permission_denied    — binary exists but not executable
+//	exec_start_failed         — other process-start failure (fallback)
+func sanitizeErrForAI(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, ErrSecretNotFound) {
+		return "not_found"
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return "exec_not_found"
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return "exec_permission_denied"
+	}
+	return "exec_start_failed"
+}
+
+// aiErr returns an IsError CallToolResult with a sanitized, fixed-taxonomy
+// error string. Use this for all errors that may carry backend or system
+// bytes (backend errors, exec start errors, sandbox errors, audit errors).
+// The original err is NOT exposed to the AI; log it via AppendAudit before
+// calling aiErr if operator visibility is needed.
+func aiErr(sanitized string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		IsError: true,
-		Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
+		Content: []mcp.Content{&mcp.TextContent{Text: sanitized}},
 	}
 }
+
+// aiUserErr returns an IsError CallToolResult with caller-controlled text
+// (e.g. input-validation messages). Use this ONLY for errors whose text is
+// composed entirely of literals or values the AI itself supplied — never for
+// errors that may carry backend or system bytes.
+func aiUserErr(msg string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}
+}
+
+// filterAuditLineForAI applies two MCP-specific filters to a single raw
+// audit-log JSON line before returning it to an AI caller:
+//
+//  1. (M3) caller filter — drops any line whose "caller" field does not have
+//     the prefix "mcp". CLI-driven entries (get/set/delete, redaction_disabled,
+//     gate-failure details, sandbox profiles chosen by the human) are invisible
+//     to the AI. The prefix match is future-proof for session IDs ("mcp:abc").
+//
+//  2. (C1) raw_exit strip — for "mcp_run" entries, removes all space-separated
+//     tokens whose key prefix is "raw_exit" from the "msg" field. This closes
+//     the exit-code oracle: normalizeExit already withholds raw_exit from the
+//     run_with_secrets response, but the AI could read it back via audit_tail
+//     without this strip.
+//
+// Returns ("", false) if the line should be dropped entirely.
+// Returns (filtered, true) with raw_exit stripped if the line should be included.
+func filterAuditLineForAI(line string) (string, bool) {
+	// Fast path: skip obviously empty lines.
+	if strings.TrimSpace(line) == "" {
+		return "", false
+	}
+
+	var ev AuditEvent
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		// Unparseable lines are dropped rather than forwarded; they could
+		// contain arbitrary bytes from a future or corrupt log format.
+		return "", false
+	}
+
+	// M3: only MCP-originated entries are visible to the AI.
+	if !strings.HasPrefix(ev.Caller, "mcp") {
+		return "", false
+	}
+
+	// C1: strip raw_exit* tokens from mcp_run messages.
+	if ev.Action == ActionMCPRun && ev.Message != "" {
+		ev.Message = stripRawExitTokens(ev.Message)
+	}
+
+	out, err := json.Marshal(ev)
+	if err != nil {
+		// Should never happen with a valid AuditEvent, but be safe.
+		return "", false
+	}
+	return string(out), true
+}
+
+// stripRawExitTokens removes any space-separated token from msg whose key
+// (the part before '=') has the prefix "raw_exit". This handles the current
+// "raw_exit=NN" format as well as any future variant (raw_exit_hex, etc.).
+func stripRawExitTokens(msg string) string {
+	tokens := strings.Fields(msg)
+	out := tokens[:0]
+	for _, tok := range tokens {
+		key, _, _ := strings.Cut(tok, "=")
+		if strings.HasPrefix(key, "raw_exit") {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return strings.Join(out, " ")
+}
+

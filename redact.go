@@ -125,15 +125,26 @@ func (r *RedactingWriter) Destroy() {
 
 // scan walks work byte-by-byte. At each position:
 //   - if a registered secret exactly matches starting here, emit
-//     "[REDACTED:NAME]" and advance past it (longest match wins on tie);
+//     "[REDACTED:NAME]" (longest match wins on tie) and mark the matched
+//     region as covered; every position inside the region is still tested as
+//     a potential secret start so overlapping secrets are also redacted;
+//   - else if the byte is inside a previously matched region, suppress it;
 //   - else if the remaining suffix could be a prefix of any secret (and we
 //     are not in finalize mode), hold it for the next Write;
 //   - else emit one byte and advance.
 //
 // When finalize is true, partial-prefix bytes are emitted verbatim (we know
 // no more input is coming).
+//
+// Overlapping secrets are handled via two cursors:
+//   - i advances by 1 each iteration so every byte position is tested as a
+//     potential secret start.
+//   - emitUpTo tracks the furthest position already covered by a redaction
+//     token; bytes below emitUpTo that do not start a new secret are
+//     suppressed rather than emitted verbatim.
 func (r *RedactingWriter) scan(work []byte, finalize bool) (out, holdover []byte) {
 	out = make([]byte, 0, len(work))
+	emitUpTo := 0 // bytes [0, emitUpTo) are already covered by a redaction token
 	i := 0
 	for i < len(work) {
 		// Find the longest exact match at position i.
@@ -151,10 +162,21 @@ func (r *RedactingWriter) scan(work []byte, finalize bool) (out, holdover []byte
 			out = append(out, "[REDACTED:"...)
 			out = append(out, bestName...)
 			out = append(out, ']')
-			i += bestLen
+			end := i + bestLen
+			if end > emitUpTo {
+				emitUpTo = end
+			}
+			i++
 			continue
 		}
-		// No exact match. Check for a partial-prefix match at i.
+		// No exact match at i.
+		if i < emitUpTo {
+			// This byte is inside a previously matched region; suppress it.
+			i++
+			continue
+		}
+		// Check for a partial-prefix match at i (only meaningful when i is
+		// not already covered and the tail is shorter than the longest secret).
 		if !finalize && len(work)-i < r.maxLen {
 			for _, s := range r.secrets {
 				if len(work)-i < len(s.value) && bytes.HasPrefix(s.value, work[i:]) {

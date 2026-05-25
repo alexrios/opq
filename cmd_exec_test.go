@@ -191,12 +191,24 @@ func TestFilterParentEnv(t *testing.T) {
 
 func TestParseEnvMappings_RejectsBlockedNames(t *testing.T) {
 	cases := []string{
+		// exact-map entries
 		"PATH=some_secret",
-		"LD_PRELOAD=some_secret",
 		"BASH_ENV=some_secret",
 		"GLIBC_TUNABLES=some_secret",
+		// LD_ prefix
+		"LD_PRELOAD=some_secret",
+		// NSS_ / GIO_ prefixes
 		"NSS_HOSTS=some_secret",
 		"GIO_USE_VFS=some_secret",
+		// ERL_ prefix (newly added)
+		"ERL_FLAGS=some_secret",
+		"ERL_NEW_FUTURE_VAR=some_secret",
+		// BASH_FUNC_ prefix (newly added); use a name valid per validEnvName
+		// (no %%) since validEnvName runs before isBlockedEnvName.
+		"BASH_FUNC_ls=some_secret",
+		// GIT_CONFIG_ prefix (newly added)
+		"GIT_CONFIG_KEY_0=some_secret",
+		"GIT_CONFIG_VALUE_0=some_secret",
 	}
 	for _, spec := range cases {
 		t.Run(spec, func(t *testing.T) {

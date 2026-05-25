@@ -163,6 +163,84 @@ func TestRedact_DownstreamErrorReportsFullConsumption(t *testing.T) {
 	}
 }
 
+// TestRedact_OverlappingSecretsAtSamePosition verifies the H3 fix: when two
+// registered secrets overlap (S2 starts inside S1's matched region), both are
+// redacted. Input "ABCD" with secrets {ABC, BCD}: ABC matches at offset 0 and
+// BCD matches at offset 1. The output must contain both redaction tokens; the
+// plain bytes C and D must not appear because they are covered by BCD.
+func TestRedact_OverlappingSecretsAtSamePosition(t *testing.T) {
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{
+		{Name: "S1", Value: []byte("ABC")},
+		{Name: "S2", Value: []byte("BCD")},
+	})
+	rw.Write([]byte("ABCD"))
+	rw.Flush()
+	got := buf.String()
+	// Both overlapping secrets must be redacted.
+	if !bytes.Contains([]byte(got), []byte("[REDACTED:S1]")) {
+		t.Errorf("S1 not redacted; got %q", got)
+	}
+	if !bytes.Contains([]byte(got), []byte("[REDACTED:S2]")) {
+		t.Errorf("S2 not redacted; got %q", got)
+	}
+	// No raw secret bytes may survive: none of A, B, C, D appear as a lone
+	// verbatim sequence outside a redaction token.
+	if got != "[REDACTED:S1][REDACTED:S2]" {
+		t.Errorf("unexpected output %q; want \"[REDACTED:S1][REDACTED:S2]\"", got)
+	}
+}
+
+// TestRedact_SecretSelfOverlap verifies that a self-overlapping secret (one
+// that overlaps with a copy of itself) is handled correctly. Secret "ABA",
+// input "ABABA": matches start at offset 0 (ABA covers 0-2) and offset 2
+// (ABA covers 2-4). Both must be redacted.
+func TestRedact_SecretSelfOverlap(t *testing.T) {
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{
+		{Name: "K", Value: []byte("ABA")},
+	})
+	rw.Write([]byte("ABABA"))
+	rw.Flush()
+	got := buf.String()
+	if got != "[REDACTED:K][REDACTED:K]" {
+		t.Errorf("got %q; want \"[REDACTED:K][REDACTED:K]\"", got)
+	}
+}
+
+// TestRedact_OverlapAcrossSplitWrites verifies that overlapping secrets are
+// still both redacted when the input arrives as two separate Write calls that
+// straddle the boundary. Write("AB") then Write("CD") with secrets {ABC,BCD}.
+func TestRedact_OverlapAcrossSplitWrites(t *testing.T) {
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{
+		{Name: "S1", Value: []byte("ABC")},
+		{Name: "S2", Value: []byte("BCD")},
+	})
+	rw.Write([]byte("AB"))
+	rw.Write([]byte("CD"))
+	rw.Flush()
+	got := buf.String()
+	if got != "[REDACTED:S1][REDACTED:S2]" {
+		t.Errorf("got %q; want \"[REDACTED:S1][REDACTED:S2]\"", got)
+	}
+}
+
+// TestRedact_NoFalsePositives verifies that substrings of registered secrets
+// that do not form a complete secret are not redacted.
+func TestRedact_NoFalsePositives(t *testing.T) {
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{
+		{Name: "K", Value: []byte("ABCDE")},
+	})
+	rw.Write([]byte("AB XYZ ABCD"))
+	rw.Flush()
+	got := buf.String()
+	if got != "AB XYZ ABCD" {
+		t.Errorf("got %q; want unmodified input", got)
+	}
+}
+
 func TestRedact_Destroy(t *testing.T) {
 	var buf bytes.Buffer
 	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: []byte("secret")}})

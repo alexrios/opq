@@ -51,10 +51,26 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	if filepath.Base(gotCmd) != "bwrap" {
 		t.Errorf("wrapper cmd = %q, want bwrap", gotCmd)
 	}
-	for _, want := range []string{"--unshare-net", "--dev-bind", "--die-with-parent", "--new-session"} {
+	// C2 fix: SandboxNet must include PID namespace isolation and private /proc
+	// to prevent sibling run_with_secrets calls from reading each other's
+	// /proc/<pid>/environ (finding C2 from the v1.1.1 security review).
+	for _, want := range []string{"--unshare-net", "--unshare-pid", "--dev-bind", "--die-with-parent", "--new-session"} {
 		if !containsArg(gotArgs, want) {
 			t.Errorf("net argv missing %q: %v", want, gotArgs)
 		}
+	}
+	// --proc /proc must appear as a sequence (private procfs for PID namespace).
+	if !hasSeq(gotArgs, []string{"--proc", "/proc"}) {
+		t.Errorf("net argv missing '--proc /proc' sequence: %v", gotArgs)
+	}
+	// --proc /proc must come AFTER --dev-bind / / so it masks the host procfs.
+	// bwrap applies mounts left-to-right; reversing this defeats PID ns isolation.
+	devBindIdx := indexOf(gotArgs, "--dev-bind")
+	procIdx := indexOf(gotArgs, "--proc")
+	if devBindIdx < 0 || procIdx < 0 {
+		t.Errorf("argv missing --dev-bind or --proc: %v", gotArgs)
+	} else if procIdx < devBindIdx {
+		t.Errorf("--proc (idx %d) must come after --dev-bind (idx %d) in argv: %v", procIdx, devBindIdx, gotArgs)
 	}
 	// The command must be resolved to an absolute path before the `--`
 	// terminator, since bwrap exec's it inside the sandbox.
