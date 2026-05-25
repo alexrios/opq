@@ -74,7 +74,14 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 	r.holdover = hold
 	if len(out) > 0 {
 		if _, err := r.w.Write(out); err != nil {
-			return 0, err
+			// All of p has been consumed: some bytes are now in
+			// r.holdover, others were transformed into out and handed
+			// to r.w. The io.Writer contract requires n to reflect
+			// bytes consumed from p, not bytes accepted downstream;
+			// returning 0 here would invite the caller to retry bytes
+			// we have already taken. Holdover is intentionally kept
+			// so a subsequent successful Write resumes cleanly.
+			return len(p), err
 		}
 	}
 	return len(p), nil

@@ -1,4 +1,5 @@
 /opq
+/opaque
 *.test
 *.out
 coverage.txt

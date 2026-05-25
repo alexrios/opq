@@ -7,14 +7,48 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
 
+// exitCodeError carries a child process exit code back to main() without
+// calling os.Exit at the deep call site. Calling os.Exit here would skip
+// all pending defers (memguard buffer Destroy, RedactingWriter Destroy,
+// signal.Stop, and the top-level memguard.Purge), leaving secret pages
+// reclaimed-but-not-zeroed on the way out. main() unwraps this error and
+// calls os.Exit AFTER all defers have run.
+type exitCodeError struct {
+	code int
+}
+
+func (e *exitCodeError) Error() string {
+	return fmt.Sprintf("child exited with code %d", e.code)
+}
+
+// ExitCode returns the exit code main() should propagate to the OS.
+func (e *exitCodeError) ExitCode() int { return e.code }
+
 type ExecCmd struct {
 	Env      []string `name:"env" short:"e" help:"Inject a secret as an environment variable for the child. Format: VAR=secret_name. Repeatable."`
 	NoRedact bool     `name:"no-redact" help:"DISABLE output redaction. Subprocess stdout/stderr passes through unchanged. Logged loudly to the audit log."`
+	Sandbox  string   `name:"sandbox" enum:"none,net,full" default:"none" help:"Subprocess sandbox profile: none (default, no isolation), net (block network), full (block network + tmpfs /home /tmp + minimal ro-binds)."`
 	Command  []string `arg:"" passthrough:"" help:"Command and arguments to run. Use -- to separate from opq flags."`
+}
+
+// parseSandboxFlag maps the CLI/MCP string ("none"/"net"/"full") to
+// a SandboxProfile. Empty string defaults to SandboxNone.
+func parseSandboxFlag(s string) (SandboxProfile, error) {
+	switch s {
+	case "", "none":
+		return SandboxNone, nil
+	case "net":
+		return SandboxNet, nil
+	case "full":
+		return SandboxFull, nil
+	default:
+		return SandboxNone, fmt.Errorf("unknown sandbox profile %q (want none|net|full)", s)
+	}
 }
 
 func (c *ExecCmd) Run() error {
@@ -62,7 +96,16 @@ func (c *ExecCmd) Run() error {
 	}
 
 	if c.NoRedact {
-		_ = AppendAudit(AuditEvent{Action: ActionRedactionDisabled, Caller: callerTag(), Message: strings.Join(c.Command, " ")})
+		// Do NOT log the full argv: shell-style invocations can pass tokens
+		// inline (e.g. `sh -c 'curl -H "Auth: sk-..."'`) and that would land
+		// in the audit log in plaintext. Log only the binary basename plus
+		// an arg-count so the loud `redaction_disabled` entry remains useful
+		// for review without leaking caller-controlled values.
+		_ = AppendAudit(AuditEvent{
+			Action:  ActionRedactionDisabled,
+			Caller:  callerTag(),
+			Message: fmt.Sprintf("%s (+%d args)", filepath.Base(c.Command[0]), len(c.Command)-1),
+		})
 	}
 
 	// Build child env: copy parent, drop our internal vars, append secrets.
@@ -74,7 +117,21 @@ func (c *ExecCmd) Run() error {
 		childEnv = append(childEnv, r.envName+"="+string(r.buf.Bytes()))
 	}
 
-	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
+	profile, err := parseSandboxFlag(c.Sandbox)
+	if err != nil {
+		return err
+	}
+	if profile != SandboxNone {
+		if err := VerifySandboxAvailable(); err != nil {
+			return fmt.Errorf("sandbox=%s requested but unavailable: %w", profile, err)
+		}
+	}
+	execCmd, execArgs, err := WrapCommand(profile, c.Command[0], c.Command[1:])
+	if err != nil {
+		return fmt.Errorf("wrap command for sandbox: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, execCmd, execArgs...)
 	cmd.Env = childEnv
 	cmd.Stdin = os.Stdin
 
@@ -113,22 +170,32 @@ func (c *ExecCmd) Run() error {
 	// and is Destroyed via defer above; the leak window is the time between
 	// exec.Start (which copies env into the child) and GC of childEnv.
 
+	// done lets the signal-forwarding goroutine exit once Wait returns,
+	// instead of leaking blocked on sigCh.
+	done := make(chan struct{})
 	go func() {
-		sig := <-sigCh
-		_ = cmd.Process.Signal(sig)
+		select {
+		case sig := <-sigCh:
+			_ = cmd.Process.Signal(sig)
+		case <-done:
+			return
+		}
 	}()
 
 	waitErr := cmd.Wait()
+	close(done)
 	if !c.NoRedact {
 		_ = stdoutRW.Flush()
 		_ = stderrRW.Flush()
 	}
 
 	if waitErr != nil {
-		// Propagate the child's exit code.
+		// Propagate the child's exit code through a typed error so all
+		// defers (mlocked-buffer Destroy, redactor Destroy, signal.Stop,
+		// top-level memguard.Purge in main) run before the process exits.
 		var ee *exec.ExitError
 		if errors.As(waitErr, &ee) {
-			os.Exit(ee.ExitCode())
+			return &exitCodeError{code: ee.ExitCode()}
 		}
 		return waitErr
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 
 	"golang.org/x/term"
 )
@@ -64,10 +65,22 @@ func (c *SetCmd) Run() error {
 }
 
 // callerTag returns a short label describing the invoking context. Refined
-// in MCP mode via SetCallerTag.
-var currentCallerTag = "cli"
+// in MCP mode via SetCallerTag. Backed by atomic.Pointer[string] so the MCP
+// server (which spawns goroutines for tool handlers) can safely re-tag from
+// any goroutine without racing readers in other handlers.
+var currentCallerTag atomic.Pointer[string]
 
-func callerTag() string { return currentCallerTag }
+func init() {
+	def := "cli"
+	currentCallerTag.Store(&def)
+}
+
+func callerTag() string {
+	if p := currentCallerTag.Load(); p != nil {
+		return *p
+	}
+	return "cli"
+}
 
 // SetCallerTag overrides the tag used in audit entries for this process.
-func SetCallerTag(tag string) { currentCallerTag = tag }
+func SetCallerTag(tag string) { currentCallerTag.Store(&tag) }

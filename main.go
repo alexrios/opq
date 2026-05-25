@@ -1,6 +1,10 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"os"
+
 	"github.com/alecthomas/kong"
 	"github.com/awnumar/memguard"
 )
@@ -16,6 +20,14 @@ type CLI struct {
 }
 
 func main() {
+	// Indirect through run() so that os.Exit fires AFTER all defers — most
+	// importantly memguard.Purge, which zeroes any locked pages still alive.
+	// Calling os.Exit directly anywhere deeper would skip those defers and
+	// leave secret pages reclaimed-but-not-zeroed.
+	os.Exit(run())
+}
+
+func run() int {
 	memguard.CatchInterrupt()
 	defer memguard.Purge()
 
@@ -26,5 +38,16 @@ func main() {
 		kong.UsageOnError(),
 	)
 	err := ctx.Run()
-	ctx.FatalIfErrorf(err)
+	if err == nil {
+		return 0
+	}
+	// Child-process exit codes are wrapped in *exitCodeError so we can
+	// unwind through Run()'s defers before exiting; propagate the code
+	// here without printing (the child already wrote its own output).
+	var ec *exitCodeError
+	if errors.As(err, &ec) {
+		return ec.code
+	}
+	fmt.Fprintln(os.Stderr, "opq:", err)
+	return 1
 }
