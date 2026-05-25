@@ -36,13 +36,11 @@ func TestParseEnvMappings(t *testing.T) {
 			}},
 		},
 		{
-			name: "secret name containing equals is kept whole",
-			// IndexByte returns the FIRST '='; everything after it is the
-			// secret name. This lets secret names contain '=' safely.
-			in: []string{"X=foo=bar=baz"},
-			want: want{mappings: []envMapping{
-				{envName: "X", secretName: "foo=bar=baz"},
-			}},
+			name: "secret name containing equals is rejected by shape validator",
+			// IndexByte returns the FIRST '='; everything after it would be
+			// the secret name. J-14 rejects names outside [A-Za-z0-9_.-]{1,128}.
+			in:   []string{"X=foo=bar=baz"},
+			want: want{errSub: "invalid secret name"},
 		},
 		{
 			name:   "missing equals is rejected",
@@ -136,6 +134,36 @@ func TestValidEnvName(t *testing.T) {
 	}
 }
 
+// TestValidEnvName_RejectsTooLong locks J-13: env-var names longer than
+// maxEnvNameBytes (256) are rejected. The cap exists to bound the
+// child-env table size a single --env / Env-map entry can produce.
+func TestValidEnvName_RejectsTooLong(t *testing.T) {
+	// 256 chars (boundary, accepted): "A_" + 254 'A's = 256.
+	at256 := "A_" + strings.Repeat("A", 254)
+	if len(at256) != 256 {
+		t.Fatalf("at256 length = %d, want 256", len(at256))
+	}
+	if !validEnvName(at256) {
+		t.Errorf("validEnvName(len=256) = false, want true")
+	}
+	// 257 chars (over the cap, rejected).
+	at257 := "A_" + strings.Repeat("A", 255)
+	if len(at257) != 257 {
+		t.Fatalf("at257 length = %d, want 257", len(at257))
+	}
+	if validEnvName(at257) {
+		t.Errorf("validEnvName(len=257) = true, want false")
+	}
+	// 255 chars (well under the cap, accepted).
+	at255 := "A_" + strings.Repeat("A", 253)
+	if len(at255) != 255 {
+		t.Fatalf("at255 length = %d, want 255", len(at255))
+	}
+	if !validEnvName(at255) {
+		t.Errorf("validEnvName(len=255) = false, want true")
+	}
+}
+
 func TestFilterParentEnv(t *testing.T) {
 	cases := []struct {
 		name string
@@ -218,6 +246,37 @@ func TestParseEnvMappings_RejectsBlockedNames(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "deny-list") {
 				t.Fatalf("expected deny-list in error, got %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestParseEnvMappings_RejectsBadSecretName locks J-14 on the CLI surface:
+// a secret name outside [A-Za-z0-9_.-]{1,128} is rejected with the
+// verbose CLI-style message ("invalid secret name") before any backend
+// touch.
+func TestParseEnvMappings_RejectsBadSecretName(t *testing.T) {
+	cases := []struct {
+		name string
+		spec string
+	}{
+		// '=' is consumed by IndexByte as the separator, so the trailing
+		// "bar=baz" becomes the secret name and fails the shape gate.
+		{"secret_with_embedded_equals", "API=foo=bar=baz"},
+		{"secret_with_space", "API=bad name"},
+		{"secret_with_slash", "API=bad/path"},
+		{"secret_with_dollar", "API=bad$value"},
+		{"secret_too_long", "API=" + strings.Repeat("a", 129)},
+		{"secret_with_newline", "API=bad\nname"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseEnvMappings([]string{tc.spec})
+			if err == nil {
+				t.Fatalf("expected error for spec %q, got nil", tc.spec)
+			}
+			if !strings.Contains(err.Error(), "invalid secret name") {
+				t.Fatalf("expected 'invalid secret name' in error, got %q", err.Error())
 			}
 		})
 	}

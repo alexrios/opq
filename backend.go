@@ -67,7 +67,11 @@ func (b *keyringBackend) Get(_ context.Context, name string) (*Buffer, error) {
 	}
 	// item.Data is a []byte owned by the keyring lib. Move it into a locked
 	// buffer (which wipes the source slice) so it never lingers on the heap.
-	return NewBufferFromBytes(item.Data), nil
+	buf, err := NewBufferFromBytes(item.Data)
+	if err != nil {
+		return nil, fmt.Errorf("keyring get: %w", err)
+	}
+	return buf, nil
 }
 
 func (b *keyringBackend) Set(_ context.Context, name string, value *Buffer) error {

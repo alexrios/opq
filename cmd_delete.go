@@ -11,6 +11,9 @@ type DeleteCmd struct {
 }
 
 func (c *DeleteCmd) Run() error {
+	if !validSecretName(c.Name) {
+		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
+	}
 	ctx := context.Background()
 	backend, err := OpenDefaultBackend()
 	if err != nil {

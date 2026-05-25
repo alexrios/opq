@@ -42,6 +42,26 @@ func VerifySandboxAvailable() error {
 	if err := checkUnprivilegedUserns(); err != nil {
 		return err
 	}
+	// J-9: a functional probe. The version + sysctl checks above are
+	// necessary but not sufficient: AppArmor profiles (Ubuntu 23.10+
+	// ships one for `bwrap` itself), seccomp on the host, or a missing
+	// kernel CONFIG_USER_NS at runtime can each block namespace creation
+	// even when the static checks pass. Run a no-op `true` under flags
+	// that mirror WrapCommand's SandboxNet so failures here surface the
+	// same way real run_with_secrets calls would. --dev-bind / / is
+	// included for fidelity with the real SandboxNet argv — a host that
+	// passes the probe is then more likely to pass real calls. The probe
+	// runs `true` which exits instantly; on AppArmor-blocked hosts the
+	// kernel returns EPERM immediately. No timeout / goroutine needed.
+	probe := exec.Command(path,
+		"--dev-bind", "/", "/",
+		"--unshare-net", "--unshare-pid",
+		"--die-with-parent", "--new-session",
+		"true",
+	)
+	if out, err := probe.CombinedOutput(); err != nil {
+		return fmt.Errorf("bwrap namespace probe failed (host may block unprivileged userns / have an AppArmor profile on bwrap): %w; bwrap output: %s", err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 
@@ -119,12 +139,27 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 		// sibling run_with_secrets calls from reading each other's /proc/<pid>/environ.
 		// --proc must come after --dev-bind / / so it masks the host procfs (bwrap applies
 		// mounts left-to-right). Abstract Unix sockets are already isolated by --unshare-net.
+		//
+		// J-1: --unshare-net only blocks AF_INET/INET6/PACKET/NETLINK. AF_UNIX
+		// sockets reachable by filesystem path (e.g. /run/user/$UID/bus — the
+		// Secret Service / D-Bus session bus, KWallet, gpg-agent, legacy
+		// /tmp/dbus-*) survive the netns and would otherwise be mounted into
+		// the child by --dev-bind. Mask the standard socket directories with
+		// empty tmpfs so the child cannot reach the keyring it was supposed to
+		// be insulated from. /tmp tmpfs also closes the cross-call multi-bit
+		// storage channel between sibling run_with_secrets invocations. On all
+		// systemd distros /var/run is a symlink to /run, so masking /run/user
+		// also masks /var/run/user; do NOT add a second --tmpfs /var/run/user
+		// — bwrap fails with "Can't mkdir /var/run/user" when /var/run is a
+		// symlink to a now-empty tmpfs (see TestSandboxNet_TmpfsMasksDBus).
 		bwArgs = []string{
 			"--dev-bind", "/", "/",
 			"--unshare-net",
 			"--unshare-pid",
 			"--proc", "/proc",
 			"--tmpfs", "/dev/shm",
+			"--tmpfs", "/run/user",
+			"--tmpfs", "/tmp",
 			"--die-with-parent",
 			"--new-session",
 		}

@@ -70,6 +70,7 @@ const (
 	ActionList              = "list"
 	ActionExecInject        = "exec_inject"
 	ActionMCPRun            = "mcp_run"
+	ActionAuditTail         = "audit_tail"
 	ActionDenied            = "denied"
 	ActionRedactionDisabled = "redaction_disabled"
 	ActionNetworkAllowed    = "network_allowed"

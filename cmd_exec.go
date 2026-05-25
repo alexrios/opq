@@ -222,6 +222,9 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 		if isBlockedEnvName(envName) {
 			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go); cannot be injected via --env", envName)
 		}
+		if !validSecretName(secretName) {
+			return nil, fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", secretName)
+		}
 		if seen[envName] {
 			return nil, fmt.Errorf("env var %q specified twice", envName)
 		}
@@ -231,8 +234,17 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 	return out, nil
 }
 
+// maxEnvNameBytes caps the length of an injected env-var name. Real POSIX
+// names are short (PATH, HOME, OPENAI_API_KEY, ...); the cap exists to bound
+// the env-table size a single --env / Env-map entry can produce, not to
+// enforce a strict POSIX rule.
+const maxEnvNameBytes = 256
+
 func validEnvName(s string) bool {
 	if s == "" {
+		return false
+	}
+	if len(s) > maxEnvNameBytes {
 		return false
 	}
 	for i, r := range s {

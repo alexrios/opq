@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -69,6 +70,7 @@ const (
 	// being returned as a tool result.
 	mcpMaxOutputBytes = 256 * 1024
 	mcpMaxEnvCount    = 32
+	mcpMaxArgCount    = 256
 	mcpMaxAuditTailN  = 200
 )
 
@@ -249,11 +251,18 @@ func clampAuditTailN(requested int) int {
 func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input runWithSecretsInput) (*mcp.CallToolResult, runWithSecretsOutput, error) {
 	if input.Command == "" {
 		// H1: user-controlled input validation — safe to return as-is.
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr("command is required"), runWithSecretsOutput{}, nil
 	}
 	if len(input.Env) > mcpMaxEnvCount {
 		// H1: user-controlled input validation — safe to return as-is.
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr(fmt.Sprintf("too many env vars in one call (%d > %d)", len(input.Env), mcpMaxEnvCount)), runWithSecretsOutput{}, nil
+	}
+	if len(input.Args) > mcpMaxArgCount {
+		// H1: user-controlled input validation — safe to return as-is.
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
+		return aiUserErr(fmt.Sprintf("too many args in one call (%d > %d)", len(input.Args), mcpMaxArgCount)), runWithSecretsOutput{}, nil
 	}
 
 	profile, err := resolveMCPSandbox(input.AllowNetwork, input.Isolation)
@@ -300,6 +309,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		if !validEnvName(envName) {
 			// H1: envName is AI-supplied but we already validated it is a
 			// simple identifier; safe to echo back for diagnostics.
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_env_name"})
 			return aiUserErr(fmt.Sprintf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
 		}
 		if isBlockedEnvName(envName) {
@@ -307,7 +317,16 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			// env var name (PATH, LD_*, BASH_ENV, MAVEN_OPTS, NODE_OPTIONS,
 			// GIT_CONFIG_*, etc.). The envName is AI-supplied; echoing it
 			// for the deny-list diagnostic is safe and actionable.
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "env_blocked"})
 			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go)", envName)), runWithSecretsOutput{}, nil
+		}
+		if !validSecretName(secretName) {
+			// Taxonomy-style for MCP. The AI can read its own input back via
+			// the audit log; verbose detail is operator-facing only. Audit
+			// the rejection so an AI probing the shape validator leaves a
+			// trace — the deterrent matches the backend.Get not_found path.
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_secret_name"})
+			return aiUserErr("invalid_secret_name"), runWithSecretsOutput{}, nil
 		}
 		buf, err := backend.Get(ctx, secretName)
 		if err != nil {
@@ -557,6 +576,15 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	// we still return up to n entries. In the worst case all entries are CLI
 	// entries and we return an empty list — that is correct behaviour.
 	n := clampAuditTailN(input.N)
+	// J-5: record EVERY audit_tail call (caller-tagged "mcp") BEFORE the read,
+	// so an AI scraping the operator's activity is itself visible in the log,
+	// even if the underlying tailAudit call fails. Message carries the
+	// requested-after-clamp size only; no caller-controlled bytes.
+	_ = AppendAudit(AuditEvent{
+		Action:  ActionAuditTail,
+		Caller:  callerTag(),
+		Message: fmt.Sprintf("n=%d", n),
+	})
 	lines, err := tailAudit(mcpMaxAuditTailN)
 	if err != nil {
 		// H1: tailAudit error may contain file-system paths; sanitize.
@@ -564,11 +592,21 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	}
 
 	// Apply MCP-specific filters (M3 caller filter, C1 raw_exit strip).
+	// The self-log entry we just appended (J-5) is included in `lines` and
+	// passes the filter — strip it so the AI's requested-n window isn't
+	// occupied by its own bookkeeping. The self-log entry's existence
+	// remains visible to the operator via `opq audit` and to subsequent
+	// AI calls (we strip the most-recent audit_tail row only; older ones
+	// from prior calls are still returned as the deterrent the design
+	// promises).
 	filtered := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if out, ok := filterAuditLineForAI(line); ok {
 			filtered = append(filtered, out)
 		}
+	}
+	if len(filtered) > 0 && isCurrentAuditTailSelfEntry(filtered[len(filtered)-1]) {
+		filtered = filtered[:len(filtered)-1]
 	}
 	// Return at most the requested n entries (last n after filter).
 	if len(filtered) > n {
@@ -578,6 +616,21 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(filtered, "\n")}},
 	}, auditTailOutput{Entries: filtered}, nil
+}
+
+// isCurrentAuditTailSelfEntry reports whether a serialized audit-line JSON
+// is an audit_tail event written by this process (matched by PID). Used to
+// strip the self-log entry that handleAuditTail just wrote from its own
+// returned window so the AI's requested `n` is not partially consumed by
+// the call's own bookkeeping. The strip is intentionally narrow — only
+// the LAST line by THIS PID is removed; older audit_tail entries from
+// prior calls survive as the deterrent the J-5 design promises.
+func isCurrentAuditTailSelfEntry(line string) bool {
+	var ev AuditEvent
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		return false
+	}
+	return ev.Action == ActionAuditTail && ev.PID == os.Getpid()
 }
 
 // sanitizeErrForAI converts any error into a fixed-taxonomy string that is
@@ -670,9 +723,12 @@ func filterAuditLineForAI(line string) (string, bool) {
 		return "", false
 	}
 
-	// C1: strip raw_exit* tokens from mcp_run messages.
+	// C1/J-10: filter the mcp_run Message field to a small allowlist of
+	// AI-visible keys. Gated to ActionMCPRun only — other actions
+	// (audit_tail, list, denied) currently emit either no Message or
+	// AI-side bookkeeping that has no AI-relevant operator detail to leak.
 	if ev.Action == ActionMCPRun && ev.Message != "" {
-		ev.Message = stripRawExitTokens(ev.Message)
+		ev.Message = filterAuditMessageForAI(ev.Message)
 	}
 
 	out, err := json.Marshal(ev)
@@ -683,15 +739,61 @@ func filterAuditLineForAI(line string) (string, bool) {
 	return string(out), true
 }
 
-// stripRawExitTokens removes any space-separated token from msg whose key
-// (the part before '=') has the prefix "raw_exit". This handles the current
-// "raw_exit=NN" format as well as any future variant (raw_exit_hex, etc.).
-func stripRawExitTokens(msg string) string {
-	tokens := strings.Fields(msg)
-	out := tokens[:0]
+// aiAuditMessageAllowlist is the closed set of `key=value` tokens that may
+// appear in an AI-visible audit-log Message. Every other token is dropped.
+// Bare (no '=') tokens are also dropped. Adding a key here is a deliberate
+// audit-channel widening — every entry below has been reviewed for AI-leak
+// implications.
+//
+//	stdout_truncated  — 1-bit oracle, already exposed in the run_with_secrets
+//	                    result; redundant in the audit stream but harmless.
+//	stderr_truncated  — same.
+//	timed_out         — same.
+//
+// Explicitly NOT on the list (and therefore stripped):
+//
+//	raw_exit          — 8-bit exit-code oracle; normalizeExit withholds it.
+//	elapsed_ms        — wall-clock timing oracle; never exposed in the
+//	                    run_with_secrets result, must not leak via audit.
+//	exec_*            — operator-facing diagnostic detail; not for AI.
+//
+// Future contributors: do NOT add a key here without writing a one-line
+// justification of why the AI seeing it does not enable a side-channel.
+var aiAuditMessageAllowlist = map[string]bool{
+	"stdout_truncated": true,
+	"stderr_truncated": true,
+	"timed_out":        true,
+}
+
+// filterAuditMessageForAI rebuilds an audit Message containing only tokens
+// whose key is on the aiAuditMessageAllowlist. The empty string is returned
+// if no tokens survive — that is a valid audit-line state (the `msg` field
+// is `omitempty` JSON).
+//
+// Invariant: every allowlisted token's value MUST NOT contain a literal
+// space. The function splits on ' ' to identify tokens, so a space inside a
+// value would split it and silently drop the trailing portion. Today every
+// producer (auditMCPRunMessage) emits boolean-shaped values; if a future
+// allowlist entry needs spaces in its value, switch the format to a
+// space-free encoding (e.g. URL encoding) before adding the key.
+func filterAuditMessageForAI(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	tokens := strings.Split(msg, " ")
+	// Allocate a fresh slice instead of aliasing tokens[:0]. The forward-
+	// scan loop happens to be safe with aliasing because every append
+	// position has already been read, but the invariant is non-local and
+	// would silently break if the loop is ever rewritten as a backward
+	// scan or rearranged to read positions after writes.
+	out := make([]string, 0, len(tokens))
 	for _, tok := range tokens {
-		key, _, _ := strings.Cut(tok, "=")
-		if strings.HasPrefix(key, "raw_exit") {
+		key, _, ok := strings.Cut(tok, "=")
+		if !ok {
+			// Bare token with no '='; drop (cannot be on allowlist).
+			continue
+		}
+		if !aiAuditMessageAllowlist[key] {
 			continue
 		}
 		out = append(out, tok)

@@ -87,6 +87,62 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	}
 }
 
+// TestSandboxNet_TmpfsMasksDBus (J-1) — the SandboxNet argv must mask
+// the standard Unix-socket directories (/run/user, /tmp) with tmpfs so
+// the child cannot reach the D-Bus / Secret Service / KWallet /
+// gpg-agent sockets that the netns alone does NOT block. We deliberately
+// do NOT mask /var/run/user separately — on all systemd distros it is a
+// symlink to /run/user, and masking the symlink target after the parent
+// /var/run path becomes a stale symlink causes bwrap to fail with
+// "Can't mkdir /var/run/user". Each tmpfs sequence must appear AFTER
+// --dev-bind / / so it shadows the host bind-mount (bwrap applies mounts
+// left-to-right).
+func TestSandboxNet_TmpfsMasksDBus(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	maskedDirs := []string{"/run/user", "/tmp"}
+	devBindIdx := indexOf(gotArgs, "--dev-bind")
+	if devBindIdx < 0 {
+		t.Fatalf("--dev-bind missing from SandboxNet argv: %v", gotArgs)
+	}
+	for _, dir := range maskedDirs {
+		if !hasSeq(gotArgs, []string{"--tmpfs", dir}) {
+			t.Errorf("SandboxNet argv missing '--tmpfs %s' mask: %v", dir, gotArgs)
+			continue
+		}
+		// The tmpfs must come AFTER --dev-bind / /. Find the --tmpfs <dir>
+		// pair and assert the --tmpfs token sits past the dev-bind index.
+		for i := 0; i+1 < len(gotArgs); i++ {
+			if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == dir {
+				if i < devBindIdx {
+					t.Errorf("--tmpfs %s (idx %d) must come AFTER --dev-bind (idx %d): %v",
+						dir, i, devBindIdx, gotArgs)
+				}
+				break
+			}
+		}
+	}
+	// Forbidden masks: re-introducing --tmpfs /var/run/user breaks bwrap on
+	// every systemd distro because /var/run is a symlink to /run; after
+	// --tmpfs /run/user empties the target, bwrap cannot mkdir
+	// /var/run/user inside the now-empty tmpfs. Guard against the
+	// regression with an explicit negative assertion.
+	if hasSeq(gotArgs, []string{"--tmpfs", "/var/run/user"}) {
+		t.Errorf("SandboxNet argv must NOT mask /var/run/user (the /var/run -> /run symlink covers it; explicit mask breaks bwrap): %v", gotArgs)
+	}
+}
+
 func TestWrapCommand_SandboxFull_BwrapArgv(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only sandbox")
@@ -146,6 +202,41 @@ func TestVerifySandboxAvailable_BwrapMissing(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing install hint %q: %s", want, msg)
 		}
+	}
+}
+
+// TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken (J-9) — a host
+// where bwrap reports a healthy version but cannot actually create
+// namespaces (e.g. AppArmor profile blocks unshare) must surface the
+// failure at startup rather than as obscure run_with_secrets failures
+// later. We simulate by planting a fake bwrap on PATH that prints the
+// expected version string for --version and exits 1 on any other argv
+// (i.e. the namespace-probe invocation).
+func TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("/bin/sh required")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "bwrap")
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  --version) echo 'bubblewrap 0.11.0'; exit 0;;\n" +
+		"  *) echo 'fake bwrap: setting up user namespace: Operation not permitted' 1>&2; exit 1;;\n" +
+		"esac\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bwrap: %v", err)
+	}
+	t.Setenv("PATH", dir)
+
+	err := VerifySandboxAvailable()
+	if err == nil {
+		t.Fatalf("expected probe error when bwrap exits 1 on namespace flags")
+	}
+	if !strings.Contains(err.Error(), "namespace probe") {
+		t.Errorf("expected error to mention 'namespace probe', got: %v", err)
 	}
 }
 

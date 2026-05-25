@@ -1,6 +1,50 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// TestValidSecretName_Table locks J-14: secret-name shape gate. Names
+// outside [A-Za-z0-9_.-]{1,128} are rejected at the call site (CLI and
+// MCP) before any caller-controlled bytes reach the operator-visible
+// audit log.
+func TestValidSecretName_Table(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		// accepted shapes
+		{"typical_underscore", "openai_api_key", true},
+		{"single_char", "a", true},
+		{"all_classes", "Key.v2-9_x", true},
+		{"dot_only_valid_inside", "key.v2", true},
+		{"dash_only_valid_inside", "key-v2", true},
+		{"digits", "123", true},
+		{"max_len_128", strings.Repeat("a", 128), true},
+		// rejected
+		{"empty", "", false},
+		{"len_129", strings.Repeat("a", 129), false},
+		{"len_512", strings.Repeat("a", 512), false},
+		{"space_inside", "key with space", false},
+		{"slash", "key/slash", false},
+		{"dollar", "key$dollar", false},
+		{"equals", "key=value", false},
+		{"newline", "key\nbad", false},
+		{"nul", "key\x00bad", false},
+		{"non_ascii", "kéy", false},
+		{"colon", "key:v2", false},
+		{"backslash", "key\\v2", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := validSecretName(c.in); got != c.want {
+				t.Fatalf("validSecretName(%q) = %v, want %v", c.in, got, c.want)
+			}
+		})
+	}
+}
 
 func TestIsBlockedEnvName_ExactMap(t *testing.T) {
 	blocked := []string{

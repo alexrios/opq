@@ -12,7 +12,10 @@ func TestBuffer_RoundTrip(t *testing.T) {
 	src := []byte("sk-test-12345")
 	original := append([]byte(nil), src...)
 
-	b := NewBufferFromBytes(src)
+	b, err := NewBufferFromBytes(src)
+	if err != nil {
+		t.Fatalf("NewBufferFromBytes: %v", err)
+	}
 	defer b.Destroy()
 
 	if !b.IsAlive() {
@@ -28,7 +31,10 @@ func TestBuffer_RoundTrip(t *testing.T) {
 
 func TestBuffer_SourceWipedAfterMove(t *testing.T) {
 	src := []byte("sk-source-wipe-test")
-	b := NewBufferFromBytes(src)
+	b, err := NewBufferFromBytes(src)
+	if err != nil {
+		t.Fatalf("NewBufferFromBytes: %v", err)
+	}
 	defer b.Destroy()
 
 	// memguard.Move wipes the source; src must not still hold the secret.
@@ -38,7 +44,10 @@ func TestBuffer_SourceWipedAfterMove(t *testing.T) {
 }
 
 func TestBuffer_DestroyZeroes(t *testing.T) {
-	b := NewBufferFromBytes([]byte("destroy-me"))
+	b, err := NewBufferFromBytes([]byte("destroy-me"))
+	if err != nil {
+		t.Fatalf("NewBufferFromBytes: %v", err)
+	}
 	if !b.IsAlive() {
 		t.Fatal("expected alive")
 	}
@@ -51,6 +60,28 @@ func TestBuffer_DestroyZeroes(t *testing.T) {
 	}
 	// Double-destroy is a no-op.
 	b.Destroy()
+}
+
+func TestBuffer_FromBytesEmpty(t *testing.T) {
+	// Stable error text is part of the contract — backend.go wraps this
+	// error via fmt.Errorf("keyring get: %w", err) and callers do not
+	// errors.Is against a sentinel today, so the text is what propagates
+	// to operator-facing logs and audit messages. If this changes, update
+	// every grep for "empty secret value" in the codebase.
+	const wantMsg = "empty secret value"
+	for _, in := range [][]byte{nil, {}} {
+		buf, err := NewBufferFromBytes(in)
+		if buf != nil {
+			t.Errorf("expected nil buffer for empty input, got %v", buf)
+		}
+		if err == nil {
+			t.Errorf("expected error for empty input %v", in)
+			continue
+		}
+		if !strings.Contains(err.Error(), wantMsg) {
+			t.Errorf("error %q does not contain %q", err.Error(), wantMsg)
+		}
+	}
 }
 
 func TestBuffer_FromReader(t *testing.T) {

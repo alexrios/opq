@@ -151,6 +151,66 @@ func TestSandboxNone_AllowsNetwork(t *testing.T) {
 	}
 }
 
+// TestSandboxNet_DBusUnreachable (J-1) — the SandboxNet tmpfs masks on
+// /run/user and /tmp must hide the D-Bus session bus socket and other
+// filesystem-path Unix sockets that --unshare-net does NOT block. On
+// systemd distros /var/run is a symlink to /run, so masking /run/user
+// also masks /var/run/user. We attempt to stat /run/user/$(id -u)/bus
+// from inside the sandbox; either the directory is missing (tmpfs is
+// empty) or the file is absent — either way, the child must not be able
+// to reach the host's keyring/D-Bus socket. Same check for /tmp.
+func TestSandboxNet_DBusUnreachable(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not available")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("/bin/sh required")
+	}
+
+	// One sh invocation, two checks. We test for the .../bus socket and
+	// also for any contents in /tmp. The UID is resolved on the host (not
+	// inside the sandbox via $(id -u)) so the test still functions on
+	// stripped environments where /usr/bin/id is missing — otherwise the
+	// substituted path becomes /run/user//bus and ls fails with ENOENT
+	// regardless of whether the mask is working. The script always exits
+	// 0; the test inspects the combined output.
+	uid := os.Getuid()
+	out, _, err := runUnderSandbox(t, SandboxNet, "sh", "-c",
+		fmt.Sprintf("ls -A /run/user/%d/bus 2>&1; echo ---; ls -A /tmp 2>&1", uid),
+	)
+	if err != nil {
+		t.Fatalf("wrap err: %v", err)
+	}
+	// Host-side bwrap setup failure (e.g. a symlinked mount path that
+	// can't be mkdir'd after a tmpfs mask) prints "bwrap: ..." and never
+	// reaches our `---` divider. This is the exact failure mode of the
+	// /var/run/user regression J-1 originally shipped with, so failing
+	// loudly here is the regression guard — do NOT skip.
+	if strings.HasPrefix(strings.TrimSpace(out), "bwrap:") {
+		t.Fatalf("bwrap setup failed under SandboxNet (likely a J-1 regression — tmpfs mask broke the mount layout): %q", out)
+	}
+	parts := strings.SplitN(out, "---", 2)
+	if len(parts) != 2 {
+		t.Fatalf("expected '---' divider in output, got: %q", out)
+	}
+	busOut := strings.TrimSpace(parts[0])
+	tmpOut := strings.TrimSpace(parts[1])
+	// The D-Bus socket path must be unreachable. Accept any of:
+	//   "No such file or directory"
+	//   "ls: cannot access ..." (busybox)
+	//   empty (directory doesn't exist; some sh versions swallow the err)
+	if strings.Contains(busOut, "/bus") && !strings.Contains(strings.ToLower(busOut), "no such") &&
+		!strings.Contains(strings.ToLower(busOut), "cannot") {
+		// A bare "/run/user/<uid>/bus" line in output without a
+		// "no such"/"cannot" error indicates the socket survived the tmpfs.
+		t.Errorf("D-Bus socket appears reachable under SandboxNet: %q", busOut)
+	}
+	// /tmp must be an empty tmpfs (ls -A on empty dir prints nothing).
+	if tmpOut != "" {
+		t.Errorf("/tmp not empty under SandboxNet (cross-call channel open): %q", tmpOut)
+	}
+}
+
 // TestSandboxNet_SiblingProcIsolation verifies fix for finding C2 (v1.1.1 security review):
 // a sibling SandboxNet subprocess must not be able to read another sibling's
 // /proc/<pid>/environ (which would expose injected secrets).

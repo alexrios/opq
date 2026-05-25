@@ -407,12 +407,14 @@ func mcpResultText(res *mcp.CallToolResult) string {
 
 // ----- Phase 3 security-fix tests (C1, M3, H1) -----
 
-// TestAuditTailMCP_StripsRawExit (C1) verifies that handleAuditTail does not
-// return raw_exit tokens to an MCP caller, closing the exit-code oracle.
-func TestAuditTailMCP_StripsRawExit(t *testing.T) {
+// TestAuditTailMCP_AllowlistFilter (C1/J-10) verifies that handleAuditTail
+// applies the AI-visible allowlist filter to mcp_run messages: raw_exit is
+// stripped (exit-code oracle defense) AND elapsed_ms is stripped (timing
+// oracle defense, J-6). Only allowlisted keys survive.
+func TestAuditTailMCP_AllowlistFilter(t *testing.T) {
 	withAuditTmpDir(t)
 
-	// Write an mcp_run audit line that contains raw_exit=42.
+	// Write an mcp_run audit line that contains raw_exit=42 and elapsed_ms=100.
 	ev := AuditEvent{
 		Action:  ActionMCPRun,
 		Caller:  "mcp",
@@ -433,11 +435,9 @@ func TestAuditTailMCP_StripsRawExit(t *testing.T) {
 		if strings.Contains(line, "raw_exit") {
 			t.Errorf("raw_exit leaked to AI in line: %s", line)
 		}
-	}
-	// The other fields must still be present.
-	combined := strings.Join(out.Entries, "\n")
-	if !strings.Contains(combined, "elapsed_ms=100") {
-		t.Errorf("elapsed_ms missing from filtered output: %s", combined)
+		if strings.Contains(line, "elapsed_ms") {
+			t.Errorf("elapsed_ms leaked to AI in line: %s", line)
+		}
 	}
 }
 
@@ -638,24 +638,360 @@ func TestFilterAuditLineForAI_EmptyDropped(t *testing.T) {
 	}
 }
 
-// TestStripRawExitTokens verifies all raw_exit variants are removed.
-func TestStripRawExitTokens(t *testing.T) {
+// TestFilterAuditLineForAI_AuditTailSurvives verifies that ActionAuditTail
+// entries pass through filterAuditLineForAI WITHOUT having their Message
+// filtered. The allowlist gate (filterAuditMessageForAI) is intentionally
+// scoped to ActionMCPRun only — broadening it would silently drop the
+// `n=N` token from audit_tail self-log entries (a J-5 deterrent the AI is
+// supposed to see). This test locks that scope so a future refactor that
+// widens the condition (e.g. `ev.Action != ActionList`) trips here.
+func TestFilterAuditLineForAI_AuditTailSurvives(t *testing.T) {
+	raw, err := json.Marshal(AuditEvent{
+		Timestamp: time.Now().UTC(),
+		Action:    ActionAuditTail,
+		Caller:    "mcp",
+		Message:   "n=20",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out, ok := filterAuditLineForAI(string(raw))
+	if !ok {
+		t.Fatal("expected audit_tail line to be kept by filter")
+	}
+	var ev AuditEvent
+	if err := json.Unmarshal([]byte(out), &ev); err != nil {
+		t.Fatalf("unmarshal filtered line: %v", err)
+	}
+	if ev.Message != "n=20" {
+		t.Errorf("audit_tail msg mutated by filter: got %q, want %q", ev.Message, "n=20")
+	}
+}
+
+// TestAIAuditMessageAllowlist_Invariant locks the exact set of keys
+// permitted in AI-visible audit Message fields. Every entry below is a
+// closed-set widening of the AI's audit channel and was reviewed for
+// side-channel implications when added (see the godoc on
+// aiAuditMessageAllowlist for the per-key justifications). Adding a new
+// key REQUIRES updating this test, which forces the contributor to write
+// a one-line justification and re-read the threat-model commentary.
+func TestAIAuditMessageAllowlist_Invariant(t *testing.T) {
+	want := map[string]bool{
+		"stdout_truncated": true,
+		"stderr_truncated": true,
+		"timed_out":        true,
+	}
+	if len(aiAuditMessageAllowlist) != len(want) {
+		t.Fatalf("allowlist size changed: got %d keys, want %d (every change to this list MUST be reviewed for AI-leak implications)",
+			len(aiAuditMessageAllowlist), len(want))
+	}
+	for k := range want {
+		if !aiAuditMessageAllowlist[k] {
+			t.Errorf("allowlist missing expected key %q", k)
+		}
+	}
+	for k := range aiAuditMessageAllowlist {
+		if !want[k] {
+			t.Errorf("allowlist contains unexpected key %q — review the side-channel implications before widening this test", k)
+		}
+	}
+}
+
+// TestFilterAuditMessageForAI verifies the allowlist filter keeps known-safe
+// keys and drops all others (including raw_exit and elapsed_ms).
+func TestFilterAuditMessageForAI(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 	}{
-		{"secrets=foo raw_exit=42 elapsed_ms=100", "secrets=foo elapsed_ms=100"},
+		{"secrets=foo raw_exit=42 elapsed_ms=100", ""},
 		{"raw_exit=-1 timed_out=true", "timed_out=true"},
-		{"raw_exit=0 elapsed_ms=5", "elapsed_ms=5"},
+		{"raw_exit=0 elapsed_ms=5", ""},
 		{"raw_exit=255 stdout_truncated=true", "stdout_truncated=true"},
-		{"secrets=bar elapsed_ms=10", "secrets=bar elapsed_ms=10"},   // no raw_exit token
+		{"secrets=bar elapsed_ms=10", ""}, // both non-allowlisted
+		{"stdout_truncated=true stderr_truncated=true timed_out=true", "stdout_truncated=true stderr_truncated=true timed_out=true"},
 		{"", ""},
 	}
 	for _, c := range cases {
-		got := stripRawExitTokens(c.in)
+		got := filterAuditMessageForAI(c.in)
 		if got != c.want {
-			t.Errorf("stripRawExitTokens(%q) = %q, want %q", c.in, got, c.want)
+			t.Errorf("filterAuditMessageForAI(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestHandleRunWithSecrets_RejectsBadSecretName (J-14) — the MCP surface
+// rejects malformed secret names with the taxonomy string
+// "invalid_secret_name" before any backend lookup. Asserting via a
+// real-backend-or-not setup is fine because the validation gate runs
+// strictly BEFORE the backend.Get call.
+func TestHandleRunWithSecrets_RejectsBadSecretName(t *testing.T) {
+	withAuditTmpDir(t)
+
+	cases := []struct {
+		envName, secretName string
+	}{
+		{"API", "bad name"},
+		{"API", "bad/path"},
+		{"API", "bad$value"},
+		{"API", strings.Repeat("a", 129)},
+		{"API", ""},
+		{"API", "bad\nname"},
+	}
+	for _, c := range cases {
+		t.Run(c.secretName, func(t *testing.T) {
+			res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+				Command: "/bin/true",
+				Env:     map[string]string{c.envName: c.secretName},
+			})
+			if err != nil {
+				t.Fatalf("unexpected transport error: %v", err)
+			}
+			if res == nil || !res.IsError {
+				t.Fatalf("expected IsError result for bad secret %q, got %+v", c.secretName, res)
+			}
+			text := mcpResultText(res)
+			if !strings.Contains(text, "invalid_secret_name") {
+				t.Fatalf("expected 'invalid_secret_name' taxonomy, got %q", text)
+			}
+			// Validation runs BEFORE backend.Get, so any 'denied' audit
+			// entry must come from the validator itself (Message =
+			// "invalid_secret_name"), not from a backend lookup (Message
+			// = "not_found" / "backend_error"). The validator MUST emit a
+			// 'denied' entry so an AI probing the shape gate leaves a
+			// trace — see Finding 4 in /tmp/opaque-qa/codereview-findings.md.
+			lines, _ := tailAudit(100)
+			sawValidatorDenied := false
+			for _, line := range lines {
+				if strings.Contains(line, `"action":"denied"`) {
+					switch {
+					case strings.Contains(line, `"msg":"invalid_secret_name"`):
+						sawValidatorDenied = true
+					case strings.Contains(line, `"msg":"not_found"`),
+						strings.Contains(line, `"msg":"backend_error"`):
+						t.Errorf("validation must run BEFORE backend.Get; saw backend-shaped 'denied' entry: %s", line)
+					}
+				}
+			}
+			if !sawValidatorDenied {
+				t.Errorf("validator must emit a 'denied' audit entry with msg=invalid_secret_name; none seen in: %v", lines)
+			}
+		})
+	}
+}
+
+// TestHandleRunWithSecrets_RejectsTooManyArgs (J-16) — input.Args length
+// must be capped at mcpMaxArgCount (256). 257 args is rejected with the
+// taxonomy "too many args" before any backend or sandbox work.
+func TestHandleRunWithSecrets_RejectsTooManyArgs(t *testing.T) {
+	args := make([]string, mcpMaxArgCount+1)
+	for i := range args {
+		args[i] = "x"
+	}
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: "/bin/true",
+		Args:    args,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError result for oversize args, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if !strings.Contains(text, "too many args") {
+		t.Fatalf("expected 'too many args' message, got %q", text)
+	}
+}
+
+// TestHandleRunWithSecrets_AcceptsArgsAtCap (J-16) — 256 args is within
+// the cap and must not be rejected by the args-cap check. The call may
+// still fail downstream (e.g. backend unavailable or sandbox probe), but
+// the failure must not be the args-cap error.
+func TestHandleRunWithSecrets_AcceptsArgsAtCap(t *testing.T) {
+	args := make([]string, mcpMaxArgCount)
+	for i := range args {
+		args[i] = "x"
+	}
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: "/bin/true",
+		Args:    args,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	// If a result was returned (success or failure), it must not be the
+	// args-cap error. Downstream failures (sandbox unavailable, backend
+	// unavailable, etc.) are acceptable here — the assertion is narrowly
+	// that the args-cap gate passed.
+	if res != nil {
+		text := mcpResultText(res)
+		if strings.Contains(text, "too many args") {
+			t.Fatalf("256 args wrongly rejected by args-cap: %q", text)
+		}
+	}
+}
+
+// TestHandleAuditTail_EmitsAuditEntry (J-5) — every audit_tail MCP call
+// must itself leave an audit entry (caller=mcp, action=audit_tail,
+// msg="n=<clamped>"). Without this, an AI scraping the operator's
+// activity via repeated audit_tail calls is invisible to the operator.
+func TestHandleAuditTail_EmitsAuditEntry(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	res, _, err := handleAuditTail(context.Background(), nil, auditTailInput{})
+	if err != nil {
+		t.Fatalf("handleAuditTail: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultText(res))
+	}
+
+	// Read the audit log directly (tailAudit returns CLI-unfiltered view)
+	// and look for the audit_tail entry. clampAuditTailN(0) = 20, so
+	// the entry's msg must be "n=20".
+	lines, err := tailAudit(20)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	var found *AuditEvent
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionAuditTail {
+			ev := ev // shadow into stable address
+			found = &ev
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no audit_tail entry found in audit log; lines=%v", lines)
+	}
+	if found.Caller != "mcp" {
+		t.Errorf("audit_tail entry caller = %q, want mcp", found.Caller)
+	}
+	if found.Message != "n=20" {
+		t.Errorf("audit_tail entry msg = %q, want n=20 (default after clamp)", found.Message)
+	}
+}
+
+// TestHandleAuditTail_EmitsAuditEntry_CustomN (J-5) — when the AI passes
+// a specific N, the audit entry must reflect the clamped value.
+func TestHandleAuditTail_EmitsAuditEntry_CustomN(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// 99999 clamps to mcpMaxAuditTailN (200).
+	_, _, err := handleAuditTail(context.Background(), nil, auditTailInput{N: 99999})
+	if err != nil {
+		t.Fatalf("handleAuditTail: %v", err)
+	}
+	lines, err := tailAudit(20)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	wantMsg := fmt.Sprintf("n=%d", mcpMaxAuditTailN)
+	var seen bool
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionAuditTail && ev.Message == wantMsg {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Fatalf("audit_tail entry with msg=%q not found in %v", wantMsg, lines)
+	}
+}
+
+// TestFilterAuditLineForAI_StripsElapsedMs (J-10/J-6) — a synthetic
+// audit_run JSON line carrying elapsed_ms must have that token stripped
+// from the AI-visible msg field. Also exercises that raw_exit and
+// exec_* tokens are stripped while allowlisted keys survive.
+func TestFilterAuditLineForAI_StripsElapsedMs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   AuditEvent
+		// want list of substrings that must NOT appear in the filtered line.
+		forbidden []string
+		// want list of substrings that MUST appear in the filtered line.
+		required []string
+	}{
+		{
+			name: "elapsed_ms_stripped",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "raw_exit=0 elapsed_ms=42 stdout_truncated=true",
+			},
+			forbidden: []string{"elapsed_ms", "raw_exit"},
+			required:  []string{"stdout_truncated=true"},
+		},
+		{
+			name: "raw_exit_negative_stripped",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "raw_exit=-1 elapsed_ms=60000 timed_out=true",
+			},
+			forbidden: []string{"raw_exit", "elapsed_ms"},
+			required:  []string{"timed_out=true"},
+		},
+		{
+			name: "exec_taxonomy_stripped",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "raw_exit=-1 elapsed_ms=10 exec_start_failed",
+			},
+			forbidden: []string{"raw_exit", "elapsed_ms", "exec_start_failed"},
+			required:  []string{},
+		},
+		{
+			name: "all_allowlisted_survive",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "stdout_truncated=true stderr_truncated=true timed_out=true",
+			},
+			forbidden: []string{"raw_exit", "elapsed_ms"},
+			required:  []string{"stdout_truncated=true", "stderr_truncated=true", "timed_out=true"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := json.Marshal(c.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			out, ok := filterAuditLineForAI(string(raw))
+			if !ok {
+				t.Fatalf("expected line to be kept, got dropped: %s", raw)
+			}
+			// Re-parse so we look at the msg field, not random JSON.
+			var got AuditEvent
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("unmarshal output: %v (line=%s)", err, out)
+			}
+			for _, bad := range c.forbidden {
+				if strings.Contains(got.Message, bad) {
+					t.Errorf("forbidden token %q present in filtered msg %q", bad, got.Message)
+				}
+			}
+			for _, want := range c.required {
+				if !strings.Contains(got.Message, want) {
+					t.Errorf("required token %q missing from filtered msg %q", want, got.Message)
+				}
+			}
+		})
 	}
 }
 

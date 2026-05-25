@@ -1,6 +1,30 @@
 package main
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
+
+// secretNameRe constrains the shape of a secret name accepted by either
+// the CLI (--env VAR=secret_name) or the MCP run_with_secrets tool's
+// Env map. The character class matches the shape of identifiers used
+// in keyring labels and audit logs:
+//
+//   - alphanumeric, underscore, dot, dash
+//   - 1..128 chars
+//
+// Names outside this shape are rejected at the call site; the keyring
+// library itself may accept wider character classes, but allowing
+// caller-controlled bytes to flow into the operator-visible audit log
+// (even JSON-escaped) is an avoidable readability and parser-hazard
+// risk. The cap also bounds the audit-log line size.
+var secretNameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+
+// validSecretName reports whether name is on the accepted shape for a
+// secret-name argument. Returns false for the empty string.
+func validSecretName(name string) bool {
+	return secretNameRe.MatchString(name)
+}
 
 // Variables on this list change how the dynamic linker, libc, or common
 // interpreters locate code, libraries, or config. Allowing an AI caller

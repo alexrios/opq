@@ -15,11 +15,15 @@ type Buffer struct {
 }
 
 // NewBufferFromBytes copies src into a locked buffer and wipes src in place.
-// Callers MUST stop using src after this call.
-func NewBufferFromBytes(src []byte) *Buffer {
+// Callers MUST stop using src after this call. Returns an error if src is
+// empty; memguard.NewBuffer(0) returns nil, and Move on nil panics.
+func NewBufferFromBytes(src []byte) (*Buffer, error) {
+	if len(src) == 0 {
+		return nil, errors.New("empty secret value")
+	}
 	b := memguard.NewBuffer(len(src))
 	b.Move(src)
-	return &Buffer{inner: b}
+	return &Buffer{inner: b}, nil
 }
 
 // NewBufferFromReader reads r to EOF into a locked buffer. The caller must

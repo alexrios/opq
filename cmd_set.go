@@ -20,8 +20,8 @@ type SetCmd struct {
 const maxSecretSize = 64 * 1024
 
 func (c *SetCmd) Run() error {
-	if c.Name == "" {
-		return errors.New("name must not be empty")
+	if !validSecretName(c.Name) {
+		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
 	}
 
 	ctx := context.Background()
@@ -42,7 +42,10 @@ func (c *SetCmd) Run() error {
 		if len(raw) == 0 {
 			return errors.New("empty secret value")
 		}
-		value = NewBufferFromBytes(raw)
+		value, err = NewBufferFromBytes(raw)
+		if err != nil {
+			return fmt.Errorf("buffer: %w", err)
+		}
 	} else {
 		value, err = NewBufferFromReader(io.LimitReader(os.Stdin, maxSecretSize+1))
 		if err != nil {
