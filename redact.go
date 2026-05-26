@@ -50,6 +50,27 @@ type redactSecret struct {
 	value []byte
 }
 
+// hasTruncationShortCircuit reports whether the downstream's Truncated()
+// short-circuit is wired (i.e. the constructor's one-shot type assertion
+// against truncatedReporter succeeded). Test-only introspection used by
+// the P2-6 regression test to lock the P1-1 pipeline invariant — if a
+// future refactor inserts an interposer between RedactingWriter and the
+// truncating sink that does not proxy Truncated(), this returns false
+// and the regression test fails before production damage. Production
+// code does not use this; it is intentionally lowercase (package-private)
+// so it stays out of the public API surface.
+//
+// NOTE: this checks structural wiring only (downTrunc != nil). It does
+// NOT verify that the downstream's Truncated() actually returns true
+// when bytes are dropped — an interposer that proxies the interface but
+// always returns false would pass this check. That semantic correctness
+// is covered by the companion behavioral test
+// TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation, which
+// asserts that passThrough flips after a real truncation event.
+func (r *RedactingWriter) hasTruncationShortCircuit() bool {
+	return r.downTrunc != nil
+}
+
 // NewRedactingWriter constructs a writer that redacts the given secrets.
 // The secrets slice is copied; the caller may destroy the source buffers
 // immediately after this returns. Empty secret values are skipped.

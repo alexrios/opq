@@ -204,6 +204,144 @@ func TestCappedWriter_RedactorSecretNeverLeaksUnderTruncation(t *testing.T) {
 	}
 }
 
+// TestRunWithSecretsPipeline_RedactorShortCircuitWired (P2-6, joint-review
+// 2026-05) locks the P1-1 short-circuit at the wiring level. If a future
+// refactor inserts an interposer (metering / logging / tee writer) between
+// RedactingWriter and cappedWriter that does NOT proxy Truncated(), the
+// one-shot type assertion in NewRedactingWriter fails silently. downTrunc
+// becomes nil, the short-circuit disappears, and an AI calling
+// run_with_secrets with a high-volume producer like `yes` burns the full
+// MCP timeout window scanning bytes the 256 KiB cap is dropping anyway.
+//
+// This test rebuilds the production handleRunWithSecrets output pipeline
+// byte-for-byte (mcp.go lines 398-406) and asserts the redactor reports
+// the short-circuit is wired. It intentionally lives in mcp_test.go (not
+// redact_test.go): the regression is a property of the MCP pipeline
+// assembly, not of RedactingWriter in isolation.
+func TestRunWithSecretsPipeline_RedactorShortCircuitWired(t *testing.T) {
+	// Mirror the production assembly. Any drift here from the real
+	// handleRunWithSecrets pipeline construction defeats the test.
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutCap := newCappedWriter(&stdoutBuf, mcpMaxOutputBytes)
+	stderrCap := newCappedWriter(&stderrBuf, mcpMaxOutputBytes)
+	named := []NamedSecret{{Name: "API", Value: []byte("sk-test-value")}}
+	stdoutRW := NewRedactingWriter(stdoutCap, named)
+	stderrRW := NewRedactingWriter(stderrCap, named)
+	defer stdoutRW.Destroy()
+	defer stderrRW.Destroy()
+
+	// Structural invariants of the wiring.
+	if !stdoutRW.hasTruncationShortCircuit() {
+		t.Fatalf("stdout RedactingWriter has nil downTrunc — the P1-1 short-circuit is no longer wired through the production pipeline. Likely cause: an interposer between RedactingWriter and cappedWriter that does not implement Truncated() bool.")
+	}
+	if !stderrRW.hasTruncationShortCircuit() {
+		t.Fatalf("stderr RedactingWriter has nil downTrunc — symmetry broken; only stdout is short-circuited.")
+	}
+
+	// Lock the cap constant. mcpMaxOutputBytes is the cap the production
+	// code passes; if either drifts the test should catch it.
+	if mcpMaxOutputBytes != 256*1024 {
+		t.Fatalf("mcpMaxOutputBytes = %d, want 256*1024 (256 KiB)", mcpMaxOutputBytes)
+	}
+	if stdoutCap.remaining != mcpMaxOutputBytes {
+		t.Fatalf("stdoutCap.remaining = %d, want %d", stdoutCap.remaining, mcpMaxOutputBytes)
+	}
+	if stderrCap.remaining != mcpMaxOutputBytes {
+		t.Fatalf("stderrCap.remaining = %d, want %d", stderrCap.remaining, mcpMaxOutputBytes)
+	}
+
+	// Initial state: pre-flip, no writes yet.
+	if stdoutRW.passThrough {
+		t.Fatalf("stdoutRW.passThrough should be false before any write")
+	}
+	if stderrRW.passThrough {
+		t.Fatalf("stderrRW.passThrough should be false before any write")
+	}
+}
+
+// TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation (P2-6) is the
+// behavioral half of the wiring assertion above. It writes more than the
+// cap through the production pipeline (with a small cap for test speed)
+// and confirms that the redactor flips into pass-through after truncation,
+// proving the short-circuit code path actually executes end-to-end rather
+// than just being structurally reachable.
+//
+// Determinism: this test does not measure CPU or wall time. It uses the
+// sticky passThrough bit and the cappedWriter byte counter as the signal,
+// both of which are deterministic state transitions.
+func TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation(t *testing.T) {
+	// Small cap so the test stays fast; the structural test above locks
+	// the production cap constant separately.
+	const cap = 1024
+	var inner bytes.Buffer
+	cw := newCappedWriter(&inner, cap)
+	rw := NewRedactingWriter(cw, []NamedSecret{{Name: "API", Value: []byte("sekret")}})
+	defer rw.Destroy()
+
+	if !rw.hasTruncationShortCircuit() {
+		t.Fatalf("precondition: downTrunc must be wired for this test to be meaningful")
+	}
+
+	// First write: cap + 1 bytes. cappedWriter consumes `cap` bytes and
+	// drops the trailing byte, flipping truncated=true. The RedactingWriter
+	// only checks downTrunc.Truncated() at the START of its own Write, so
+	// passThrough is still false at this point.
+	first := bytes.Repeat([]byte("A"), cap+1)
+	if _, err := rw.Write(first); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if !cw.Truncated() {
+		t.Fatalf("cappedWriter should have flipped truncated=true after writing cap+1 bytes")
+	}
+	// Lock cap exhaustion explicitly. Without this, a future inner-writer
+	// that partially accepts bytes (n < len(p), no error) would leave
+	// remaining > 0 and the second write below could still grow `inner`,
+	// making the inner.Len() == preLen assertion misleading. bytes.Buffer
+	// today always accepts the full slice, so this is defense-in-depth.
+	if cw.remaining != 0 {
+		t.Fatalf("cap not fully exhausted after first write: remaining=%d, want 0", cw.remaining)
+	}
+	if rw.passThrough {
+		t.Fatalf("rw.passThrough should still be false — the flip happens on the NEXT Write")
+	}
+
+	// Second write: this triggers the short-circuit check at the top of
+	// RedactingWriter.Write. The secret "sekret" must come through verbatim
+	// to the cappedWriter (which then drops it because the cap is exhausted),
+	// proving scan() was bypassed.
+	preLen := inner.Len()
+	if _, err := rw.Write([]byte("B sekret B")); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	// Assert the sticky passThrough bit is now set — this is the P1-1
+	// short-circuit having fired.
+	if !rw.passThrough {
+		t.Fatalf("rw.passThrough must be true after the second write — the short-circuit did not fire")
+	}
+	// Holdover must have been zeroed on the flip (redact.go lines 101-106).
+	if len(rw.holdover) != 0 {
+		t.Fatalf("rw.holdover must be empty after the flip, got %d bytes", len(rw.holdover))
+	}
+	// Inner buffer must not have grown past the cap: cappedWriter drops
+	// post-cap bytes, and the redactor handed them off verbatim (proving
+	// it did not retry / split / hold them).
+	if inner.Len() != preLen {
+		t.Fatalf("inner buffer grew past the cap: was %d, now %d (cap=%d)", preLen, inner.Len(), cap)
+	}
+	if inner.Len() > cap {
+		t.Fatalf("inner.Len() = %d exceeds cap %d", inner.Len(), cap)
+	}
+	// No redaction token must appear post-flip in the inner buffer: bytes
+	// past the cap are dropped, so the only post-flip evidence we can read
+	// is the absence of growth above. Also assert no raw secret leaked
+	// into the captured (pre-cap) portion — this is a separate invariant
+	// from the short-circuit, but a cheap sanity check.
+	if bytes.Contains(inner.Bytes(), []byte("sekret")) {
+		t.Fatalf("raw secret leaked into pre-cap buffer: %q", inner.String())
+	}
+}
+
 func TestHandleRunWithSecrets_EnvCountCap(t *testing.T) {
 	// 33 entries should be rejected before any keyring access. We
 	// can't easily mock the keyring, so we rely on the cap check being
