@@ -241,6 +241,149 @@ func TestRedact_NoFalsePositives(t *testing.T) {
 	}
 }
 
+// truncatingWriter mirrors mcp.cappedWriter's contract: it forwards bytes
+// to an inner buffer up to `cap`, then silently drops further bytes and
+// reports truncated=true. Used to exercise the RedactingWriter P1-1
+// short-circuit without pulling in the MCP package.
+type truncatingWriter struct {
+	inner     bytes.Buffer
+	remaining int
+	truncated bool
+}
+
+func (t *truncatingWriter) Write(p []byte) (int, error) {
+	if t.remaining <= 0 {
+		t.truncated = true
+		return len(p), nil
+	}
+	if len(p) <= t.remaining {
+		n, err := t.inner.Write(p)
+		t.remaining -= n
+		return n, err
+	}
+	take := p[:t.remaining]
+	n, err := t.inner.Write(take)
+	t.remaining -= n
+	t.truncated = true
+	if err != nil {
+		return n, err
+	}
+	return len(p), nil
+}
+
+func (t *truncatingWriter) Truncated() bool { return t.truncated }
+
+// plainWriter has no Truncated() method — used to confirm RedactingWriter
+// still redacts normally when the downstream does not implement the
+// optional truncatedReporter interface.
+type plainWriter struct{ bytes.Buffer }
+
+// TestRedact_NoTruncatedReporter_UnchangedBehavior confirms that when the
+// downstream writer does not implement truncatedReporter, RedactingWriter
+// behaves exactly as before: secrets are redacted, holdover works.
+func TestRedact_NoTruncatedReporter_UnchangedBehavior(t *testing.T) {
+	pw := &plainWriter{}
+	rw := NewRedactingWriter(pw, []NamedSecret{{Name: "K", Value: []byte("sk-12345")}})
+	if rw.downTrunc != nil {
+		t.Fatalf("downTrunc should be nil when downstream lacks Truncated()")
+	}
+	rw.Write([]byte("hello sk-12345 world"))
+	rw.Flush()
+	if got := pw.String(); got != "hello [REDACTED:K] world" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// TestRedact_ShortCircuitOnTruncation verifies P1-1: once the downstream
+// reports Truncated(), the redactor flips to pass-through and bytes that
+// would otherwise be redacted are forwarded verbatim. This is observable
+// because the truncatingWriter's inner buffer ALSO drops post-cap bytes,
+// so we test by setting the cap larger than the first batch but writing
+// the secret in the second batch after manually flipping truncated=true.
+func TestRedact_ShortCircuitOnTruncation(t *testing.T) {
+	tw := &truncatingWriter{remaining: 1 << 20} // generous cap; we'll flip manually
+	rw := NewRedactingWriter(tw, []NamedSecret{{Name: "K", Value: []byte("sekret")}})
+	if rw.downTrunc == nil {
+		t.Fatalf("downTrunc should be set when downstream implements Truncated()")
+	}
+
+	// Pre-flip: secret is redacted normally.
+	if _, err := rw.Write([]byte("before sekret\n")); err != nil {
+		t.Fatalf("pre-flip write: %v", err)
+	}
+	if !bytes.Contains(tw.inner.Bytes(), []byte("[REDACTED:K]")) {
+		t.Fatalf("pre-flip: expected redaction, got %q", tw.inner.String())
+	}
+
+	// Flip the downstream signal and write a fresh secret. The redactor
+	// must pass the bytes through verbatim, proving scan() was bypassed.
+	tw.truncated = true
+	preLen := tw.inner.Len()
+	if _, err := rw.Write([]byte("after sekret\n")); err != nil {
+		t.Fatalf("post-flip write: %v", err)
+	}
+	post := tw.inner.Bytes()[preLen:]
+	if !bytes.Contains(post, []byte("sekret")) {
+		t.Errorf("post-flip: expected raw passthrough (cap not yet hit), got %q", post)
+	}
+	if bytes.Contains(post, []byte("[REDACTED:K]")) {
+		t.Errorf("post-flip: redaction still applied, scan() was not bypassed: %q", post)
+	}
+
+	// Subsequent writes must remain in pass-through without re-checking
+	// (sanity: even if we cleared truncated, passThrough is sticky).
+	tw.truncated = false
+	preLen = tw.inner.Len()
+	if _, err := rw.Write([]byte("still sekret\n")); err != nil {
+		t.Fatalf("third write: %v", err)
+	}
+	post = tw.inner.Bytes()[preLen:]
+	if bytes.Contains(post, []byte("[REDACTED:K]")) {
+		t.Errorf("passthrough should be sticky; got %q", post)
+	}
+}
+
+// TestRedact_HoldoverDiscardedOnTruncation verifies that any holdover bytes
+// retained before the truncation flip are discarded (not retained, not
+// flushed downstream). The previous Write left "AB" in holdover as a
+// possible prefix of "ABCDEFGH"; after truncation, that holdover must be
+// dropped, and a subsequent Flush must not emit it.
+func TestRedact_HoldoverDiscardedOnTruncation(t *testing.T) {
+	tw := &truncatingWriter{remaining: 1 << 20}
+	rw := NewRedactingWriter(tw, []NamedSecret{{Name: "K", Value: []byte("ABCDEFGH")}})
+
+	// First write leaves "AB" in holdover (partial prefix of the secret).
+	if _, err := rw.Write([]byte("xx AB")); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if len(rw.holdover) == 0 {
+		t.Fatalf("expected non-empty holdover, got none")
+	}
+
+	// Flip and write — the holdover must be dropped, not flushed.
+	tw.truncated = true
+	preLen := tw.inner.Len()
+	if _, err := rw.Write([]byte(" tail")); err != nil {
+		t.Fatalf("post-flip write: %v", err)
+	}
+	if len(rw.holdover) != 0 {
+		t.Errorf("holdover should be cleared after truncation flip, got %q", rw.holdover)
+	}
+	post := tw.inner.Bytes()[preLen:]
+	// The "AB" that was in holdover must NOT reappear; only " tail" passes.
+	if bytes.Contains(post, []byte("AB")) {
+		t.Errorf("holdover bytes leaked downstream: %q", post)
+	}
+	if string(post) != " tail" {
+		t.Errorf("got %q, want %q", post, " tail")
+	}
+
+	// Flush must be a no-op (holdover already cleared).
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+
 func TestRedact_Destroy(t *testing.T) {
 	var buf bytes.Buffer
 	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: []byte("secret")}})

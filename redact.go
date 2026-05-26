@@ -20,6 +20,23 @@ type RedactingWriter struct {
 	secrets  []redactSecret
 	maxLen   int
 	holdover []byte
+	// downTrunc is non-nil iff the downstream writer implements
+	// truncatedReporter. Cached at construction to avoid a per-Write type
+	// assertion. Once downTrunc.Truncated() returns true, passThrough flips
+	// permanently and subsequent Writes bypass scan() entirely (P1-1: CPU
+	// DoS short-circuit — without it, a high-volume producer like `yes`
+	// burns the full MCP timeout window scanning bytes the cappedWriter
+	// downstream silently drops).
+	downTrunc   truncatedReporter
+	passThrough bool
+}
+
+// truncatedReporter is the optional contract a downstream io.Writer can
+// implement to signal that it has begun discarding bytes. RedactingWriter
+// checks it once per Write and flips to pass-through forever once true.
+// Keep this interface single-method and side-effect-free.
+type truncatedReporter interface {
+	Truncated() bool
 }
 
 type redactSecret struct {
@@ -32,6 +49,9 @@ type redactSecret struct {
 // immediately after this returns. Empty secret values are skipped.
 func NewRedactingWriter(w io.Writer, secrets []NamedSecret) *RedactingWriter {
 	rw := &RedactingWriter{w: w}
+	if tr, ok := w.(truncatedReporter); ok {
+		rw.downTrunc = tr
+	}
 	for _, s := range secrets {
 		if len(s.Value) == 0 {
 			continue
@@ -62,6 +82,24 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 
 	if len(r.secrets) == 0 {
 		// Pass-through. Holdover stays empty.
+		return r.w.Write(p)
+	}
+
+	// P1-1: if the downstream has already started dropping bytes (e.g. the
+	// MCP cappedWriter past its 256 KiB cap), every further byte scanned is
+	// wasted CPU. Flip to pass-through once and drop any retained holdover
+	// — those bytes are already past the cap and will be dropped downstream
+	// regardless.
+	if !r.passThrough && r.downTrunc != nil && r.downTrunc.Truncated() {
+		r.passThrough = true
+		if len(r.holdover) > 0 {
+			for i := range r.holdover {
+				r.holdover[i] = 0
+			}
+			r.holdover = nil
+		}
+	}
+	if r.passThrough {
 		return r.w.Write(p)
 	}
 
