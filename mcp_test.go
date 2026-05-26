@@ -1118,6 +1118,176 @@ func TestHandleAuditTail_EmitsAuditEntry_CustomN(t *testing.T) {
 	}
 }
 
+// TestHandleAuditTail_StripsSelfEntryByNonce (joint-review 2026-05 P3-1)
+// — handleAuditTail writes a self-entry BEFORE reading the log, then
+// strips its own row from the AI-visible response so the requested `n`
+// is not partially consumed. The strip used to be position-based ("the
+// last filtered line, matched by PID"), which broke under two
+// scenarios: (a) concurrent writers landing between our write and our
+// read, pushing our self-entry away from last position; (b) prior
+// audit_tail entries from earlier calls being incorrectly considered
+// for strip because they shared our PID.
+//
+// This test asserts the second invariant directly: a prior audit_tail
+// entry MUST NOT be stripped by a new call. We pre-plant a "prior"
+// audit_tail row with a distinct nonce, plant a follow-on mcp_run row,
+// then call handleAuditTail. The handler's own freshly-written entry
+// must be stripped (by nonce match), while the pre-planted prior
+// audit_tail entry must survive as the deterrent the J-5 design
+// promises. (The concurrent-writer race itself is exercised at unit
+// level by TestStripSelfAuditTailEntry/removes_single_match_anywhere;
+// integration-testing the literal interleaving would require a custom
+// audit-writer hook with no security gain.)
+func TestHandleAuditTail_StripsSelfEntryByNonce(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// Pre-plant a self-style audit_tail entry from a "prior call".
+	const priorNonce = "deadbeefdeadbeefdeadbeefdeadbeef"
+	if err := AppendAudit(AuditEvent{
+		Action:  ActionAuditTail,
+		Caller:  "mcp",
+		Message: "n=20",
+		Nonce:   priorNonce,
+	}); err != nil {
+		t.Fatalf("plant prior audit_tail: %v", err)
+	}
+	// Plant a follow-on mcp_run entry so our prior-call audit_tail is
+	// no longer the last line in the log when handleAuditTail reads it.
+	// This is the "displaced" scenario.
+	if err := AppendAudit(AuditEvent{
+		Action:  ActionMCPRun,
+		Caller:  "mcp",
+		Message: "raw_exit=0 elapsed_ms=10",
+	}); err != nil {
+		t.Fatalf("plant mcp_run: %v", err)
+	}
+
+	res, out, err := handleAuditTail(context.Background(), nil, auditTailInput{N: 20})
+	if err != nil {
+		t.Fatalf("handleAuditTail: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultText(res))
+	}
+
+	// The prior-call audit_tail (deterrent) MUST survive.
+	var seenPrior bool
+	var selfCount int
+	for _, line := range out.Entries {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal entry: %v", err)
+		}
+		if ev.Nonce == priorNonce {
+			seenPrior = true
+		}
+		if ev.Action == ActionAuditTail {
+			selfCount++
+		}
+	}
+	if !seenPrior {
+		t.Errorf("prior-call audit_tail entry (nonce=%s) was incorrectly stripped; entries=%v", priorNonce, out.Entries)
+	}
+	// Exactly one audit_tail entry should remain (the prior one). The
+	// handler's own freshly-written row must have been stripped by its
+	// unique nonce match.
+	if selfCount != 1 {
+		t.Errorf("expected exactly 1 audit_tail entry to survive (the prior-call deterrent), got %d: %v", selfCount, out.Entries)
+	}
+}
+
+// TestStripSelfAuditTailEntry locks the nonce-scanner's invariants in
+// isolation so a future refactor of handleAuditTail cannot accidentally
+// regress the strip behavior.
+func TestStripSelfAuditTailEntry(t *testing.T) {
+	// Helper to build a serialized audit-line with a given nonce.
+	mk := func(action, nonce string) string {
+		raw, err := json.Marshal(AuditEvent{Action: action, Caller: "mcp", Nonce: nonce})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(raw)
+	}
+
+	t.Run("removes single match anywhere in slice", func(t *testing.T) {
+		// Place the self-entry in the MIDDLE of the slice — this is
+		// the race-displacement case (a concurrent writer landed after
+		// our AppendAudit, so the new line(s) are now after us). A
+		// position-based strip would have missed this row.
+		a := mk(ActionList, "")
+		self := mk(ActionAuditTail, "n1")
+		b := mk(ActionMCPRun, "")
+		out := stripSelfAuditTailEntry([]string{a, self, b}, "n1")
+		if len(out) != 2 {
+			t.Fatalf("expected 2 entries, got %d: %v", len(out), out)
+		}
+		// Robust check via Nonce field rather than substring match
+		// (Kimi gate 2): a future change that adds a field whose value
+		// contains "n1" would otherwise pass spuriously.
+		for _, line := range out {
+			var ev AuditEvent
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.Nonce == "n1" {
+				t.Errorf("self entry not stripped: %s", line)
+			}
+		}
+	})
+	t.Run("empty nonce is a no-op", func(t *testing.T) {
+		entries := []string{mk(ActionAuditTail, ""), mk(ActionMCPRun, "")}
+		out := stripSelfAuditTailEntry(entries, "")
+		if len(out) != 2 {
+			t.Errorf("empty nonce must not modify slice; got %v", out)
+		}
+	})
+	t.Run("no match is a no-op", func(t *testing.T) {
+		entries := []string{mk(ActionAuditTail, "other"), mk(ActionMCPRun, "")}
+		out := stripSelfAuditTailEntry(entries, "missing")
+		if len(out) != 2 {
+			t.Errorf("non-matching nonce must not modify slice; got %v", out)
+		}
+	})
+	t.Run("only audit_tail action matches", func(t *testing.T) {
+		// A non-audit_tail entry carrying the same nonce must NOT be
+		// stripped — defensive against future code paths that mint
+		// nonces for other actions.
+		entries := []string{mk(ActionMCPRun, "samepid")}
+		out := stripSelfAuditTailEntry(entries, "samepid")
+		if len(out) != 1 {
+			t.Errorf("expected non-audit_tail nonce-bearer to survive; got %v", out)
+		}
+	})
+	t.Run("malformed json is skipped", func(t *testing.T) {
+		entries := []string{"{not json", mk(ActionAuditTail, "n2")}
+		out := stripSelfAuditTailEntry(entries, "n2")
+		if len(out) != 1 || out[0] != "{not json" {
+			t.Errorf("expected malformed to survive, audit_tail to be stripped; got %v", out)
+		}
+	})
+}
+
+// TestGenerateAuditNonce sanity-checks the nonce generator.
+func TestGenerateAuditNonce(t *testing.T) {
+	a := generateAuditNonce()
+	b := generateAuditNonce()
+	if len(a) != 32 || len(b) != 32 {
+		t.Fatalf("nonce length: a=%d b=%d, want 32", len(a), len(b))
+	}
+	if a == b {
+		t.Errorf("two nonces collided: %s == %s", a, b)
+	}
+	// Verify hex shape.
+	for _, ch := range a {
+		ok := (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
+		if !ok {
+			t.Errorf("nonce contains non-hex char %q in %s", ch, a)
+		}
+	}
+}
+
 // TestFilterAuditLineForAI_StripsElapsedMs (J-10/J-6) — a synthetic
 // audit_run JSON line carrying elapsed_ms must have that token stripped
 // from the AI-visible msg field. Also exercises that raw_exit and

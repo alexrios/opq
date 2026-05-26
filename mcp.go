@@ -59,12 +59,13 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -680,10 +681,28 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	// so an AI scraping the operator's activity is itself visible in the log,
 	// even if the underlying tailAudit call fails. Message carries the
 	// requested-after-clamp size only; no caller-controlled bytes.
+	//
+	// joint-review 2026-05 P3: tag the self-entry with a per-call random
+	// nonce so the strip below can find OUR entry regardless of position.
+	// The previous PID-based match only worked when our self-entry was
+	// the LAST line in the filtered view; a concurrent AppendAudit (or
+	// another audit_tail call from the same PID in a separate goroutine)
+	// could displace it and either (a) leak our bookkeeping into the AI's
+	// window or (b) incorrectly strip the line that is now last. A
+	// crypto/rand-sourced 128-bit nonce is unique-per-call and immune to
+	// reordering, PID reuse, and concurrent writers.
+	//
+	// If crypto/rand fails (extraordinarily unlikely on Linux but
+	// possible in constrained environments) the nonce stays empty and
+	// the strip becomes a no-op for this call — the AI still sees the
+	// self-entry, which is a one-row leak of our own bookkeeping, not a
+	// security violation. We prefer that to crashing the handler.
+	nonce := generateAuditNonce()
 	_ = AppendAudit(AuditEvent{
 		Action:  ActionAuditTail,
 		Caller:  callerTag(),
 		Message: fmt.Sprintf("n=%d", n),
+		Nonce:   nonce,
 	})
 	lines, err := tailAudit(mcpMaxAuditTailN)
 	if err != nil {
@@ -696,18 +715,16 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	// passes the filter — strip it so the AI's requested-n window isn't
 	// occupied by its own bookkeeping. The self-log entry's existence
 	// remains visible to the operator via `opq audit` and to subsequent
-	// AI calls (we strip the most-recent audit_tail row only; older ones
-	// from prior calls are still returned as the deterrent the design
-	// promises).
+	// AI calls (we strip OUR row only, identified by nonce; older
+	// audit_tail entries from prior calls survive as the deterrent the
+	// design promises).
 	filtered := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if out, ok := filterAuditLineForAI(line); ok {
 			filtered = append(filtered, out)
 		}
 	}
-	if len(filtered) > 0 && isCurrentAuditTailSelfEntry(filtered[len(filtered)-1]) {
-		filtered = filtered[:len(filtered)-1]
-	}
+	filtered = stripSelfAuditTailEntry(filtered, nonce)
 	// Return at most the requested n entries (last n after filter).
 	if len(filtered) > n {
 		filtered = filtered[len(filtered)-n:]
@@ -718,19 +735,63 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	}, auditTailOutput{Entries: filtered}, nil
 }
 
-// isCurrentAuditTailSelfEntry reports whether a serialized audit-line JSON
-// is an audit_tail event written by this process (matched by PID). Used to
-// strip the self-log entry that handleAuditTail just wrote from its own
-// returned window so the AI's requested `n` is not partially consumed by
-// the call's own bookkeeping. The strip is intentionally narrow — only
-// the LAST line by THIS PID is removed; older audit_tail entries from
-// prior calls survive as the deterrent the J-5 design promises.
-func isCurrentAuditTailSelfEntry(line string) bool {
-	var ev AuditEvent
-	if err := json.Unmarshal([]byte(line), &ev); err != nil {
-		return false
+// generateAuditNonce returns 32 hex chars (16 random bytes / 128 bits)
+// suitable for tagging a single audit entry so the writer can identify
+// it among later log lines. Returns the empty string on the (vanishingly
+// rare) event that crypto/rand fails — callers must treat the empty
+// nonce as "no strip possible" rather than crashing. 128 bits is
+// overkill for the tiny collision domain (a few hundred entries in a
+// tail window) but cheap and removes any need to think about birthday
+// bounds.
+func generateAuditNonce() string {
+	var buf [16]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		return ""
 	}
-	return ev.Action == ActionAuditTail && ev.PID == os.Getpid()
+	return hex.EncodeToString(buf[:])
+}
+
+// stripSelfAuditTailEntry scans the filtered audit lines and removes
+// every ActionAuditTail entry whose Nonce matches the provided value.
+// Returns the input unchanged if nonce is empty (graceful degradation
+// path when crypto/rand fails) or no match is found.
+//
+// Why scan instead of strip-last (joint-review 2026-05 P3):
+// handleAuditTail writes its self-entry BEFORE reading the log, but a
+// concurrent AppendAudit (CLI process, another MCP handler, etc.) can
+// land between our write and our read — our entry may then sit anywhere
+// in the filtered window, not just at the end. A position-based strip
+// either misses our entry (leak) or strips the wrong line (incorrect
+// truncation of operator activity). Nonce-based matching is immune to
+// reordering and to PID reuse (a previous process that wrote an
+// audit_tail entry with the same PID is no longer our concern).
+//
+// Duplicate nonces would indicate a catastrophic RNG failure (128 bits
+// of crypto/rand output colliding). We strip ALL matches rather than
+// stop at the first — a defensive choice that costs nothing in the
+// success path (zero duplicates) and avoids surfacing a duplicate-row
+// puzzle to the AI in the failure path. Malformed JSON entries pass
+// through unchanged.
+func stripSelfAuditTailEntry(filtered []string, nonce string) []string {
+	if nonce == "" {
+		return filtered
+	}
+	out := make([]string, 0, len(filtered))
+	for _, line := range filtered {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			// Malformed lines pass through; the AI-visible filter would
+			// already have dropped them upstream if they were invalid.
+			out = append(out, line)
+			continue
+		}
+		if ev.Action == ActionAuditTail && ev.Nonce == nonce {
+			// Strip this entry.
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 // sanitizeErrForAI converts any error into a fixed-taxonomy string that is

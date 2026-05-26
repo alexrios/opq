@@ -237,6 +237,11 @@ func TestVerifySandboxAvailable_OK(t *testing.T) {
 	if _, err := exec.LookPath("bwrap"); err != nil {
 		t.Skip("bwrap not present")
 	}
+	// Reset the sync.Once cache so a prior test's failure (e.g. the
+	// bwrap-missing test running first under -shuffle) does not leak
+	// into this one. Reset on exit too so subsequent tests start clean.
+	resetSandboxVerifyCacheForTest()
+	t.Cleanup(resetSandboxVerifyCacheForTest)
 	if err := VerifySandboxAvailable(); err != nil {
 		t.Fatalf("VerifySandboxAvailable: %v", err)
 	}
@@ -250,6 +255,11 @@ func TestVerifySandboxAvailable_BwrapMissing(t *testing.T) {
 	orig := os.Getenv("PATH")
 	t.Setenv("PATH", empty)
 	defer t.Setenv("PATH", orig)
+	// Cache reset: a prior successful test would otherwise short-circuit
+	// our PATH manipulation. Reset on exit too so the cached failure
+	// does not poison subsequent tests in the same binary run.
+	resetSandboxVerifyCacheForTest()
+	t.Cleanup(resetSandboxVerifyCacheForTest)
 
 	err := VerifySandboxAvailable()
 	if err == nil {
@@ -288,6 +298,8 @@ func TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken(t *testing.T) {
 		t.Fatalf("write fake bwrap: %v", err)
 	}
 	t.Setenv("PATH", dir)
+	resetSandboxVerifyCacheForTest()
+	t.Cleanup(resetSandboxVerifyCacheForTest)
 
 	err := VerifySandboxAvailable()
 	if err == nil {
@@ -296,6 +308,75 @@ func TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken(t *testing.T) {
 	if !strings.Contains(err.Error(), "namespace probe") {
 		t.Errorf("expected error to mention 'namespace probe', got: %v", err)
 	}
+}
+
+// TestVerifySandboxAvailable_CachesResult locks the P3-2 optimization:
+// after a first call, subsequent calls must NOT re-run the bwrap probe.
+// We plant a counting fake bwrap that succeeds on --version and the
+// namespace probe, drive a first call, then nuke PATH so any real
+// re-probe would fail — a cached success must still be returned. The
+// converse case (cache the failure too) is asserted by inverting the
+// arrangement: plant a missing PATH, fail once, then add bwrap back —
+// cached failure must persist.
+func TestVerifySandboxAvailable_CachesResult(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("/bin/sh required")
+	}
+
+	t.Run("cached success", func(t *testing.T) {
+		if _, err := exec.LookPath("bwrap"); err != nil {
+			t.Skip("bwrap not present on host; cannot exercise success cache")
+		}
+		resetSandboxVerifyCacheForTest()
+		t.Cleanup(resetSandboxVerifyCacheForTest)
+
+		if err := VerifySandboxAvailable(); err != nil {
+			t.Fatalf("first call: %v", err)
+		}
+		// Sabotage PATH so a re-probe would fail. The cache must short
+		// circuit and still return nil.
+		empty := t.TempDir()
+		t.Setenv("PATH", empty)
+		if err := VerifySandboxAvailable(); err != nil {
+			t.Fatalf("second call should be cached success, got: %v", err)
+		}
+	})
+
+	t.Run("cached failure", func(t *testing.T) {
+		resetSandboxVerifyCacheForTest()
+		t.Cleanup(resetSandboxVerifyCacheForTest)
+		empty := t.TempDir()
+		t.Setenv("PATH", empty)
+		err := VerifySandboxAvailable()
+		if err == nil {
+			t.Fatalf("first call: expected error when bwrap is missing")
+		}
+		first := err.Error()
+		// "Install" bwrap by repointing PATH at a directory holding a
+		// fake one. A re-probe would now succeed; the cache must still
+		// return the original error.
+		dir := t.TempDir()
+		fake := filepath.Join(dir, "bwrap")
+		script := "#!/bin/sh\n" +
+			"case \"$1\" in\n" +
+			"  --version) echo 'bubblewrap 0.11.0'; exit 0;;\n" +
+			"  *) exit 0;;\n" +
+			"esac\n"
+		if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake bwrap: %v", err)
+		}
+		t.Setenv("PATH", dir)
+		err = VerifySandboxAvailable()
+		if err == nil {
+			t.Fatalf("expected cached failure to persist after bwrap appears on PATH")
+		}
+		if err.Error() != first {
+			t.Errorf("cached error text changed: was %q, now %q", first, err.Error())
+		}
+	})
 }
 
 func TestResolveMCPSandbox(t *testing.T) {

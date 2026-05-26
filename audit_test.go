@@ -119,6 +119,60 @@ func TestAppendAudit_FileModeAndAppend(t *testing.T) {
 	}
 }
 
+// TestAuditEvent_NonceFieldRoundTrip locks the JSON shape of the new
+// Nonce field (joint-review 2026-05 P3-1). Empty Nonce must be omitted
+// from the serialized form so existing tools that grep the log for
+// known keys do not see an unfamiliar `nonce:""`. A populated Nonce
+// must round-trip cleanly through Marshal/Unmarshal so the strip in
+// handleAuditTail can match it byte-for-byte after the line passes
+// through filterAuditLineForAI's re-marshal.
+func TestAuditEvent_NonceFieldRoundTrip(t *testing.T) {
+	t.Run("empty omitted", func(t *testing.T) {
+		ev := AuditEvent{Action: ActionAuditTail, Caller: "mcp", Message: "n=20"}
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(raw, []byte("nonce")) {
+			t.Errorf("empty Nonce leaked into JSON: %s", raw)
+		}
+	})
+	t.Run("populated round-trips", func(t *testing.T) {
+		original := AuditEvent{
+			Action: ActionAuditTail,
+			Caller: "mcp",
+			Nonce:  "0123456789abcdef0123456789abcdef",
+		}
+		raw, err := json.Marshal(original)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !bytes.Contains(raw, []byte(`"nonce":"0123456789abcdef0123456789abcdef"`)) {
+			t.Errorf("nonce missing from JSON: %s", raw)
+		}
+		var got AuditEvent
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.Nonce != original.Nonce {
+			t.Errorf("nonce mismatch: got %q, want %q", got.Nonce, original.Nonce)
+		}
+	})
+	t.Run("legacy entries parse", func(t *testing.T) {
+		// A log line written by an older opq version (no nonce field at
+		// all) must unmarshal cleanly with empty Nonce — the strip
+		// scanner relies on this to skip such entries without crashing.
+		const legacy = `{"ts":"2026-05-01T00:00:00Z","action":"audit_tail","caller":"mcp","pid":42,"ppid":1,"msg":"n=20"}`
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(legacy), &ev); err != nil {
+			t.Fatalf("unmarshal legacy: %v", err)
+		}
+		if ev.Nonce != "" {
+			t.Errorf("expected empty nonce from legacy entry, got %q", ev.Nonce)
+		}
+	})
+}
+
 func TestTailAudit(t *testing.T) {
 	withAuditTmpDir(t)
 	for i := 0; i < 5; i++ {

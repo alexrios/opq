@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // bwrapMinMajor / bwrapMinMinor: floor that supports all the flags
@@ -19,12 +20,51 @@ const (
 	bwrapMinMinor = 5
 )
 
+// sandboxVerifyOnce / sandboxVerifyOnceErr cache the result of the
+// (potentially fork-exec-heavy) sandbox availability probe for the life
+// of the process. See VerifySandboxAvailable for the per-call cost
+// motivation; see resetSandboxVerifyCacheForTest for the test hook.
+var (
+	sandboxVerifyOnce    sync.Once
+	sandboxVerifyOnceErr error
+)
+
 // VerifySandboxAvailable returns nil if the sandbox profiles other
 // than SandboxNone will work on this host. It checks for bwrap on
 // PATH at a sufficient version, and that unprivileged user
 // namespaces are available — the kernel feature bwrap uses to apply
 // the namespace flags without setuid.
+//
+// The result is cached in a process-global sync.Once. The probe runs
+// `bwrap --version` and a `bwrap ... true` namespace check, each of
+// which is a fork-exec costing ~10-50 ms. The cached version takes
+// nanoseconds. This matters for two call sites:
+//   - cmd_mcp.go invokes VerifySandboxAvailable once at server startup,
+//     so caching is a no-op there.
+//   - cmd_exec.go invokes it from EVERY `opq exec --sandbox=net|full`,
+//     which is the hot path for scripted CLI usage. Within a single CLI
+//     process (one exec invocation) the cache is still cheap; the win
+//     is for any future caller that loops or for the in-handler check
+//     at mcp.go:311 (defense-in-depth re-check after the startup gate).
+//
+// Both success AND failure are cached. The host's bwrap binary,
+// version, AppArmor profile state, and userns sysctl are stable for
+// the process lifetime; re-probing on failure cannot recover, only
+// burn fork-exec on every call. Operators who install bwrap mid-session
+// must restart the daemon — an acceptable trade against the per-call
+// cost in the common (success) case (joint-review 2026-05 P3).
 func VerifySandboxAvailable() error {
+	sandboxVerifyOnce.Do(func() {
+		sandboxVerifyOnceErr = verifySandboxAvailableUncached()
+	})
+	return sandboxVerifyOnceErr
+}
+
+// verifySandboxAvailableUncached performs the actual probe without
+// any caching. Split out of VerifySandboxAvailable so the sync.Once
+// wrapper stays trivial and so tests can drive the underlying logic
+// after resetSandboxVerifyCacheForTest.
+func verifySandboxAvailableUncached() error {
 	path, err := exec.LookPath("bwrap")
 	if err != nil {
 		return fmt.Errorf("bubblewrap (bwrap) not found in PATH: install it via your package manager (Debian/Ubuntu: apt install bubblewrap; Fedora: dnf install bubblewrap; Arch: pacman -S bubblewrap)")
@@ -64,6 +104,15 @@ func VerifySandboxAvailable() error {
 		return fmt.Errorf("bwrap namespace probe failed (host may block unprivileged userns / have an AppArmor profile on bwrap): %w; bwrap output: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// resetSandboxVerifyCacheForTest clears the sync.Once cache so a
+// subsequent VerifySandboxAvailable call re-probes the host. Used by
+// tests that manipulate PATH (e.g. faking bwrap missing) and rely on
+// the next call observing the new environment. NOT for production code.
+func resetSandboxVerifyCacheForTest() {
+	sandboxVerifyOnce = sync.Once{}
+	sandboxVerifyOnceErr = nil
 }
 
 // parseBwrapVersion extracts a major.minor pair from the output of
