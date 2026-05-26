@@ -138,12 +138,74 @@ func resolveAuditDirForMask() (string, error) {
 	return real, nil
 }
 
+// sandboxNetArgvCommon returns the bwrap argv shared by SandboxNet and
+// SandboxNetAllowed. The two profiles differ only by whether the
+// caller adds --unshare-net; everything else (read-only host bind,
+// tmpfs masks on the socket/tmp/dev-shm/audit dirs, private PID
+// namespace, --die-with-parent, --new-session) is identical.
+//
+// Ordering is load-bearing:
+//   - --ro-bind / / must be FIRST so subsequent --tmpfs entries
+//     shadow the host bind-mounts (bwrap applies mounts L→R).
+//   - --proc /proc must come AFTER --ro-bind / / so it masks the host
+//     procfs (PID-namespace isolation depends on this — finding C2).
+//
+// J-1: --unshare-net only blocks AF_INET/INET6/PACKET/NETLINK. AF_UNIX
+// sockets reachable by filesystem path (e.g. /run/user/$UID/bus — the
+// Secret Service / D-Bus session bus, KWallet, gpg-agent, legacy
+// /tmp/dbus-*) survive the netns and would otherwise be mounted into
+// the child by --ro-bind. The tmpfs masks below close that bypass.
+// On all systemd distros /var/run is a symlink to /run, so masking
+// /run/user also masks /var/run/user; do NOT add a second
+// --tmpfs /var/run/user — bwrap fails with "Can't mkdir /var/run/user"
+// when /var/run is a symlink to a now-empty tmpfs (see
+// TestSandboxNet_TmpfsMasksDBus).
+//
+// J-12: audit log lives at $XDG_STATE_HOME/opq/ or $HOME/.local/state/opq/.
+// Under --ro-bind / / the AI subprocess could cat audit.log and read
+// caller="cli" entries (filterAuditLineForAI strips them for MCP audit_tail)
+// plus raw_exit / elapsed_ms tokens (filterAuditMessageForAI strips them).
+// Masking the audit directory with tmpfs closes that bypass. SandboxFull
+// already tmpfs-masks /home so it is covered there incidentally.
+func sandboxNetArgvCommon(auditDir string) []string {
+	return []string{
+		"--ro-bind", "/", "/",
+		"--unshare-pid",
+		"--proc", "/proc",
+		"--tmpfs", "/dev/shm",
+		"--tmpfs", "/run/user",
+		"--tmpfs", "/tmp",
+		"--tmpfs", auditDir,
+		"--die-with-parent",
+		"--new-session",
+	}
+}
+
+// insertAfterRoBind inserts a single bwrap flag immediately after the
+// `--ro-bind / /` pair at the head of the argv. Used to add
+// --unshare-net to the shared SandboxNet/SandboxNetAllowed base while
+// preserving the load-bearing left-to-right mount order described in
+// sandboxNetArgvCommon. Panics if the head pair is not `--ro-bind /`
+// — a structural invariant of sandboxNetArgvCommon, not a runtime
+// condition; making it loud here catches a future refactor that breaks
+// the assumption immediately rather than at sandbox-exec time.
+func insertAfterRoBind(args []string, flag string) []string {
+	if len(args) < 3 || args[0] != "--ro-bind" || args[1] != "/" || args[2] != "/" {
+		panic(fmt.Sprintf("sandboxNetArgvCommon must start with --ro-bind / /, got %v", args))
+	}
+	out := make([]string, 0, len(args)+1)
+	out = append(out, args[:3]...)
+	out = append(out, flag)
+	out = append(out, args[3:]...)
+	return out
+}
+
 // WrapCommand returns the argv to feed to exec.Command for running
 // `cmd args...` under the chosen profile. For SandboxNone the call
-// is a no-op passthrough. For SandboxNet / SandboxFull, the command
-// is resolved to an absolute path via PATH on the host first (bwrap
-// then exec's that absolute path inside the sandbox — the host PATH
-// lookup must happen before the FS view changes).
+// is a no-op passthrough. For SandboxNet / SandboxNetAllowed /
+// SandboxFull, the command is resolved to an absolute path via PATH
+// on the host first (bwrap then exec's that absolute path inside the
+// sandbox — the host PATH lookup must happen before the FS view changes).
 func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []string, error) {
 	if cmd == "" {
 		return "", nil, fmt.Errorf("empty command")
@@ -162,50 +224,28 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 
 	var bwArgs []string
 	switch profile {
-	case SandboxNet:
-		// Resolve the audit directory inside the SandboxNet branch only.
-		// SandboxFull tmpfs-masks /home, which covers the default audit-log
-		// location, so it does not need the explicit mask and should not
-		// pay the prepareAuditDir / EvalSymlinks side-effects.
+	case SandboxNet, SandboxNetAllowed:
+		// Both profiles share the same filesystem sandbox (read-only host,
+		// tmpfs masks on socket / tmp / dev-shm / audit-dir, private PID
+		// namespace). They differ only in whether the netns is applied.
+		//
+		// SandboxNetAllowed exists because the previous v1.1.x design
+		// routed allow_network=true to SandboxNone (no bwrap at all),
+		// which let an AI write the resolved secret to /var/tmp/.x in
+		// one call and `cat /var/tmp/.x` from a later SandboxNet call
+		// (joint-review 2026-05 P2). Keeping the FS sandbox closes the
+		// cross-call persistence vector while still letting the caller's
+		// network-using command (curl, etc.) reach external hosts.
 		auditDir, err := resolveAuditDirForMask()
 		if err != nil {
 			return "", nil, fmt.Errorf("resolve audit dir for sandbox mask: %w", err)
 		}
-		// --unshare-pid + --proc /proc (after ro-bind): private PID namespace prevents
-		// sibling run_with_secrets calls from reading each other's /proc/<pid>/environ.
-		// --proc must come after --ro-bind / / so it masks the host procfs (bwrap applies
-		// mounts left-to-right). Abstract Unix sockets are already isolated by --unshare-net.
-		//
-		// J-1: --unshare-net only blocks AF_INET/INET6/PACKET/NETLINK. AF_UNIX
-		// sockets reachable by filesystem path (e.g. /run/user/$UID/bus — the
-		// Secret Service / D-Bus session bus, KWallet, gpg-agent, legacy
-		// /tmp/dbus-*) survive the netns and would otherwise be mounted into
-		// the child by --ro-bind. Mask the standard socket directories with
-		// empty tmpfs so the child cannot reach the keyring it was supposed to
-		// be insulated from. /tmp tmpfs also closes the cross-call multi-bit
-		// storage channel between sibling run_with_secrets invocations. On all
-		// systemd distros /var/run is a symlink to /run, so masking /run/user
-		// also masks /var/run/user; do NOT add a second --tmpfs /var/run/user
-		// — bwrap fails with "Can't mkdir /var/run/user" when /var/run is a
-		// symlink to a now-empty tmpfs (see TestSandboxNet_TmpfsMasksDBus).
-		bwArgs = []string{
-			"--ro-bind", "/", "/",
-			"--unshare-net",
-			"--unshare-pid",
-			"--proc", "/proc",
-			"--tmpfs", "/dev/shm",
-			"--tmpfs", "/run/user",
-			"--tmpfs", "/tmp",
-			// J-12/post-v1.1.2: audit log lives at $XDG_STATE_HOME/opq/ or
-			// $HOME/.local/state/opq/. Under --ro-bind / / the AI subprocess
-			// could cat audit.log and read caller="cli" entries (which
-			// filterAuditLineForAI strips for MCP audit_tail) plus raw_exit /
-			// elapsed_ms tokens (which filterAuditMessageForAI strips). Masking
-			// the whole audit directory with tmpfs closes that bypass. SandboxFull
-			// already tmpfs-masks /home so it is covered there incidentally.
-			"--tmpfs", auditDir,
-			"--die-with-parent",
-			"--new-session",
+		bwArgs = sandboxNetArgvCommon(auditDir)
+		if profile == SandboxNet {
+			// Inserted after --ro-bind / / (which is the first pair in the
+			// common slice). Without --unshare-net the child has full host
+			// network reachability; that's the SandboxNetAllowed contract.
+			bwArgs = insertAfterRoBind(bwArgs, "--unshare-net")
 		}
 	case SandboxFull:
 		bwArgs = []string{

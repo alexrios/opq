@@ -30,6 +30,21 @@
 //     will pass it through untouched. Entropy detection was considered
 //     and rejected (false positives on legitimate hashes/UUIDs/tokens).
 //
+//  3. OUTPUT-VOLUME SIDE CHANNEL. The AI controls the subprocess, so
+//     it can craft a command whose stdout/stderr byte count is a
+//     function of a secret byte (e.g. `printf '%*s' "$X" ""` or a
+//     Python one-liner that emits `ord(secret[0])` characters). The
+//     AI then measures len(stdout) in the returned tool result and
+//     recovers the secret one byte at a time. The redactor cannot
+//     help — the emitted bytes are not the secret, they are a
+//     length-encoded function of it. We have removed the cleanest
+//     convenience oracle (the stdout_truncated/stderr_truncated
+//     booleans previously surfaced on both the tool result and via
+//     audit_tail), but the underlying len(stdout) channel remains.
+//     Operators concerned about this should run high-risk callers
+//     under the policy-enforcing wrapper described below, or pair
+//     this server with rate-limiting at the MCP transport layer.
+//
 // The supported deployment model for high-risk environments is a
 // policy-enforcing wrapper: a second MCP server that proxies into opq
 // and allowlists (command, args pattern, env var set) tuples for each
@@ -135,6 +150,13 @@ type listSecretsOutput struct {
 }
 
 func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecretsInput) (*mcp.CallToolResult, listSecretsOutput, error) {
+	// Audit the call BEFORE attempting the backend operation. Mirrors
+	// handleAuditTail (J-5): an AI probing a degraded backend (D-Bus
+	// down, keyring locked, etc.) by hammering list_secrets must still
+	// leave a trace, even when every call returns an error. Previously
+	// the audit fired only on success, so failure-path probing was
+	// invisible to the operator (joint-review 2026-05 P3).
+	_ = AppendAudit(AuditEvent{Action: ActionList, Caller: callerTag()})
 	backend, err := OpenDefaultBackend()
 	if err != nil {
 		// H1: backend errors may contain keyring/D-Bus text; sanitize.
@@ -145,7 +167,6 @@ func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecret
 		// H1: backend errors may contain keyring/D-Bus text; sanitize.
 		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
-	_ = AppendAudit(AuditEvent{Action: ActionList, Caller: callerTag()})
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(names, "\n")}},
 	}, listSecretsOutput{Names: names}, nil
@@ -166,10 +187,16 @@ type runWithSecretsInput struct {
 // SandboxProfile. The default (both unset) is SandboxNet — the AI
 // gets the secret but cannot ship it off-box.
 //
-//   AllowNetwork=true  + Isolation=""|"net" -> SandboxNone (audit network_allowed)
+//   AllowNetwork=true  + Isolation=""|"net" -> SandboxNetAllowed (audit network_allowed)
 //   AllowNetwork=true  + Isolation="full"   -> error (incompatible in v1.1)
 //   AllowNetwork=false + Isolation=""|"net" -> SandboxNet (default)
 //   AllowNetwork=false + Isolation="full"   -> SandboxFull
+//
+// Note: AllowNetwork=true no longer routes to SandboxNone. A previous
+// version did, which let an AI write the resolved secret to /var/tmp
+// during a network-allowed call and read it back from a later
+// SandboxNet call (joint-review 2026-05 P2). SandboxNetAllowed keeps
+// the same FS sandbox as SandboxNet but lifts the netns restriction.
 func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, error) {
 	iso := isolation
 	if iso == "" {
@@ -184,7 +211,7 @@ func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, err
 		if iso == "full" {
 			return SandboxNone, fmt.Errorf("isolation=full is incompatible with allow_network=true until v1.2")
 		}
-		return SandboxNone, nil
+		return SandboxNetAllowed, nil
 	}
 	if iso == "full" {
 		return SandboxFull, nil
@@ -198,14 +225,24 @@ func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, err
 // status would turn it into an oracle the AI could use to leak one byte
 // per call via `exit $(printf '%d' "'${SECRET:0:1}")`. The raw status is
 // recorded in the audit log for the human operator.
+//
+// Note the deliberate ABSENCE of stdout_truncated / stderr_truncated
+// flags. A previous version surfaced them as booleans, but combined
+// with caller-controlled commands they were a clean 1-bit-per-call
+// oracle (the AI emits a volume that is a function of a secret byte
+// and binary-searches the cap threshold). Truncation still happens
+// silently in cappedWriter, and the operator-facing audit log still
+// records `stdout_truncated=true` / `stderr_truncated=true` tokens
+// for diagnostics, but the AI no longer gets a clean flag. The
+// residual len(stdout) channel is documented as gap #3 in the file
+// header — there is no defense against it short of refusing to
+// return subprocess output at all.
 type runWithSecretsOutput struct {
-	Succeeded       bool   `json:"succeeded"`
-	ExitCode        int    `json:"exit_code"`
-	Stdout          string `json:"stdout"`
-	Stderr          string `json:"stderr"`
-	StdoutTruncated bool   `json:"stdout_truncated"`
-	StderrTruncated bool   `json:"stderr_truncated"`
-	TimedOut        bool   `json:"timed_out"`
+	Succeeded bool   `json:"succeeded"`
+	ExitCode  int    `json:"exit_code"`
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	TimedOut  bool   `json:"timed_out"`
 }
 
 // normalizeExit collapses a raw subprocess exit code to the (Succeeded,
@@ -391,10 +428,17 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}
 
 	if input.AllowNetwork {
+		// SecretNames mirrors the ActionMCPRun entry below so operators
+		// reviewing the audit log can correlate WHICH secrets were live
+		// for this network-allowed call without joining two entries by
+		// timestamp. The Message stays operator-facing (command basename
+		// + arg count); filterAuditLineForAI strips it before exposing
+		// the entry to the AI via audit_tail (joint-review 2026-05 P3).
 		_ = AppendAudit(AuditEvent{
-			Action:  ActionNetworkAllowed,
-			Caller:  callerTag(),
-			Message: fmt.Sprintf("command=%s args=%d", filepath.Base(input.Command), len(input.Args)),
+			Action:      ActionNetworkAllowed,
+			Caller:      callerTag(),
+			SecretNames: resolvedSecretNames,
+			Message:     fmt.Sprintf("command=%s args=%d", filepath.Base(input.Command), len(input.Args)),
 		})
 	}
 
@@ -444,21 +488,24 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		normalizedExit = 1
 	}
 
+	// Note: stdoutCap.Truncated() / stderrCap.Truncated() are still
+	// recorded in the operator-visible audit log Message below (useful
+	// for diagnostics) but are deliberately NOT exposed to the AI via
+	// the response struct or the textual header. See the godoc on
+	// runWithSecretsOutput for the side-channel reasoning.
 	out := runWithSecretsOutput{
-		Succeeded:       succeeded,
-		ExitCode:        normalizedExit,
-		Stdout:          stdoutBuf.String(),
-		Stderr:          stderrBuf.String(),
-		StdoutTruncated: stdoutCap.Truncated(),
-		StderrTruncated: stderrCap.Truncated(),
-		TimedOut:        timedOut,
+		Succeeded: succeeded,
+		ExitCode:  normalizedExit,
+		Stdout:    stdoutBuf.String(),
+		Stderr:    stderrBuf.String(),
+		TimedOut:  timedOut,
 	}
 
 	_ = AppendAudit(AuditEvent{
 		Action:      ActionMCPRun,
 		Caller:      callerTag(),
 		SecretNames: resolvedSecretNames,
-		Message:     auditMCPRunMessage(rawExit, out.StdoutTruncated, out.StderrTruncated, timedOut, elapsed, ""),
+		Message:     auditMCPRunMessage(rawExit, stdoutCap.Truncated(), stderrCap.Truncated(), timedOut, elapsed, ""),
 	})
 
 	exitLabel := "success"
@@ -468,12 +515,6 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	textParts := []string{fmt.Sprintf("exit=%s", exitLabel)}
 	if timedOut {
 		textParts = append(textParts, "timed_out=true")
-	}
-	if out.StdoutTruncated {
-		textParts = append(textParts, "stdout_truncated=true")
-	}
-	if out.StderrTruncated {
-		textParts = append(textParts, "stderr_truncated=true")
 	}
 	header := strings.Join(textParts, " ")
 	return &mcp.CallToolResult{
@@ -723,12 +764,21 @@ func filterAuditLineForAI(line string) (string, bool) {
 		return "", false
 	}
 
-	// C1/J-10: filter the mcp_run Message field to a small allowlist of
-	// AI-visible keys. Gated to ActionMCPRun only — other actions
-	// (audit_tail, list, denied) currently emit either no Message or
-	// AI-side bookkeeping that has no AI-relevant operator detail to leak.
-	if ev.Action == ActionMCPRun && ev.Message != "" {
-		ev.Message = filterAuditMessageForAI(ev.Message)
+	// C1/J-10: filter Message fields that use the operator-facing
+	// `key=value` shape down to a small AI-safe allowlist. The gate
+	// must cover EVERY action whose Message uses that shape; today
+	// those are ActionMCPRun (raw_exit / elapsed_ms / *_truncated /
+	// timed_out) and ActionNetworkAllowed (command / args). Bare-token
+	// taxonomy actions (ActionDenied with "env_blocked",
+	// "invalid_input", etc.) intentionally bypass this filter because
+	// the allowlist's bare-token rule would drop their entire payload.
+	// audit_tail's "n=<int>" Message is also AI-supplied so leaving it
+	// through is a no-op in security terms.
+	switch ev.Action {
+	case ActionMCPRun, ActionNetworkAllowed:
+		if ev.Message != "" {
+			ev.Message = filterAuditMessageForAI(ev.Message)
+		}
 	}
 
 	out, err := json.Marshal(ev)
@@ -745,24 +795,25 @@ func filterAuditLineForAI(line string) (string, bool) {
 // audit-channel widening — every entry below has been reviewed for AI-leak
 // implications.
 //
-//	stdout_truncated  — 1-bit oracle, already exposed in the run_with_secrets
-//	                    result; redundant in the audit stream but harmless.
-//	stderr_truncated  — same.
-//	timed_out         — same.
+//	timed_out — 1-bit oracle, already exposed in the run_with_secrets
+//	            result (TimedOut), so allowlisting it in the audit stream
+//	            does not enlarge the AI's information surface.
 //
 // Explicitly NOT on the list (and therefore stripped):
 //
 //	raw_exit          — 8-bit exit-code oracle; normalizeExit withholds it.
 //	elapsed_ms        — wall-clock timing oracle; never exposed in the
 //	                    run_with_secrets result, must not leak via audit.
+//	stdout_truncated  — output-volume oracle; removed from the response
+//	                    struct (see gap #3 in the file header). The AI
+//	                    must not be able to recover the flag via audit_tail.
+//	stderr_truncated  — same.
 //	exec_*            — operator-facing diagnostic detail; not for AI.
 //
 // Future contributors: do NOT add a key here without writing a one-line
 // justification of why the AI seeing it does not enable a side-channel.
 var aiAuditMessageAllowlist = map[string]bool{
-	"stdout_truncated": true,
-	"stderr_truncated": true,
-	"timed_out":        true,
+	"timed_out": true,
 }
 
 // filterAuditMessageForAI rebuilds an audit Message containing only tokens

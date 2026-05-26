@@ -11,7 +11,8 @@ func VerifySandboxAvailable() error {
 }
 
 // WrapCommand returns cmd+args unchanged for SandboxNone and errors
-// for any other profile, since no non-Linux backend exists yet.
+// for any other profile (including SandboxNet, SandboxNetAllowed, and
+// SandboxFull) since no non-Linux backend exists yet.
 func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []string, error) {
 	if cmd == "" {
 		return "", nil, fmt.Errorf("empty command")

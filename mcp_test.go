@@ -506,6 +506,47 @@ func TestAuditTailMCP_FiltersNonMCPCaller(t *testing.T) {
 	}
 }
 
+// TestHandleListSecrets_AuditsBeforeBackend (joint-review 2026-05 P3)
+// locks the audit-before-action contract for list_secrets. An AI that
+// hammers list_secrets against a degraded backend (D-Bus down, keyring
+// locked, etc.) must leave a trace per call. Previously the audit was
+// emitted ONLY on the success path, so failure-path probing was
+// invisible to the operator. The fix moves AppendAudit to the head of
+// the handler so backend success and failure both audit.
+//
+// The test works whether or not the host has a usable keyring: if the
+// call succeeds, the post-call audit log carries the entry; if it
+// fails, the same entry must still be present.
+func TestHandleListSecrets_AuditsBeforeBackend(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	_, _, err := handleListSecrets(context.Background(), nil, listSecretsInput{})
+	if err != nil {
+		t.Fatalf("handleListSecrets: %v", err)
+	}
+
+	lines, err := tailAudit(20)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	var seen bool
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionList && ev.Caller == "mcp" {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Fatalf("expected ActionList/mcp audit entry regardless of backend availability; got %v", lines)
+	}
+}
+
 // TestAuditCLI_StillSeesEverything verifies that the CLI path (tailAudit
 // directly) is unfiltered — the M3/C1 filtering is MCP-side only.
 func TestAuditCLI_StillSeesEverything(t *testing.T) {
@@ -668,6 +709,29 @@ func TestFilterAuditLineForAI_AuditTailSurvives(t *testing.T) {
 	}
 }
 
+// TestRunWithSecretsOutput_NoTruncationFields locks the P1 fix from
+// the 2026-05 joint review: the AI-visible response struct must not
+// expose stdout_truncated / stderr_truncated. Combined with caller-
+// controlled commands those booleans were a clean 1-bit-per-call
+// output-volume oracle (the AI emits a volume that is a function of a
+// secret byte and binary-searches the cap threshold). Re-introducing
+// either field re-opens the oracle. The textual header path
+// (handleRunWithSecrets' textParts builder) is covered by the existing
+// end-to-end MCP tests below, which assert the rendered text shape.
+func TestRunWithSecretsOutput_NoTruncationFields(t *testing.T) {
+	raw, err := json.Marshal(runWithSecretsOutput{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, banned := range []string{"stdout_truncated", "stderr_truncated"} {
+		if strings.Contains(string(raw), banned) {
+			t.Errorf("AI-visible response JSON contains banned key %q: %s\n"+
+				"This field is an output-volume oracle (joint review 2026-05 P1) "+
+				"and must not be reintroduced.", banned, raw)
+		}
+	}
+}
+
 // TestAIAuditMessageAllowlist_Invariant locks the exact set of keys
 // permitted in AI-visible audit Message fields. Every entry below is a
 // closed-set widening of the AI's audit channel and was reviewed for
@@ -675,11 +739,14 @@ func TestFilterAuditLineForAI_AuditTailSurvives(t *testing.T) {
 // aiAuditMessageAllowlist for the per-key justifications). Adding a new
 // key REQUIRES updating this test, which forces the contributor to write
 // a one-line justification and re-read the threat-model commentary.
+//
+// stdout_truncated and stderr_truncated were REMOVED from this list when
+// the output-volume oracle (P1 in joint review 2026-05) was closed; the
+// AI must not be able to recover the truncation flag via audit_tail
+// either. Re-adding them would re-open the oracle.
 func TestAIAuditMessageAllowlist_Invariant(t *testing.T) {
 	want := map[string]bool{
-		"stdout_truncated": true,
-		"stderr_truncated": true,
-		"timed_out":        true,
+		"timed_out": true,
 	}
 	if len(aiAuditMessageAllowlist) != len(want) {
 		t.Fatalf("allowlist size changed: got %d keys, want %d (every change to this list MUST be reviewed for AI-leak implications)",
@@ -698,7 +765,8 @@ func TestAIAuditMessageAllowlist_Invariant(t *testing.T) {
 }
 
 // TestFilterAuditMessageForAI verifies the allowlist filter keeps known-safe
-// keys and drops all others (including raw_exit and elapsed_ms).
+// keys and drops all others (including raw_exit, elapsed_ms, and the now-
+// stripped stdout_truncated/stderr_truncated output-volume oracle tokens).
 func TestFilterAuditMessageForAI(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -707,9 +775,9 @@ func TestFilterAuditMessageForAI(t *testing.T) {
 		{"secrets=foo raw_exit=42 elapsed_ms=100", ""},
 		{"raw_exit=-1 timed_out=true", "timed_out=true"},
 		{"raw_exit=0 elapsed_ms=5", ""},
-		{"raw_exit=255 stdout_truncated=true", "stdout_truncated=true"},
+		{"raw_exit=255 stdout_truncated=true", ""},
 		{"secrets=bar elapsed_ms=10", ""}, // both non-allowlisted
-		{"stdout_truncated=true stderr_truncated=true timed_out=true", "stdout_truncated=true stderr_truncated=true timed_out=true"},
+		{"stdout_truncated=true stderr_truncated=true timed_out=true", "timed_out=true"},
 		{"", ""},
 	}
 	for _, c := range cases {
@@ -932,8 +1000,11 @@ func TestFilterAuditLineForAI_StripsElapsedMs(t *testing.T) {
 				Caller:  "mcp",
 				Message: "raw_exit=0 elapsed_ms=42 stdout_truncated=true",
 			},
-			forbidden: []string{"elapsed_ms", "raw_exit"},
-			required:  []string{"stdout_truncated=true"},
+			// stdout_truncated is now a forbidden token too (joint-review
+			// 2026-05 P1 fix): the output-volume oracle is closed at both
+			// the response struct and the audit_tail surfaces.
+			forbidden: []string{"elapsed_ms", "raw_exit", "stdout_truncated"},
+			required:  []string{},
 		},
 		{
 			name: "raw_exit_negative_stripped",
@@ -956,14 +1027,34 @@ func TestFilterAuditLineForAI_StripsElapsedMs(t *testing.T) {
 			required:  []string{},
 		},
 		{
-			name: "all_allowlisted_survive",
+			name: "only_timed_out_survives",
 			in: AuditEvent{
 				Action:  ActionMCPRun,
 				Caller:  "mcp",
 				Message: "stdout_truncated=true stderr_truncated=true timed_out=true",
 			},
-			forbidden: []string{"raw_exit", "elapsed_ms"},
-			required:  []string{"stdout_truncated=true", "stderr_truncated=true", "timed_out=true"},
+			// Post P1 fix: stdout_truncated/stderr_truncated are oracles
+			// and must not survive the filter; only timed_out remains.
+			forbidden: []string{"raw_exit", "elapsed_ms", "stdout_truncated", "stderr_truncated"},
+			required:  []string{"timed_out=true"},
+		},
+		{
+			// Joint-review 2026-05 P3: ActionNetworkAllowed messages
+			// were previously NOT run through the allowlist filter, so
+			// `command=` and `args=` tokens reached the AI verbatim
+			// (AI-supplied bytes echoed back via audit_tail — a
+			// divergence from the closed-allowlist invariant). The
+			// fix extends the filter to cover this action; neither
+			// `command` nor `args` is on the allowlist, so the Message
+			// collapses to empty.
+			name: "network_allowed_command_stripped",
+			in: AuditEvent{
+				Action:  ActionNetworkAllowed,
+				Caller:  "mcp",
+				Message: "command=curl args=3",
+			},
+			forbidden: []string{"command=", "args=", "curl"},
+			required:  []string{},
 		},
 	}
 	for _, c := range cases {

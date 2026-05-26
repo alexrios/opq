@@ -172,6 +172,63 @@ func TestWrapCommand_SandboxFull_BwrapArgv(t *testing.T) {
 	}
 }
 
+// TestWrapCommand_SandboxNetAllowed_BwrapArgv locks the joint-review
+// 2026-05 P2 fix: allow_network=true must still wrap with bwrap (not
+// pass-through to a bare host exec) and must preserve the SandboxNet
+// filesystem sandbox while lifting only the netns. The bwrap argv
+// must therefore:
+//   - run via bwrap (NOT a bare exec of the caller's command)
+//   - INCLUDE the same FS sandbox flags as SandboxNet (--ro-bind / /,
+//     tmpfs on /tmp + /run/user + /dev/shm + audit-dir, --unshare-pid,
+//     --proc /proc, --die-with-parent, --new-session)
+//   - EXCLUDE --unshare-net (that is the entire point of the profile)
+//
+// A regression would resurrect the cross-call host-FS persistence
+// chain: call-1 writes secret to /var/tmp under allow_network=true,
+// call-2 under default SandboxNet reads it back.
+func TestWrapCommand_SandboxNetAllowed_BwrapArgv(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	gotCmd, gotArgs, err := WrapCommand(SandboxNetAllowed, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if filepath.Base(gotCmd) != "bwrap" {
+		t.Errorf("wrapper cmd = %q, want bwrap (allow_network must NOT bypass the sandbox)", gotCmd)
+	}
+	// FS sandbox must be present.
+	for _, want := range []string{"--ro-bind", "--unshare-pid", "--die-with-parent", "--new-session"} {
+		if !containsArg(gotArgs, want) {
+			t.Errorf("net-allowed argv missing FS-sandbox flag %q: %v", want, gotArgs)
+		}
+	}
+	for _, seq := range [][]string{
+		{"--ro-bind", "/", "/"},
+		{"--proc", "/proc"},
+		{"--tmpfs", "/dev/shm"},
+		{"--tmpfs", "/run/user"},
+		{"--tmpfs", "/tmp"},
+	} {
+		if !hasSeq(gotArgs, seq) {
+			t.Errorf("net-allowed argv missing %v: %v", seq, gotArgs)
+		}
+	}
+	// Netns must be ABSENT — that is the defining difference from
+	// SandboxNet. If this assertion ever flips, the profile has
+	// collapsed back into SandboxNet and allow_network=true silently
+	// stops working for legitimate callers.
+	if containsArg(gotArgs, "--unshare-net") {
+		t.Errorf("net-allowed argv MUST NOT contain --unshare-net: %v", gotArgs)
+	}
+}
+
 func TestVerifySandboxAvailable_OK(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only sandbox")
@@ -251,8 +308,13 @@ func TestResolveMCPSandbox(t *testing.T) {
 		{"defaults", false, "", SandboxNet, false},
 		{"net explicit", false, "net", SandboxNet, false},
 		{"full", false, "full", SandboxFull, false},
-		{"allow_network default", true, "", SandboxNone, false},
-		{"allow_network + net", true, "net", SandboxNone, false},
+		// allow_network=true now routes to SandboxNetAllowed (FS sandbox
+		// preserved, netns lifted) instead of SandboxNone, closing the
+		// P2 cross-call host-FS persistence chain from joint-review
+		// 2026-05. SandboxNone is reachable from the MCP surface only
+		// via the error path below.
+		{"allow_network default", true, "", SandboxNetAllowed, false},
+		{"allow_network + net", true, "net", SandboxNetAllowed, false},
 		{"allow_network + full rejected", true, "full", SandboxNone, true},
 		{"unknown isolation", false, "bogus", SandboxNone, true},
 	}
