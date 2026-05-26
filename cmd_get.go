@@ -97,6 +97,9 @@ func (c *GetCmd) Run() error {
 	if !c.Plaintext {
 		return errors.New("refusing to print a secret without --plaintext; use `opq exec` to use the secret without exposing it")
 	}
+	if !validSecretName(c.Name) {
+		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
+	}
 
 	cfg := getGateConfig{
 		stdoutIsTTY:    term.IsTerminal(int(os.Stdout.Fd())),

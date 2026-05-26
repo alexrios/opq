@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io"
 
@@ -14,16 +15,35 @@ type Buffer struct {
 	inner *memguard.LockedBuffer
 }
 
+// ErrSecretContainsNUL is returned when a secret value carries a NUL byte
+// (joint-review 2026-05 P3 defense-in-depth). Go's os/exec rejects env
+// entries containing NUL bytes before invoking execve, so any NUL-bearing
+// secret is unusable in the primary opq workflow (`opq exec --env` and
+// MCP run_with_secrets) — every invocation would fail with an unhelpful
+// "exec_start_failed". Rejecting at constructor time turns that confusing
+// runtime failure into a clear error at the point where the secret enters
+// the system (typically `opq set`).
+var ErrSecretContainsNUL = errors.New("secret value contains NUL byte (not usable as an environment variable; reject at source)")
+
 // NewBufferFromBytes copies src into a locked buffer and wipes src in place.
-// Callers MUST stop using src after this call.
-func NewBufferFromBytes(src []byte) *Buffer {
+// Callers MUST stop using src after this call. Returns an error if src is
+// empty (memguard.NewBuffer(0) returns nil, and Move on nil panics) or if
+// src contains a NUL byte (see ErrSecretContainsNUL).
+func NewBufferFromBytes(src []byte) (*Buffer, error) {
+	if len(src) == 0 {
+		return nil, errors.New("empty secret value")
+	}
+	if bytes.IndexByte(src, 0) >= 0 {
+		return nil, ErrSecretContainsNUL
+	}
 	b := memguard.NewBuffer(len(src))
 	b.Move(src)
-	return &Buffer{inner: b}
+	return &Buffer{inner: b}, nil
 }
 
 // NewBufferFromReader reads r to EOF into a locked buffer. The caller must
-// bound r (e.g. via io.LimitReader) to prevent unbounded allocation.
+// bound r (e.g. via io.LimitReader) to prevent unbounded allocation. Same
+// NUL-byte rejection as NewBufferFromBytes.
 func NewBufferFromReader(r io.Reader) (*Buffer, error) {
 	lb, err := memguard.NewBufferFromEntireReader(r)
 	if err != nil {
@@ -37,6 +57,10 @@ func NewBufferFromReader(r io.Reader) (*Buffer, error) {
 			lb.Destroy()
 		}
 		return nil, errors.New("empty secret value")
+	}
+	if bytes.IndexByte(lb.Bytes(), 0) >= 0 {
+		lb.Destroy()
+		return nil, ErrSecretContainsNUL
 	}
 	return &Buffer{inner: lb}, nil
 }

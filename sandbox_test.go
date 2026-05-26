@@ -54,7 +54,7 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	// C2 fix: SandboxNet must include PID namespace isolation and private /proc
 	// to prevent sibling run_with_secrets calls from reading each other's
 	// /proc/<pid>/environ (finding C2 from the v1.1.1 security review).
-	for _, want := range []string{"--unshare-net", "--unshare-pid", "--dev-bind", "--die-with-parent", "--new-session"} {
+	for _, want := range []string{"--unshare-net", "--unshare-pid", "--ro-bind", "--die-with-parent", "--new-session"} {
 		if !containsArg(gotArgs, want) {
 			t.Errorf("net argv missing %q: %v", want, gotArgs)
 		}
@@ -63,14 +63,14 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	if !hasSeq(gotArgs, []string{"--proc", "/proc"}) {
 		t.Errorf("net argv missing '--proc /proc' sequence: %v", gotArgs)
 	}
-	// --proc /proc must come AFTER --dev-bind / / so it masks the host procfs.
+	// --proc /proc must come AFTER --ro-bind / / so it masks the host procfs.
 	// bwrap applies mounts left-to-right; reversing this defeats PID ns isolation.
-	devBindIdx := indexOf(gotArgs, "--dev-bind")
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
 	procIdx := indexOf(gotArgs, "--proc")
-	if devBindIdx < 0 || procIdx < 0 {
-		t.Errorf("argv missing --dev-bind or --proc: %v", gotArgs)
-	} else if procIdx < devBindIdx {
-		t.Errorf("--proc (idx %d) must come after --dev-bind (idx %d) in argv: %v", procIdx, devBindIdx, gotArgs)
+	if roBindIdx < 0 || procIdx < 0 {
+		t.Errorf("argv missing --ro-bind or --proc: %v", gotArgs)
+	} else if procIdx < roBindIdx {
+		t.Errorf("--proc (idx %d) must come after --ro-bind (idx %d) in argv: %v", procIdx, roBindIdx, gotArgs)
 	}
 	// The command must be resolved to an absolute path before the `--`
 	// terminator, since bwrap exec's it inside the sandbox.
@@ -86,6 +86,63 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 		t.Errorf("command after -- must be absolute, got %q", resolved)
 	}
 }
+
+// TestSandboxNet_TmpfsMasksDBus (J-1) — the SandboxNet argv must mask
+// the standard Unix-socket directories (/run/user, /tmp) with tmpfs so
+// the child cannot reach the D-Bus / Secret Service / KWallet /
+// gpg-agent sockets that the netns alone does NOT block. We deliberately
+// do NOT mask /var/run/user separately — on all systemd distros it is a
+// symlink to /run/user, and masking the symlink target after the parent
+// /var/run path becomes a stale symlink causes bwrap to fail with
+// "Can't mkdir /var/run/user". Each tmpfs sequence must appear AFTER
+// --ro-bind / / so it shadows the host bind-mount (bwrap applies mounts
+// left-to-right).
+func TestSandboxNet_TmpfsMasksDBus(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	maskedDirs := []string{"/run/user", "/tmp"}
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
+	if roBindIdx < 0 {
+		t.Fatalf("--ro-bind missing from SandboxNet argv: %v", gotArgs)
+	}
+	for _, dir := range maskedDirs {
+		if !hasSeq(gotArgs, []string{"--tmpfs", dir}) {
+			t.Errorf("SandboxNet argv missing '--tmpfs %s' mask: %v", dir, gotArgs)
+			continue
+		}
+		// The tmpfs must come AFTER --ro-bind / /. Find the --tmpfs <dir>
+		// pair and assert the --tmpfs token sits past the ro-bind index.
+		for i := 0; i+1 < len(gotArgs); i++ {
+			if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == dir {
+				if i < roBindIdx {
+					t.Errorf("--tmpfs %s (idx %d) must come AFTER --ro-bind (idx %d): %v",
+						dir, i, roBindIdx, gotArgs)
+				}
+				break
+			}
+		}
+	}
+	// Forbidden masks: re-introducing --tmpfs /var/run/user breaks bwrap on
+	// every systemd distro because /var/run is a symlink to /run; after
+	// --tmpfs /run/user empties the target, bwrap cannot mkdir
+	// /var/run/user inside the now-empty tmpfs. Guard against the
+	// regression with an explicit negative assertion.
+	if hasSeq(gotArgs, []string{"--tmpfs", "/var/run/user"}) {
+		t.Errorf("SandboxNet argv must NOT mask /var/run/user (the /var/run -> /run symlink covers it; explicit mask breaks bwrap): %v", gotArgs)
+	}
+}
+
 
 func TestWrapCommand_SandboxFull_BwrapArgv(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -116,6 +173,63 @@ func TestWrapCommand_SandboxFull_BwrapArgv(t *testing.T) {
 	}
 }
 
+// TestWrapCommand_SandboxNetAllowed_BwrapArgv locks the joint-review
+// 2026-05 P2 fix: allow_network=true must still wrap with bwrap (not
+// pass-through to a bare host exec) and must preserve the SandboxNet
+// filesystem sandbox while lifting only the netns. The bwrap argv
+// must therefore:
+//   - run via bwrap (NOT a bare exec of the caller's command)
+//   - INCLUDE the same FS sandbox flags as SandboxNet (--ro-bind / /,
+//     tmpfs on /tmp + /run/user + /dev/shm + audit-dir, --unshare-pid,
+//     --proc /proc, --die-with-parent, --new-session)
+//   - EXCLUDE --unshare-net (that is the entire point of the profile)
+//
+// A regression would resurrect the cross-call host-FS persistence
+// chain: call-1 writes secret to /var/tmp under allow_network=true,
+// call-2 under default SandboxNet reads it back.
+func TestWrapCommand_SandboxNetAllowed_BwrapArgv(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	gotCmd, gotArgs, err := WrapCommand(SandboxNetAllowed, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if filepath.Base(gotCmd) != "bwrap" {
+		t.Errorf("wrapper cmd = %q, want bwrap (allow_network must NOT bypass the sandbox)", gotCmd)
+	}
+	// FS sandbox must be present.
+	for _, want := range []string{"--ro-bind", "--unshare-pid", "--die-with-parent", "--new-session"} {
+		if !containsArg(gotArgs, want) {
+			t.Errorf("net-allowed argv missing FS-sandbox flag %q: %v", want, gotArgs)
+		}
+	}
+	for _, seq := range [][]string{
+		{"--ro-bind", "/", "/"},
+		{"--proc", "/proc"},
+		{"--tmpfs", "/dev/shm"},
+		{"--tmpfs", "/run/user"},
+		{"--tmpfs", "/tmp"},
+	} {
+		if !hasSeq(gotArgs, seq) {
+			t.Errorf("net-allowed argv missing %v: %v", seq, gotArgs)
+		}
+	}
+	// Netns must be ABSENT — that is the defining difference from
+	// SandboxNet. If this assertion ever flips, the profile has
+	// collapsed back into SandboxNet and allow_network=true silently
+	// stops working for legitimate callers.
+	if containsArg(gotArgs, "--unshare-net") {
+		t.Errorf("net-allowed argv MUST NOT contain --unshare-net: %v", gotArgs)
+	}
+}
+
 func TestVerifySandboxAvailable_OK(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only sandbox")
@@ -123,6 +237,11 @@ func TestVerifySandboxAvailable_OK(t *testing.T) {
 	if _, err := exec.LookPath("bwrap"); err != nil {
 		t.Skip("bwrap not present")
 	}
+	// Reset the sync.Once cache so a prior test's failure (e.g. the
+	// bwrap-missing test running first under -shuffle) does not leak
+	// into this one. Reset on exit too so subsequent tests start clean.
+	resetSandboxVerifyCacheForTest()
+	t.Cleanup(resetSandboxVerifyCacheForTest)
 	if err := VerifySandboxAvailable(); err != nil {
 		t.Fatalf("VerifySandboxAvailable: %v", err)
 	}
@@ -136,6 +255,11 @@ func TestVerifySandboxAvailable_BwrapMissing(t *testing.T) {
 	orig := os.Getenv("PATH")
 	t.Setenv("PATH", empty)
 	defer t.Setenv("PATH", orig)
+	// Cache reset: a prior successful test would otherwise short-circuit
+	// our PATH manipulation. Reset on exit too so the cached failure
+	// does not poison subsequent tests in the same binary run.
+	resetSandboxVerifyCacheForTest()
+	t.Cleanup(resetSandboxVerifyCacheForTest)
 
 	err := VerifySandboxAvailable()
 	if err == nil {
@@ -149,6 +273,112 @@ func TestVerifySandboxAvailable_BwrapMissing(t *testing.T) {
 	}
 }
 
+// TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken (J-9) — a host
+// where bwrap reports a healthy version but cannot actually create
+// namespaces (e.g. AppArmor profile blocks unshare) must surface the
+// failure at startup rather than as obscure run_with_secrets failures
+// later. We simulate by planting a fake bwrap on PATH that prints the
+// expected version string for --version and exits 1 on any other argv
+// (i.e. the namespace-probe invocation).
+func TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("/bin/sh required")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "bwrap")
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  --version) echo 'bubblewrap 0.11.0'; exit 0;;\n" +
+		"  *) echo 'fake bwrap: setting up user namespace: Operation not permitted' 1>&2; exit 1;;\n" +
+		"esac\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bwrap: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	resetSandboxVerifyCacheForTest()
+	t.Cleanup(resetSandboxVerifyCacheForTest)
+
+	err := VerifySandboxAvailable()
+	if err == nil {
+		t.Fatalf("expected probe error when bwrap exits 1 on namespace flags")
+	}
+	if !strings.Contains(err.Error(), "namespace probe") {
+		t.Errorf("expected error to mention 'namespace probe', got: %v", err)
+	}
+}
+
+// TestVerifySandboxAvailable_CachesResult locks the P3-2 optimization:
+// after a first call, subsequent calls must NOT re-run the bwrap probe.
+// We plant a counting fake bwrap that succeeds on --version and the
+// namespace probe, drive a first call, then nuke PATH so any real
+// re-probe would fail — a cached success must still be returned. The
+// converse case (cache the failure too) is asserted by inverting the
+// arrangement: plant a missing PATH, fail once, then add bwrap back —
+// cached failure must persist.
+func TestVerifySandboxAvailable_CachesResult(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("/bin/sh required")
+	}
+
+	t.Run("cached success", func(t *testing.T) {
+		if _, err := exec.LookPath("bwrap"); err != nil {
+			t.Skip("bwrap not present on host; cannot exercise success cache")
+		}
+		resetSandboxVerifyCacheForTest()
+		t.Cleanup(resetSandboxVerifyCacheForTest)
+
+		if err := VerifySandboxAvailable(); err != nil {
+			t.Fatalf("first call: %v", err)
+		}
+		// Sabotage PATH so a re-probe would fail. The cache must short
+		// circuit and still return nil.
+		empty := t.TempDir()
+		t.Setenv("PATH", empty)
+		if err := VerifySandboxAvailable(); err != nil {
+			t.Fatalf("second call should be cached success, got: %v", err)
+		}
+	})
+
+	t.Run("cached failure", func(t *testing.T) {
+		resetSandboxVerifyCacheForTest()
+		t.Cleanup(resetSandboxVerifyCacheForTest)
+		empty := t.TempDir()
+		t.Setenv("PATH", empty)
+		err := VerifySandboxAvailable()
+		if err == nil {
+			t.Fatalf("first call: expected error when bwrap is missing")
+		}
+		first := err.Error()
+		// "Install" bwrap by repointing PATH at a directory holding a
+		// fake one. A re-probe would now succeed; the cache must still
+		// return the original error.
+		dir := t.TempDir()
+		fake := filepath.Join(dir, "bwrap")
+		script := "#!/bin/sh\n" +
+			"case \"$1\" in\n" +
+			"  --version) echo 'bubblewrap 0.11.0'; exit 0;;\n" +
+			"  *) exit 0;;\n" +
+			"esac\n"
+		if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake bwrap: %v", err)
+		}
+		t.Setenv("PATH", dir)
+		err = VerifySandboxAvailable()
+		if err == nil {
+			t.Fatalf("expected cached failure to persist after bwrap appears on PATH")
+		}
+		if err.Error() != first {
+			t.Errorf("cached error text changed: was %q, now %q", first, err.Error())
+		}
+	})
+}
+
 func TestResolveMCPSandbox(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -160,8 +390,13 @@ func TestResolveMCPSandbox(t *testing.T) {
 		{"defaults", false, "", SandboxNet, false},
 		{"net explicit", false, "net", SandboxNet, false},
 		{"full", false, "full", SandboxFull, false},
-		{"allow_network default", true, "", SandboxNone, false},
-		{"allow_network + net", true, "net", SandboxNone, false},
+		// allow_network=true now routes to SandboxNetAllowed (FS sandbox
+		// preserved, netns lifted) instead of SandboxNone, closing the
+		// P2 cross-call host-FS persistence chain from joint-review
+		// 2026-05. SandboxNone is reachable from the MCP surface only
+		// via the error path below.
+		{"allow_network default", true, "", SandboxNetAllowed, false},
+		{"allow_network + net", true, "net", SandboxNetAllowed, false},
 		{"allow_network + full rejected", true, "full", SandboxNone, true},
 		{"unknown isolation", false, "bogus", SandboxNone, true},
 	}
@@ -198,6 +433,164 @@ func TestParseSandboxFlag(t *testing.T) {
 		if !c.wantErr && got != c.want {
 			t.Errorf("parseSandboxFlag(%q) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SandboxNet tmpfs-masks the audit directory (J-12 / P0-2).
+//
+// Background: under SandboxNet, --ro-bind / / makes the host filesystem
+// visible to the child. Without an explicit mask, the AI-spawned subprocess
+// could read $XDG_STATE_HOME/opq/audit.log (or the HOME fallback) and recover
+// raw_exit / elapsed_ms tokens that filterAuditMessageForAI strips from the
+// MCP audit_tail response. The fix in sandbox_linux.go appends
+// `--tmpfs <auditDir>` to the SandboxNet argv. These tests lock down:
+//   - the argv includes the tmpfs after --ro-bind / /
+//   - the HOME fallback works when XDG_STATE_HOME is unset
+//   - the wrapper fails CLOSED (no argv produced) if neither path resolves
+//   - SandboxFull does NOT reach the audit-dir resolver (it tmpfs-masks /home
+//     wholesale, so the resolver must not be a hard dependency there)
+// -----------------------------------------------------------------------------
+
+// TestSandboxNet_TmpfsMasksAuditDir locks the canonical XDG_STATE_HOME path.
+// With XDG_STATE_HOME=<tmp>, the resolved audit dir is <tmp>/opq and the
+// argv must carry "--tmpfs <tmp>/opq" after --ro-bind / /.
+func TestSandboxNet_TmpfsMasksAuditDir(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	wantDir := filepath.Join(tmp, "opq")
+	// EvalSymlinks resolves /tmp -> /private/tmp on macOS, but we already
+	// skipped non-linux above. On linux, t.TempDir under /tmp may already be
+	// canonical; if not, mirror resolveAuditDirForMask's EvalSymlinks step.
+	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
+		wantDir = resolved
+	}
+
+	if !hasSeq(gotArgs, []string{"--tmpfs", wantDir}) {
+		t.Fatalf("SandboxNet argv missing '--tmpfs %s': %v", wantDir, gotArgs)
+	}
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
+	if roBindIdx < 0 {
+		t.Fatalf("--ro-bind missing from SandboxNet argv: %v", gotArgs)
+	}
+	// The audit-dir tmpfs must come AFTER --ro-bind / / so it shadows the
+	// inherited bind-mount (bwrap applies left-to-right).
+	for i := 0; i+1 < len(gotArgs); i++ {
+		if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == wantDir {
+			if i < roBindIdx {
+				t.Errorf("--tmpfs %s (idx %d) must come AFTER --ro-bind (idx %d): %v",
+					wantDir, i, roBindIdx, gotArgs)
+			}
+			return
+		}
+	}
+}
+
+// TestSandboxNet_TmpfsMasksAuditDir_HonorsHomeFallback covers the second
+// auditLogPath branch: when XDG_STATE_HOME is empty, the audit dir is
+// $HOME/.local/state/opq. The argv must carry that path as a tmpfs mask.
+func TestSandboxNet_TmpfsMasksAuditDir_HonorsHomeFallback(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	home := t.TempDir()
+	// Explicitly clear XDG_STATE_HOME so auditLogPath falls back to HOME.
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", home)
+
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand: %v", err)
+	}
+
+	wantDir := filepath.Join(home, ".local", "state", "opq")
+	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
+		wantDir = resolved
+	}
+
+	if !hasSeq(gotArgs, []string{"--tmpfs", wantDir}) {
+		t.Errorf("SandboxNet argv missing '--tmpfs %s' from HOME fallback: %v", wantDir, gotArgs)
+	}
+}
+
+// TestSandboxNet_FailsClosedOnUnresolvableAuditDir locks the regression for
+// the silent-skip variant: if the audit directory cannot be resolved (e.g.
+// neither XDG_STATE_HOME nor HOME is set), WrapCommand must return a non-nil
+// error and an empty argv rather than silently omit the tmpfs mask and run
+// the child without it.
+func TestSandboxNet_FailsClosedOnUnresolvableAuditDir(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+
+	gotCmd, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err == nil {
+		t.Fatalf("expected WrapCommand to fail closed with no XDG_STATE_HOME / HOME, got cmd=%q args=%v", gotCmd, gotArgs)
+	}
+	if gotCmd != "" || len(gotArgs) != 0 {
+		t.Errorf("on failure WrapCommand must return empty cmd/args, got cmd=%q args=%v", gotCmd, gotArgs)
+	}
+}
+
+// TestSandboxFull_DoesNotInvokeAuditDirResolver — the audit-dir resolution
+// branch is intentionally scoped to SandboxNet. SandboxFull tmpfs-masks /home
+// wholesale, so it must not gain a transitive failure mode on a missing HOME.
+// We blank XDG_STATE_HOME and HOME and assert WrapCommand(SandboxFull, ...)
+// still produces a valid argv.
+func TestSandboxFull_DoesNotInvokeAuditDirResolver(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("/bin/true not present")
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+
+	_, gotArgs, err := WrapCommand(SandboxFull, "true", nil)
+	if err != nil {
+		t.Fatalf("WrapCommand(SandboxFull) must not depend on audit-dir resolution; got err=%v", err)
+	}
+	// Sanity: SandboxFull still emits its own argv shape, including the
+	// --setenv HOME /tmp pair that's irrelevant to the resolver but useful
+	// as evidence the SandboxFull branch ran.
+	if !hasSeq(gotArgs, []string{"--setenv", "HOME", "/tmp"}) {
+		t.Errorf("SandboxFull argv missing '--setenv HOME /tmp': %v", gotArgs)
+	}
+	if !hasSeq(gotArgs, []string{"--tmpfs", "/home"}) {
+		t.Errorf("SandboxFull argv missing '--tmpfs /home': %v", gotArgs)
 	}
 }
 

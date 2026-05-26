@@ -20,6 +20,29 @@ type RedactingWriter struct {
 	secrets  []redactSecret
 	maxLen   int
 	holdover []byte
+	// downTrunc is non-nil iff the downstream writer implements
+	// truncatedReporter. Cached at construction to avoid a per-Write type
+	// assertion. Once downTrunc.Truncated() returns true, passThrough flips
+	// permanently and subsequent Writes bypass scan() entirely (P1-1: CPU
+	// DoS short-circuit — without it, a high-volume producer like `yes`
+	// burns the full MCP timeout window scanning bytes the cappedWriter
+	// downstream silently drops).
+	downTrunc   truncatedReporter
+	passThrough bool
+}
+
+// truncatedReporter is the optional contract a downstream io.Writer can
+// implement to signal that it has begun discarding bytes. RedactingWriter
+// checks it once per Write and flips to pass-through forever once true.
+// Keep this interface single-method and side-effect-free.
+//
+// NOTE: the wiring is a one-shot type assertion in NewRedactingWriter. Any
+// interposer between RedactingWriter and the truncating sink (e.g. a metering
+// or logging wrapper) MUST proxy Truncated() — otherwise the P1-1 short-circuit
+// silently disappears with no compile-time warning. Today only mcp.cappedWriter
+// implements it; review this assumption when adding a new wrapper.
+type truncatedReporter interface {
+	Truncated() bool
 }
 
 type redactSecret struct {
@@ -27,11 +50,35 @@ type redactSecret struct {
 	value []byte
 }
 
+// hasTruncationShortCircuit reports whether the downstream's Truncated()
+// short-circuit is wired (i.e. the constructor's one-shot type assertion
+// against truncatedReporter succeeded). Test-only introspection used by
+// the P2-6 regression test to lock the P1-1 pipeline invariant — if a
+// future refactor inserts an interposer between RedactingWriter and the
+// truncating sink that does not proxy Truncated(), this returns false
+// and the regression test fails before production damage. Production
+// code does not use this; it is intentionally lowercase (package-private)
+// so it stays out of the public API surface.
+//
+// NOTE: this checks structural wiring only (downTrunc != nil). It does
+// NOT verify that the downstream's Truncated() actually returns true
+// when bytes are dropped — an interposer that proxies the interface but
+// always returns false would pass this check. That semantic correctness
+// is covered by the companion behavioral test
+// TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation, which
+// asserts that passThrough flips after a real truncation event.
+func (r *RedactingWriter) hasTruncationShortCircuit() bool {
+	return r.downTrunc != nil
+}
+
 // NewRedactingWriter constructs a writer that redacts the given secrets.
 // The secrets slice is copied; the caller may destroy the source buffers
 // immediately after this returns. Empty secret values are skipped.
 func NewRedactingWriter(w io.Writer, secrets []NamedSecret) *RedactingWriter {
 	rw := &RedactingWriter{w: w}
+	if tr, ok := w.(truncatedReporter); ok {
+		rw.downTrunc = tr
+	}
 	for _, s := range secrets {
 		if len(s.Value) == 0 {
 			continue
@@ -62,6 +109,24 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 
 	if len(r.secrets) == 0 {
 		// Pass-through. Holdover stays empty.
+		return r.w.Write(p)
+	}
+
+	// P1-1: if the downstream has already started dropping bytes (e.g. the
+	// MCP cappedWriter past its 256 KiB cap), every further byte scanned is
+	// wasted CPU. Flip to pass-through once and drop any retained holdover
+	// — those bytes are already past the cap and will be dropped downstream
+	// regardless.
+	if !r.passThrough && r.downTrunc != nil && r.downTrunc.Truncated() {
+		r.passThrough = true
+		if len(r.holdover) > 0 {
+			for i := range r.holdover {
+				r.holdover[i] = 0
+			}
+			r.holdover = nil
+		}
+	}
+	if r.passThrough {
 		return r.w.Write(p)
 	}
 

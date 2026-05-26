@@ -204,6 +204,144 @@ func TestCappedWriter_RedactorSecretNeverLeaksUnderTruncation(t *testing.T) {
 	}
 }
 
+// TestRunWithSecretsPipeline_RedactorShortCircuitWired (P2-6, joint-review
+// 2026-05) locks the P1-1 short-circuit at the wiring level. If a future
+// refactor inserts an interposer (metering / logging / tee writer) between
+// RedactingWriter and cappedWriter that does NOT proxy Truncated(), the
+// one-shot type assertion in NewRedactingWriter fails silently. downTrunc
+// becomes nil, the short-circuit disappears, and an AI calling
+// run_with_secrets with a high-volume producer like `yes` burns the full
+// MCP timeout window scanning bytes the 256 KiB cap is dropping anyway.
+//
+// This test rebuilds the production handleRunWithSecrets output pipeline
+// byte-for-byte (mcp.go lines 398-406) and asserts the redactor reports
+// the short-circuit is wired. It intentionally lives in mcp_test.go (not
+// redact_test.go): the regression is a property of the MCP pipeline
+// assembly, not of RedactingWriter in isolation.
+func TestRunWithSecretsPipeline_RedactorShortCircuitWired(t *testing.T) {
+	// Mirror the production assembly. Any drift here from the real
+	// handleRunWithSecrets pipeline construction defeats the test.
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutCap := newCappedWriter(&stdoutBuf, mcpMaxOutputBytes)
+	stderrCap := newCappedWriter(&stderrBuf, mcpMaxOutputBytes)
+	named := []NamedSecret{{Name: "API", Value: []byte("sk-test-value")}}
+	stdoutRW := NewRedactingWriter(stdoutCap, named)
+	stderrRW := NewRedactingWriter(stderrCap, named)
+	defer stdoutRW.Destroy()
+	defer stderrRW.Destroy()
+
+	// Structural invariants of the wiring.
+	if !stdoutRW.hasTruncationShortCircuit() {
+		t.Fatalf("stdout RedactingWriter has nil downTrunc — the P1-1 short-circuit is no longer wired through the production pipeline. Likely cause: an interposer between RedactingWriter and cappedWriter that does not implement Truncated() bool.")
+	}
+	if !stderrRW.hasTruncationShortCircuit() {
+		t.Fatalf("stderr RedactingWriter has nil downTrunc — symmetry broken; only stdout is short-circuited.")
+	}
+
+	// Lock the cap constant. mcpMaxOutputBytes is the cap the production
+	// code passes; if either drifts the test should catch it.
+	if mcpMaxOutputBytes != 256*1024 {
+		t.Fatalf("mcpMaxOutputBytes = %d, want 256*1024 (256 KiB)", mcpMaxOutputBytes)
+	}
+	if stdoutCap.remaining != mcpMaxOutputBytes {
+		t.Fatalf("stdoutCap.remaining = %d, want %d", stdoutCap.remaining, mcpMaxOutputBytes)
+	}
+	if stderrCap.remaining != mcpMaxOutputBytes {
+		t.Fatalf("stderrCap.remaining = %d, want %d", stderrCap.remaining, mcpMaxOutputBytes)
+	}
+
+	// Initial state: pre-flip, no writes yet.
+	if stdoutRW.passThrough {
+		t.Fatalf("stdoutRW.passThrough should be false before any write")
+	}
+	if stderrRW.passThrough {
+		t.Fatalf("stderrRW.passThrough should be false before any write")
+	}
+}
+
+// TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation (P2-6) is the
+// behavioral half of the wiring assertion above. It writes more than the
+// cap through the production pipeline (with a small cap for test speed)
+// and confirms that the redactor flips into pass-through after truncation,
+// proving the short-circuit code path actually executes end-to-end rather
+// than just being structurally reachable.
+//
+// Determinism: this test does not measure CPU or wall time. It uses the
+// sticky passThrough bit and the cappedWriter byte counter as the signal,
+// both of which are deterministic state transitions.
+func TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation(t *testing.T) {
+	// Small cap so the test stays fast; the structural test above locks
+	// the production cap constant separately.
+	const cap = 1024
+	var inner bytes.Buffer
+	cw := newCappedWriter(&inner, cap)
+	rw := NewRedactingWriter(cw, []NamedSecret{{Name: "API", Value: []byte("sekret")}})
+	defer rw.Destroy()
+
+	if !rw.hasTruncationShortCircuit() {
+		t.Fatalf("precondition: downTrunc must be wired for this test to be meaningful")
+	}
+
+	// First write: cap + 1 bytes. cappedWriter consumes `cap` bytes and
+	// drops the trailing byte, flipping truncated=true. The RedactingWriter
+	// only checks downTrunc.Truncated() at the START of its own Write, so
+	// passThrough is still false at this point.
+	first := bytes.Repeat([]byte("A"), cap+1)
+	if _, err := rw.Write(first); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if !cw.Truncated() {
+		t.Fatalf("cappedWriter should have flipped truncated=true after writing cap+1 bytes")
+	}
+	// Lock cap exhaustion explicitly. Without this, a future inner-writer
+	// that partially accepts bytes (n < len(p), no error) would leave
+	// remaining > 0 and the second write below could still grow `inner`,
+	// making the inner.Len() == preLen assertion misleading. bytes.Buffer
+	// today always accepts the full slice, so this is defense-in-depth.
+	if cw.remaining != 0 {
+		t.Fatalf("cap not fully exhausted after first write: remaining=%d, want 0", cw.remaining)
+	}
+	if rw.passThrough {
+		t.Fatalf("rw.passThrough should still be false — the flip happens on the NEXT Write")
+	}
+
+	// Second write: this triggers the short-circuit check at the top of
+	// RedactingWriter.Write. The secret "sekret" must come through verbatim
+	// to the cappedWriter (which then drops it because the cap is exhausted),
+	// proving scan() was bypassed.
+	preLen := inner.Len()
+	if _, err := rw.Write([]byte("B sekret B")); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	// Assert the sticky passThrough bit is now set — this is the P1-1
+	// short-circuit having fired.
+	if !rw.passThrough {
+		t.Fatalf("rw.passThrough must be true after the second write — the short-circuit did not fire")
+	}
+	// Holdover must have been zeroed on the flip (redact.go lines 101-106).
+	if len(rw.holdover) != 0 {
+		t.Fatalf("rw.holdover must be empty after the flip, got %d bytes", len(rw.holdover))
+	}
+	// Inner buffer must not have grown past the cap: cappedWriter drops
+	// post-cap bytes, and the redactor handed them off verbatim (proving
+	// it did not retry / split / hold them).
+	if inner.Len() != preLen {
+		t.Fatalf("inner buffer grew past the cap: was %d, now %d (cap=%d)", preLen, inner.Len(), cap)
+	}
+	if inner.Len() > cap {
+		t.Fatalf("inner.Len() = %d exceeds cap %d", inner.Len(), cap)
+	}
+	// No redaction token must appear post-flip in the inner buffer: bytes
+	// past the cap are dropped, so the only post-flip evidence we can read
+	// is the absence of growth above. Also assert no raw secret leaked
+	// into the captured (pre-cap) portion — this is a separate invariant
+	// from the short-circuit, but a cheap sanity check.
+	if bytes.Contains(inner.Bytes(), []byte("sekret")) {
+		t.Fatalf("raw secret leaked into pre-cap buffer: %q", inner.String())
+	}
+}
+
 func TestHandleRunWithSecrets_EnvCountCap(t *testing.T) {
 	// 33 entries should be rejected before any keyring access. We
 	// can't easily mock the keyring, so we rely on the cap check being
@@ -407,12 +545,14 @@ func mcpResultText(res *mcp.CallToolResult) string {
 
 // ----- Phase 3 security-fix tests (C1, M3, H1) -----
 
-// TestAuditTailMCP_StripsRawExit (C1) verifies that handleAuditTail does not
-// return raw_exit tokens to an MCP caller, closing the exit-code oracle.
-func TestAuditTailMCP_StripsRawExit(t *testing.T) {
+// TestAuditTailMCP_AllowlistFilter (C1/J-10) verifies that handleAuditTail
+// applies the AI-visible allowlist filter to mcp_run messages: raw_exit is
+// stripped (exit-code oracle defense) AND elapsed_ms is stripped (timing
+// oracle defense, J-6). Only allowlisted keys survive.
+func TestAuditTailMCP_AllowlistFilter(t *testing.T) {
 	withAuditTmpDir(t)
 
-	// Write an mcp_run audit line that contains raw_exit=42.
+	// Write an mcp_run audit line that contains raw_exit=42 and elapsed_ms=100.
 	ev := AuditEvent{
 		Action:  ActionMCPRun,
 		Caller:  "mcp",
@@ -433,11 +573,9 @@ func TestAuditTailMCP_StripsRawExit(t *testing.T) {
 		if strings.Contains(line, "raw_exit") {
 			t.Errorf("raw_exit leaked to AI in line: %s", line)
 		}
-	}
-	// The other fields must still be present.
-	combined := strings.Join(out.Entries, "\n")
-	if !strings.Contains(combined, "elapsed_ms=100") {
-		t.Errorf("elapsed_ms missing from filtered output: %s", combined)
+		if strings.Contains(line, "elapsed_ms") {
+			t.Errorf("elapsed_ms leaked to AI in line: %s", line)
+		}
 	}
 }
 
@@ -503,6 +641,47 @@ func TestAuditTailMCP_FiltersNonMCPCaller(t *testing.T) {
 		if strings.Contains(line, "mykey") {
 			t.Errorf("CLI secret name leaked to MCP caller: %s", line)
 		}
+	}
+}
+
+// TestHandleListSecrets_AuditsBeforeBackend (joint-review 2026-05 P3)
+// locks the audit-before-action contract for list_secrets. An AI that
+// hammers list_secrets against a degraded backend (D-Bus down, keyring
+// locked, etc.) must leave a trace per call. Previously the audit was
+// emitted ONLY on the success path, so failure-path probing was
+// invisible to the operator. The fix moves AppendAudit to the head of
+// the handler so backend success and failure both audit.
+//
+// The test works whether or not the host has a usable keyring: if the
+// call succeeds, the post-call audit log carries the entry; if it
+// fails, the same entry must still be present.
+func TestHandleListSecrets_AuditsBeforeBackend(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	_, _, err := handleListSecrets(context.Background(), nil, listSecretsInput{})
+	if err != nil {
+		t.Fatalf("handleListSecrets: %v", err)
+	}
+
+	lines, err := tailAudit(20)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	var seen bool
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionList && ev.Caller == "mcp" {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Fatalf("expected ActionList/mcp audit entry regardless of backend availability; got %v", lines)
 	}
 }
 
@@ -638,24 +817,580 @@ func TestFilterAuditLineForAI_EmptyDropped(t *testing.T) {
 	}
 }
 
-// TestStripRawExitTokens verifies all raw_exit variants are removed.
-func TestStripRawExitTokens(t *testing.T) {
+// TestFilterAuditLineForAI_AuditTailSurvives verifies that ActionAuditTail
+// entries pass through filterAuditLineForAI WITHOUT having their Message
+// filtered. The allowlist gate (filterAuditMessageForAI) is intentionally
+// scoped to ActionMCPRun only — broadening it would silently drop the
+// `n=N` token from audit_tail self-log entries (a J-5 deterrent the AI is
+// supposed to see). This test locks that scope so a future refactor that
+// widens the condition (e.g. `ev.Action != ActionList`) trips here.
+func TestFilterAuditLineForAI_AuditTailSurvives(t *testing.T) {
+	raw, err := json.Marshal(AuditEvent{
+		Timestamp: time.Now().UTC(),
+		Action:    ActionAuditTail,
+		Caller:    "mcp",
+		Message:   "n=20",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out, ok := filterAuditLineForAI(string(raw))
+	if !ok {
+		t.Fatal("expected audit_tail line to be kept by filter")
+	}
+	var ev AuditEvent
+	if err := json.Unmarshal([]byte(out), &ev); err != nil {
+		t.Fatalf("unmarshal filtered line: %v", err)
+	}
+	if ev.Message != "n=20" {
+		t.Errorf("audit_tail msg mutated by filter: got %q, want %q", ev.Message, "n=20")
+	}
+}
+
+// TestRunWithSecretsOutput_NoTruncationFields locks the P1 fix from
+// the 2026-05 joint review: the AI-visible response struct must not
+// expose stdout_truncated / stderr_truncated. Combined with caller-
+// controlled commands those booleans were a clean 1-bit-per-call
+// output-volume oracle (the AI emits a volume that is a function of a
+// secret byte and binary-searches the cap threshold). Re-introducing
+// either field re-opens the oracle. The textual header path
+// (handleRunWithSecrets' textParts builder) is covered by the existing
+// end-to-end MCP tests below, which assert the rendered text shape.
+func TestRunWithSecretsOutput_NoTruncationFields(t *testing.T) {
+	raw, err := json.Marshal(runWithSecretsOutput{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, banned := range []string{"stdout_truncated", "stderr_truncated"} {
+		if strings.Contains(string(raw), banned) {
+			t.Errorf("AI-visible response JSON contains banned key %q: %s\n"+
+				"This field is an output-volume oracle (joint review 2026-05 P1) "+
+				"and must not be reintroduced.", banned, raw)
+		}
+	}
+}
+
+// TestAIAuditMessageAllowlist_Invariant locks the exact set of keys
+// permitted in AI-visible audit Message fields. Every entry below is a
+// closed-set widening of the AI's audit channel and was reviewed for
+// side-channel implications when added (see the godoc on
+// aiAuditMessageAllowlist for the per-key justifications). Adding a new
+// key REQUIRES updating this test, which forces the contributor to write
+// a one-line justification and re-read the threat-model commentary.
+//
+// stdout_truncated and stderr_truncated were REMOVED from this list when
+// the output-volume oracle (P1 in joint review 2026-05) was closed; the
+// AI must not be able to recover the truncation flag via audit_tail
+// either. Re-adding them would re-open the oracle.
+func TestAIAuditMessageAllowlist_Invariant(t *testing.T) {
+	want := map[string]bool{
+		"timed_out": true,
+	}
+	if len(aiAuditMessageAllowlist) != len(want) {
+		t.Fatalf("allowlist size changed: got %d keys, want %d (every change to this list MUST be reviewed for AI-leak implications)",
+			len(aiAuditMessageAllowlist), len(want))
+	}
+	for k := range want {
+		if !aiAuditMessageAllowlist[k] {
+			t.Errorf("allowlist missing expected key %q", k)
+		}
+	}
+	for k := range aiAuditMessageAllowlist {
+		if !want[k] {
+			t.Errorf("allowlist contains unexpected key %q — review the side-channel implications before widening this test", k)
+		}
+	}
+}
+
+// TestFilterAuditMessageForAI verifies the allowlist filter keeps known-safe
+// keys and drops all others (including raw_exit, elapsed_ms, and the now-
+// stripped stdout_truncated/stderr_truncated output-volume oracle tokens).
+func TestFilterAuditMessageForAI(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 	}{
-		{"secrets=foo raw_exit=42 elapsed_ms=100", "secrets=foo elapsed_ms=100"},
+		{"secrets=foo raw_exit=42 elapsed_ms=100", ""},
 		{"raw_exit=-1 timed_out=true", "timed_out=true"},
-		{"raw_exit=0 elapsed_ms=5", "elapsed_ms=5"},
-		{"raw_exit=255 stdout_truncated=true", "stdout_truncated=true"},
-		{"secrets=bar elapsed_ms=10", "secrets=bar elapsed_ms=10"},   // no raw_exit token
+		{"raw_exit=0 elapsed_ms=5", ""},
+		{"raw_exit=255 stdout_truncated=true", ""},
+		{"secrets=bar elapsed_ms=10", ""}, // both non-allowlisted
+		{"stdout_truncated=true stderr_truncated=true timed_out=true", "timed_out=true"},
 		{"", ""},
 	}
 	for _, c := range cases {
-		got := stripRawExitTokens(c.in)
+		got := filterAuditMessageForAI(c.in)
 		if got != c.want {
-			t.Errorf("stripRawExitTokens(%q) = %q, want %q", c.in, got, c.want)
+			t.Errorf("filterAuditMessageForAI(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestHandleRunWithSecrets_RejectsBadSecretName (J-14) — the MCP surface
+// rejects malformed secret names with the taxonomy string
+// "invalid_secret_name" before any backend lookup. Asserting via a
+// real-backend-or-not setup is fine because the validation gate runs
+// strictly BEFORE the backend.Get call.
+func TestHandleRunWithSecrets_RejectsBadSecretName(t *testing.T) {
+	withAuditTmpDir(t)
+
+	cases := []struct {
+		envName, secretName string
+	}{
+		{"API", "bad name"},
+		{"API", "bad/path"},
+		{"API", "bad$value"},
+		{"API", strings.Repeat("a", 129)},
+		{"API", ""},
+		{"API", "bad\nname"},
+	}
+	for _, c := range cases {
+		t.Run(c.secretName, func(t *testing.T) {
+			res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+				Command: "/bin/true",
+				Env:     map[string]string{c.envName: c.secretName},
+			})
+			if err != nil {
+				t.Fatalf("unexpected transport error: %v", err)
+			}
+			if res == nil || !res.IsError {
+				t.Fatalf("expected IsError result for bad secret %q, got %+v", c.secretName, res)
+			}
+			text := mcpResultText(res)
+			if !strings.Contains(text, "invalid_secret_name") {
+				t.Fatalf("expected 'invalid_secret_name' taxonomy, got %q", text)
+			}
+			// Validation runs BEFORE backend.Get, so any 'denied' audit
+			// entry must come from the validator itself (Message =
+			// "invalid_secret_name"), not from a backend lookup (Message
+			// = "not_found" / "backend_error"). The validator MUST emit a
+			// 'denied' entry so an AI probing the shape gate leaves a
+			// trace — see Finding 4 in /tmp/opaque-qa/codereview-findings.md.
+			lines, _ := tailAudit(100)
+			sawValidatorDenied := false
+			for _, line := range lines {
+				if strings.Contains(line, `"action":"denied"`) {
+					switch {
+					case strings.Contains(line, `"msg":"invalid_secret_name"`):
+						sawValidatorDenied = true
+					case strings.Contains(line, `"msg":"not_found"`),
+						strings.Contains(line, `"msg":"backend_error"`):
+						t.Errorf("validation must run BEFORE backend.Get; saw backend-shaped 'denied' entry: %s", line)
+					}
+				}
+			}
+			if !sawValidatorDenied {
+				t.Errorf("validator must emit a 'denied' audit entry with msg=invalid_secret_name; none seen in: %v", lines)
+			}
+		})
+	}
+}
+
+// TestHandleRunWithSecrets_RejectsTooManyArgs (J-16) — input.Args length
+// must be capped at mcpMaxArgCount (256). 257 args is rejected with the
+// taxonomy "too many args" before any backend or sandbox work.
+func TestHandleRunWithSecrets_RejectsTooManyArgs(t *testing.T) {
+	args := make([]string, mcpMaxArgCount+1)
+	for i := range args {
+		args[i] = "x"
+	}
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: "/bin/true",
+		Args:    args,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError result for oversize args, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if !strings.Contains(text, "too many args") {
+		t.Fatalf("expected 'too many args' message, got %q", text)
+	}
+}
+
+// TestHandleRunWithSecrets_AcceptsArgsAtCap (J-16) — 256 args is within
+// the cap and must not be rejected by the args-cap check. The call may
+// still fail downstream (e.g. backend unavailable or sandbox probe), but
+// the failure must not be the args-cap error.
+func TestHandleRunWithSecrets_AcceptsArgsAtCap(t *testing.T) {
+	args := make([]string, mcpMaxArgCount)
+	for i := range args {
+		args[i] = "x"
+	}
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: "/bin/true",
+		Args:    args,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	// If a result was returned (success or failure), it must not be the
+	// args-cap error. Downstream failures (sandbox unavailable, backend
+	// unavailable, etc.) are acceptable here — the assertion is narrowly
+	// that the args-cap gate passed.
+	if res != nil {
+		text := mcpResultText(res)
+		if strings.Contains(text, "too many args") {
+			t.Fatalf("256 args wrongly rejected by args-cap: %q", text)
+		}
+	}
+}
+
+// TestHandleAuditTail_EmitsAuditEntry (J-5) — every audit_tail MCP call
+// must itself leave an audit entry (caller=mcp, action=audit_tail,
+// msg="n=<clamped>"). Without this, an AI scraping the operator's
+// activity via repeated audit_tail calls is invisible to the operator.
+func TestHandleAuditTail_EmitsAuditEntry(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	res, _, err := handleAuditTail(context.Background(), nil, auditTailInput{})
+	if err != nil {
+		t.Fatalf("handleAuditTail: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultText(res))
+	}
+
+	// Read the audit log directly (tailAudit returns CLI-unfiltered view)
+	// and look for the audit_tail entry. clampAuditTailN(0) = 20, so
+	// the entry's msg must be "n=20".
+	lines, err := tailAudit(20)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	var found *AuditEvent
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionAuditTail {
+			ev := ev // shadow into stable address
+			found = &ev
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no audit_tail entry found in audit log; lines=%v", lines)
+	}
+	if found.Caller != "mcp" {
+		t.Errorf("audit_tail entry caller = %q, want mcp", found.Caller)
+	}
+	if found.Message != "n=20" {
+		t.Errorf("audit_tail entry msg = %q, want n=20 (default after clamp)", found.Message)
+	}
+}
+
+// TestHandleAuditTail_EmitsAuditEntry_CustomN (J-5) — when the AI passes
+// a specific N, the audit entry must reflect the clamped value.
+func TestHandleAuditTail_EmitsAuditEntry_CustomN(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// 99999 clamps to mcpMaxAuditTailN (200).
+	_, _, err := handleAuditTail(context.Background(), nil, auditTailInput{N: 99999})
+	if err != nil {
+		t.Fatalf("handleAuditTail: %v", err)
+	}
+	lines, err := tailAudit(20)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	wantMsg := fmt.Sprintf("n=%d", mcpMaxAuditTailN)
+	var seen bool
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionAuditTail && ev.Message == wantMsg {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Fatalf("audit_tail entry with msg=%q not found in %v", wantMsg, lines)
+	}
+}
+
+// TestHandleAuditTail_StripsSelfEntryByNonce (joint-review 2026-05 P3-1)
+// — handleAuditTail writes a self-entry BEFORE reading the log, then
+// strips its own row from the AI-visible response so the requested `n`
+// is not partially consumed. The strip used to be position-based ("the
+// last filtered line, matched by PID"), which broke under two
+// scenarios: (a) concurrent writers landing between our write and our
+// read, pushing our self-entry away from last position; (b) prior
+// audit_tail entries from earlier calls being incorrectly considered
+// for strip because they shared our PID.
+//
+// This test asserts the second invariant directly: a prior audit_tail
+// entry MUST NOT be stripped by a new call. We pre-plant a "prior"
+// audit_tail row with a distinct nonce, plant a follow-on mcp_run row,
+// then call handleAuditTail. The handler's own freshly-written entry
+// must be stripped (by nonce match), while the pre-planted prior
+// audit_tail entry must survive as the deterrent the J-5 design
+// promises. (The concurrent-writer race itself is exercised at unit
+// level by TestStripSelfAuditTailEntry/removes_single_match_anywhere;
+// integration-testing the literal interleaving would require a custom
+// audit-writer hook with no security gain.)
+func TestHandleAuditTail_StripsSelfEntryByNonce(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// Pre-plant a self-style audit_tail entry from a "prior call".
+	const priorNonce = "deadbeefdeadbeefdeadbeefdeadbeef"
+	if err := AppendAudit(AuditEvent{
+		Action:  ActionAuditTail,
+		Caller:  "mcp",
+		Message: "n=20",
+		Nonce:   priorNonce,
+	}); err != nil {
+		t.Fatalf("plant prior audit_tail: %v", err)
+	}
+	// Plant a follow-on mcp_run entry so our prior-call audit_tail is
+	// no longer the last line in the log when handleAuditTail reads it.
+	// This is the "displaced" scenario.
+	if err := AppendAudit(AuditEvent{
+		Action:  ActionMCPRun,
+		Caller:  "mcp",
+		Message: "raw_exit=0 elapsed_ms=10",
+	}); err != nil {
+		t.Fatalf("plant mcp_run: %v", err)
+	}
+
+	res, out, err := handleAuditTail(context.Background(), nil, auditTailInput{N: 20})
+	if err != nil {
+		t.Fatalf("handleAuditTail: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultText(res))
+	}
+
+	// The prior-call audit_tail (deterrent) MUST survive.
+	var seenPrior bool
+	var selfCount int
+	for _, line := range out.Entries {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal entry: %v", err)
+		}
+		if ev.Nonce == priorNonce {
+			seenPrior = true
+		}
+		if ev.Action == ActionAuditTail {
+			selfCount++
+		}
+	}
+	if !seenPrior {
+		t.Errorf("prior-call audit_tail entry (nonce=%s) was incorrectly stripped; entries=%v", priorNonce, out.Entries)
+	}
+	// Exactly one audit_tail entry should remain (the prior one). The
+	// handler's own freshly-written row must have been stripped by its
+	// unique nonce match.
+	if selfCount != 1 {
+		t.Errorf("expected exactly 1 audit_tail entry to survive (the prior-call deterrent), got %d: %v", selfCount, out.Entries)
+	}
+}
+
+// TestStripSelfAuditTailEntry locks the nonce-scanner's invariants in
+// isolation so a future refactor of handleAuditTail cannot accidentally
+// regress the strip behavior.
+func TestStripSelfAuditTailEntry(t *testing.T) {
+	// Helper to build a serialized audit-line with a given nonce.
+	mk := func(action, nonce string) string {
+		raw, err := json.Marshal(AuditEvent{Action: action, Caller: "mcp", Nonce: nonce})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(raw)
+	}
+
+	t.Run("removes single match anywhere in slice", func(t *testing.T) {
+		// Place the self-entry in the MIDDLE of the slice — this is
+		// the race-displacement case (a concurrent writer landed after
+		// our AppendAudit, so the new line(s) are now after us). A
+		// position-based strip would have missed this row.
+		a := mk(ActionList, "")
+		self := mk(ActionAuditTail, "n1")
+		b := mk(ActionMCPRun, "")
+		out := stripSelfAuditTailEntry([]string{a, self, b}, "n1")
+		if len(out) != 2 {
+			t.Fatalf("expected 2 entries, got %d: %v", len(out), out)
+		}
+		// Robust check via Nonce field rather than substring match
+		// (Kimi gate 2): a future change that adds a field whose value
+		// contains "n1" would otherwise pass spuriously.
+		for _, line := range out {
+			var ev AuditEvent
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.Nonce == "n1" {
+				t.Errorf("self entry not stripped: %s", line)
+			}
+		}
+	})
+	t.Run("empty nonce is a no-op", func(t *testing.T) {
+		entries := []string{mk(ActionAuditTail, ""), mk(ActionMCPRun, "")}
+		out := stripSelfAuditTailEntry(entries, "")
+		if len(out) != 2 {
+			t.Errorf("empty nonce must not modify slice; got %v", out)
+		}
+	})
+	t.Run("no match is a no-op", func(t *testing.T) {
+		entries := []string{mk(ActionAuditTail, "other"), mk(ActionMCPRun, "")}
+		out := stripSelfAuditTailEntry(entries, "missing")
+		if len(out) != 2 {
+			t.Errorf("non-matching nonce must not modify slice; got %v", out)
+		}
+	})
+	t.Run("only audit_tail action matches", func(t *testing.T) {
+		// A non-audit_tail entry carrying the same nonce must NOT be
+		// stripped — defensive against future code paths that mint
+		// nonces for other actions.
+		entries := []string{mk(ActionMCPRun, "samepid")}
+		out := stripSelfAuditTailEntry(entries, "samepid")
+		if len(out) != 1 {
+			t.Errorf("expected non-audit_tail nonce-bearer to survive; got %v", out)
+		}
+	})
+	t.Run("malformed json is skipped", func(t *testing.T) {
+		entries := []string{"{not json", mk(ActionAuditTail, "n2")}
+		out := stripSelfAuditTailEntry(entries, "n2")
+		if len(out) != 1 || out[0] != "{not json" {
+			t.Errorf("expected malformed to survive, audit_tail to be stripped; got %v", out)
+		}
+	})
+}
+
+// TestGenerateAuditNonce sanity-checks the nonce generator.
+func TestGenerateAuditNonce(t *testing.T) {
+	a := generateAuditNonce()
+	b := generateAuditNonce()
+	if len(a) != 32 || len(b) != 32 {
+		t.Fatalf("nonce length: a=%d b=%d, want 32", len(a), len(b))
+	}
+	if a == b {
+		t.Errorf("two nonces collided: %s == %s", a, b)
+	}
+	// Verify hex shape.
+	for _, ch := range a {
+		ok := (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
+		if !ok {
+			t.Errorf("nonce contains non-hex char %q in %s", ch, a)
+		}
+	}
+}
+
+// TestFilterAuditLineForAI_StripsElapsedMs (J-10/J-6) — a synthetic
+// audit_run JSON line carrying elapsed_ms must have that token stripped
+// from the AI-visible msg field. Also exercises that raw_exit and
+// exec_* tokens are stripped while allowlisted keys survive.
+func TestFilterAuditLineForAI_StripsElapsedMs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   AuditEvent
+		// want list of substrings that must NOT appear in the filtered line.
+		forbidden []string
+		// want list of substrings that MUST appear in the filtered line.
+		required []string
+	}{
+		{
+			name: "elapsed_ms_stripped",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "raw_exit=0 elapsed_ms=42 stdout_truncated=true",
+			},
+			// stdout_truncated is now a forbidden token too (joint-review
+			// 2026-05 P1 fix): the output-volume oracle is closed at both
+			// the response struct and the audit_tail surfaces.
+			forbidden: []string{"elapsed_ms", "raw_exit", "stdout_truncated"},
+			required:  []string{},
+		},
+		{
+			name: "raw_exit_negative_stripped",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "raw_exit=-1 elapsed_ms=60000 timed_out=true",
+			},
+			forbidden: []string{"raw_exit", "elapsed_ms"},
+			required:  []string{"timed_out=true"},
+		},
+		{
+			name: "exec_taxonomy_stripped",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "raw_exit=-1 elapsed_ms=10 exec_start_failed",
+			},
+			forbidden: []string{"raw_exit", "elapsed_ms", "exec_start_failed"},
+			required:  []string{},
+		},
+		{
+			name: "only_timed_out_survives",
+			in: AuditEvent{
+				Action:  ActionMCPRun,
+				Caller:  "mcp",
+				Message: "stdout_truncated=true stderr_truncated=true timed_out=true",
+			},
+			// Post P1 fix: stdout_truncated/stderr_truncated are oracles
+			// and must not survive the filter; only timed_out remains.
+			forbidden: []string{"raw_exit", "elapsed_ms", "stdout_truncated", "stderr_truncated"},
+			required:  []string{"timed_out=true"},
+		},
+		{
+			// Joint-review 2026-05 P3: ActionNetworkAllowed messages
+			// were previously NOT run through the allowlist filter, so
+			// `command=` and `args=` tokens reached the AI verbatim
+			// (AI-supplied bytes echoed back via audit_tail — a
+			// divergence from the closed-allowlist invariant). The
+			// fix extends the filter to cover this action; neither
+			// `command` nor `args` is on the allowlist, so the Message
+			// collapses to empty.
+			name: "network_allowed_command_stripped",
+			in: AuditEvent{
+				Action:  ActionNetworkAllowed,
+				Caller:  "mcp",
+				Message: "command=curl args=3",
+			},
+			forbidden: []string{"command=", "args=", "curl"},
+			required:  []string{},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := json.Marshal(c.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			out, ok := filterAuditLineForAI(string(raw))
+			if !ok {
+				t.Fatalf("expected line to be kept, got dropped: %s", raw)
+			}
+			// Re-parse so we look at the msg field, not random JSON.
+			var got AuditEvent
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("unmarshal output: %v (line=%s)", err, out)
+			}
+			for _, bad := range c.forbidden {
+				if strings.Contains(got.Message, bad) {
+					t.Errorf("forbidden token %q present in filtered msg %q", bad, got.Message)
+				}
+			}
+			for _, want := range c.required {
+				if !strings.Contains(got.Message, want) {
+					t.Errorf("required token %q missing from filtered msg %q", want, got.Message)
+				}
+			}
+		})
 	}
 }
 
@@ -685,5 +1420,209 @@ func TestAuditTailClamp(t *testing.T) {
 	}
 	if got := len(lines); got != mcpMaxAuditTailN {
 		t.Fatalf("len=%d want %d", got, mcpMaxAuditTailN)
+	}
+}
+
+// findAuditDeniedWithMessage scans the audit log entries for an
+// ActionDenied event tagged with caller "mcp" and exact Message match.
+// Returns the parsed event and ok=true if found. Used by the P1-1 tests
+// below to assert that exec-resolution failures leave a forensic trace.
+func findAuditDeniedWithMessage(t *testing.T, wantMsg string) (AuditEvent, bool) {
+	t.Helper()
+	lines, err := tailAudit(50)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionDenied && strings.HasPrefix(ev.Caller, "mcp") && ev.Message == wantMsg {
+			return ev, true
+		}
+	}
+	return AuditEvent{}, false
+}
+
+// TestHandleRunWithSecrets_AuditsOnExecNotFound (P1-1, joint-review 2026-05)
+// locks the audit-before-return invariant for the exec_not_found branch
+// of handleRunWithSecrets's WrapCommand-failure handler. An AI probing
+// filesystem path existence one call at a time by reading the response
+// taxonomy ("exec_not_found: <basename>") must leave a forensic trace
+// in the operator's audit log. Previously this branch returned without
+// auditing — joint-review 2026-05 P1.
+//
+// The Message MUST be the bare taxonomy token "exec_not_found" with
+// no AI-supplied bytes (no basename echo) — that would be an
+// AI-controlled-bytes channel into the operator log.
+func TestHandleRunWithSecrets_AuditsOnExecNotFound(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// A bare name guaranteed not to be on PATH. exec.LookPath only wraps
+	// exec.ErrNotFound for bare-name lookups — an absolute path that does
+	// not exist returns an os-level fs.ErrNotExist that does NOT satisfy
+	// errors.Is(err, exec.ErrNotFound) (it falls into the wrap_command_failed
+	// catch-all instead, see TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath).
+	const ghost = "zzz-no-such-bin-anywhere-for-test-xyz"
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: ghost,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError for missing command, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if !strings.Contains(text, "exec_not_found") {
+		t.Fatalf("expected response to carry exec_not_found taxonomy, got %q", text)
+	}
+
+	ev, ok := findAuditDeniedWithMessage(t, "exec_not_found")
+	if !ok {
+		t.Fatalf("expected ActionDenied/mcp audit entry with Message=exec_not_found; none found")
+	}
+	// CRITICAL: the basename ("nonexistent-binary-for-test-only-xyz") must
+	// NOT appear anywhere in the audit Message. If it does, an AI can
+	// inject controlled bytes into the operator-facing audit log via
+	// `Command`. Exact-match on the taxonomy token catches any future
+	// regression that concatenates the basename in.
+	if ev.Message != "exec_not_found" {
+		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
+	}
+	if strings.Contains(ev.Message, ghost) {
+		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
+	}
+}
+
+// TestHandleRunWithSecrets_AuditsOnExecPermissionDenied (P1-1) locks the
+// audit-before-return invariant for the exec_permission_denied branch.
+// An AI enumerating which paths exist-but-aren't-executable (a common
+// signal for "this host has the binary I want") must leave a trace.
+func TestHandleRunWithSecrets_AuditsOnExecPermissionDenied(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// Create a regular file with mode 0600 (no exec bit). exec.LookPath
+	// on an absolute path checks executability and returns fs.ErrPermission.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "not-executable")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\necho nope\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: target,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError for non-executable command, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if !strings.Contains(text, "exec_permission_denied") {
+		t.Fatalf("expected response to carry exec_permission_denied taxonomy, got %q", text)
+	}
+
+	ev, ok := findAuditDeniedWithMessage(t, "exec_permission_denied")
+	if !ok {
+		t.Fatalf("expected ActionDenied/mcp audit entry with Message=exec_permission_denied; none found")
+	}
+	if ev.Message != "exec_permission_denied" {
+		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
+	}
+	if strings.Contains(ev.Message, filepath.Base(target)) {
+		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
+	}
+}
+
+// TestHandleRunWithSecrets_AuditMessageHasNoBasename (P1-1) is an
+// explicit guard against any future change that re-introduces the
+// AI-supplied basename into the audit Message. The audit log is
+// operator-facing; injecting attacker-controlled bytes (via the
+// Command field) into that log enables log-poisoning and
+// taxonomy-grep evasion. Locked here so even a well-meaning refactor
+// trips the assertion.
+func TestHandleRunWithSecrets_AuditMessageHasNoBasename(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// A distinctive basename that would be obvious if it leaked.
+	const sentinel = "/zzz-attacker-poison-marker"
+	_, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: sentinel,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+
+	lines, err := tailAudit(50)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if strings.Contains(ev.Message, "zzz-attacker-poison-marker") {
+			t.Fatalf("AI-supplied basename leaked into audit Message: %q", line)
+		}
+	}
+}
+
+// TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath (P1-1)
+// drives the third WrapCommand-failure branch end-to-end. exec.LookPath
+// on an absolute path that does not exist returns an *exec.Error
+// wrapping syscall ENOENT — which does NOT satisfy
+// errors.Is(err, exec.ErrNotFound) (that sentinel is specifically for
+// the "bare name not on PATH" case). So the failure flows into the
+// catch-all third branch and must be audited as "wrap_command_failed".
+//
+// The taxonomy is deliberately NOT "sandbox_unavailable" for this
+// branch: an absent absolute path is not an infrastructure failure;
+// the pre-WrapCommand VerifySandboxAvailable branch retains the
+// sandbox_unavailable taxonomy for actual sandbox-broken cases. Naming
+// fix per Kimi gate 2.
+//
+// Recording this behavior also pins the taxonomy: if a future
+// LookPath change starts returning a more specific wrapped error for
+// absolute paths, this test breaks loudly and the maintainer can pick
+// a more accurate Message.
+func TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// Absolute path that does not exist on disk.
+	const ghost = "/nonexistent-binary-for-test-only-xyz"
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: ghost,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError, got %+v", res)
+	}
+	if text := mcpResultText(res); !strings.Contains(text, "wrap_command_failed") {
+		t.Fatalf("expected wrap_command_failed in response, got %q", text)
+	}
+
+	ev, ok := findAuditDeniedWithMessage(t, "wrap_command_failed")
+	if !ok {
+		t.Fatalf("expected ActionDenied/mcp audit entry with Message=wrap_command_failed; none found")
+	}
+	if ev.Message != "wrap_command_failed" {
+		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
+	}
+	if strings.Contains(ev.Message, filepath.Base(ghost)) {
+		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
 	}
 }
