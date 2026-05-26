@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestParseEnvMappings(t *testing.T) {
@@ -671,5 +673,56 @@ func TestNoRedactGate_AuditMessageFormat(t *testing.T) {
 	}
 	if !strings.HasSuffix(ev.Message, auditReason) {
 		t.Errorf("Message = %q, want suffix %q (the stable taxonomy key)", ev.Message, auditReason)
+	}
+}
+
+// TestForwardSignals_RelaysMultipleSignals proves the signal-forwarding
+// helper stays alive across multiple signals (P1-2 from the joint review:
+// the previous one-shot select dropped a second ^C aimed at a hung child).
+func TestForwardSignals_RelaysMultipleSignals(t *testing.T) {
+	sigCh := make(chan os.Signal, 4)
+	done := make(chan struct{})
+
+	received := make(chan os.Signal, 4)
+	gotAll := make(chan struct{})
+	go func() {
+		forwardSignals(sigCh, done, func(sig os.Signal) {
+			received <- sig
+			if len(received) == 3 {
+				close(gotAll)
+			}
+		})
+	}()
+
+	sigCh <- syscall.SIGINT
+	sigCh <- syscall.SIGINT
+	sigCh <- syscall.SIGTERM
+
+	select {
+	case <-gotAll:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("forwardSignals delivered only %d signals, want 3", len(received))
+	}
+
+	want := []os.Signal{syscall.SIGINT, syscall.SIGINT, syscall.SIGTERM}
+	for i, w := range want {
+		got := <-received
+		if got != w {
+			t.Errorf("signal[%d] = %v, want %v", i, got, w)
+		}
+	}
+
+	exited := make(chan struct{})
+	go func() {
+		// Re-run the helper with an empty sigCh so we can prove `done` exits it.
+		idle := make(chan os.Signal)
+		forwardSignals(idle, done, func(os.Signal) {})
+		close(exited)
+	}()
+	close(done)
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwardSignals did not return after done was closed")
 	}
 }

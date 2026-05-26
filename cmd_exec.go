@@ -255,14 +255,7 @@ func (c *ExecCmd) Run() error {
 	// done lets the signal-forwarding goroutine exit once Wait returns,
 	// instead of leaking blocked on sigCh.
 	done := make(chan struct{})
-	go func() {
-		select {
-		case sig := <-sigCh:
-			_ = cmd.Process.Signal(sig)
-		case <-done:
-			return
-		}
-	}()
+	go forwardSignals(sigCh, done, func(sig os.Signal) { _ = cmd.Process.Signal(sig) })
 
 	waitErr := cmd.Wait()
 	close(done)
@@ -282,6 +275,20 @@ func (c *ExecCmd) Run() error {
 		return waitErr
 	}
 	return nil
+}
+
+// forwardSignals relays every signal received on sigCh to signaller until
+// done is closed. Looping (rather than returning after one signal) lets a
+// second ^C reach a hung child after the first is dropped or ignored.
+func forwardSignals(sigCh <-chan os.Signal, done <-chan struct{}, signaller func(os.Signal)) {
+	for {
+		select {
+		case sig := <-sigCh:
+			signaller(sig)
+		case <-done:
+			return
+		}
+	}
 }
 
 type envMapping struct {
