@@ -418,13 +418,72 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		// from infrastructure problems so the AI can act on its own input.
 		// WrapCommand's exec.LookPath wraps ErrNotFound and ErrPermission;
 		// errors.Is sees through the wrap.
+		//
+		// P1-1 (joint-review 2026-05): every branch here MUST audit before
+		// returning. Without an audit entry, an AI can enumerate
+		// /usr/bin/* path existence and permission state one call at a
+		// time by reading the response taxonomy, leaving zero forensic
+		// trace in the operator's audit log.
+		//
+		// The Message uses bare-token taxonomy (exec_not_found /
+		// exec_permission_denied / wrap_command_failed). The
+		// AI-visibility of these tokens via audit_tail is governed by
+		// filterAuditLineForAI's action-coverage gate, which scopes the
+		// allowlist-based stripper (filterAuditMessageForAI) to
+		// ActionMCPRun and ActionNetworkAllowed only — ActionDenied
+		// entries pass through unchanged. That's intentional: the AI
+		// already learns the same taxonomy from the synchronous
+		// run_with_secrets response, so re-exposing it via audit_tail
+		// adds no new information.
+		//
+		// CRITICAL: filepath.Base(input.Command) is NOT included in the
+		// Message — that would be an AI-controlled-bytes channel into the
+		// operator's log. The basename is still echoed back to the AI
+		// (the AI supplied it), just not into the audit record.
+		// SecretNames mirrors the ActionMCPRun / ActionNetworkAllowed
+		// entries above: at this point every requested secret was
+		// resolved successfully (the failure happened in the sandbox
+		// wrap, after backend.Get), so the operator can see which
+		// secrets were live for the rejected call.
+		//
+		// Branch 3 ("wrap_command_failed") covers the catch-all case
+		// where WrapCommand returns a non-ErrNotFound / non-ErrPermission
+		// error. The most common in-practice trigger today is
+		// exec.LookPath on an ABSOLUTE path that does not exist —
+		// LookPath wraps fs.ENOENT in an *exec.Error that does NOT
+		// satisfy errors.Is(err, exec.ErrNotFound) (that sentinel is
+		// reserved for the "bare name not on PATH" case). Naming the
+		// taxonomy wrap_command_failed rather than sandbox_unavailable
+		// avoids falsely blaming sandbox infrastructure for what is
+		// usually a bad caller-supplied path. The pre-WrapCommand
+		// VerifySandboxAvailable branch at line ~313 keeps the
+		// sandbox_unavailable taxonomy because it actually does mean
+		// the sandbox infrastructure is broken.
 		if errors.Is(err, exec.ErrNotFound) {
+			_ = AppendAudit(AuditEvent{
+				Action:      ActionDenied,
+				Caller:      callerTag(),
+				SecretNames: resolvedSecretNames,
+				Message:     "exec_not_found",
+			})
 			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
 		}
 		if errors.Is(err, fs.ErrPermission) {
+			_ = AppendAudit(AuditEvent{
+				Action:      ActionDenied,
+				Caller:      callerTag(),
+				SecretNames: resolvedSecretNames,
+				Message:     "exec_permission_denied",
+			})
 			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
 		}
-		return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
+		_ = AppendAudit(AuditEvent{
+			Action:      ActionDenied,
+			Caller:      callerTag(),
+			SecretNames: resolvedSecretNames,
+			Message:     "wrap_command_failed",
+		})
+		return aiErr("wrap_command_failed"), runWithSecretsOutput{}, nil
 	}
 
 	if input.AllowNetwork {

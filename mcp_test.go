@@ -1114,3 +1114,207 @@ func TestAuditTailClamp(t *testing.T) {
 		t.Fatalf("len=%d want %d", got, mcpMaxAuditTailN)
 	}
 }
+
+// findAuditDeniedWithMessage scans the audit log entries for an
+// ActionDenied event tagged with caller "mcp" and exact Message match.
+// Returns the parsed event and ok=true if found. Used by the P1-1 tests
+// below to assert that exec-resolution failures leave a forensic trace.
+func findAuditDeniedWithMessage(t *testing.T, wantMsg string) (AuditEvent, bool) {
+	t.Helper()
+	lines, err := tailAudit(50)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Action == ActionDenied && strings.HasPrefix(ev.Caller, "mcp") && ev.Message == wantMsg {
+			return ev, true
+		}
+	}
+	return AuditEvent{}, false
+}
+
+// TestHandleRunWithSecrets_AuditsOnExecNotFound (P1-1, joint-review 2026-05)
+// locks the audit-before-return invariant for the exec_not_found branch
+// of handleRunWithSecrets's WrapCommand-failure handler. An AI probing
+// filesystem path existence one call at a time by reading the response
+// taxonomy ("exec_not_found: <basename>") must leave a forensic trace
+// in the operator's audit log. Previously this branch returned without
+// auditing — joint-review 2026-05 P1.
+//
+// The Message MUST be the bare taxonomy token "exec_not_found" with
+// no AI-supplied bytes (no basename echo) — that would be an
+// AI-controlled-bytes channel into the operator log.
+func TestHandleRunWithSecrets_AuditsOnExecNotFound(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// A bare name guaranteed not to be on PATH. exec.LookPath only wraps
+	// exec.ErrNotFound for bare-name lookups — an absolute path that does
+	// not exist returns an os-level fs.ErrNotExist that does NOT satisfy
+	// errors.Is(err, exec.ErrNotFound) (it falls into the wrap_command_failed
+	// catch-all instead, see TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath).
+	const ghost = "zzz-no-such-bin-anywhere-for-test-xyz"
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: ghost,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError for missing command, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if !strings.Contains(text, "exec_not_found") {
+		t.Fatalf("expected response to carry exec_not_found taxonomy, got %q", text)
+	}
+
+	ev, ok := findAuditDeniedWithMessage(t, "exec_not_found")
+	if !ok {
+		t.Fatalf("expected ActionDenied/mcp audit entry with Message=exec_not_found; none found")
+	}
+	// CRITICAL: the basename ("nonexistent-binary-for-test-only-xyz") must
+	// NOT appear anywhere in the audit Message. If it does, an AI can
+	// inject controlled bytes into the operator-facing audit log via
+	// `Command`. Exact-match on the taxonomy token catches any future
+	// regression that concatenates the basename in.
+	if ev.Message != "exec_not_found" {
+		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
+	}
+	if strings.Contains(ev.Message, ghost) {
+		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
+	}
+}
+
+// TestHandleRunWithSecrets_AuditsOnExecPermissionDenied (P1-1) locks the
+// audit-before-return invariant for the exec_permission_denied branch.
+// An AI enumerating which paths exist-but-aren't-executable (a common
+// signal for "this host has the binary I want") must leave a trace.
+func TestHandleRunWithSecrets_AuditsOnExecPermissionDenied(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// Create a regular file with mode 0600 (no exec bit). exec.LookPath
+	// on an absolute path checks executability and returns fs.ErrPermission.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "not-executable")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\necho nope\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: target,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError for non-executable command, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if !strings.Contains(text, "exec_permission_denied") {
+		t.Fatalf("expected response to carry exec_permission_denied taxonomy, got %q", text)
+	}
+
+	ev, ok := findAuditDeniedWithMessage(t, "exec_permission_denied")
+	if !ok {
+		t.Fatalf("expected ActionDenied/mcp audit entry with Message=exec_permission_denied; none found")
+	}
+	if ev.Message != "exec_permission_denied" {
+		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
+	}
+	if strings.Contains(ev.Message, filepath.Base(target)) {
+		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
+	}
+}
+
+// TestHandleRunWithSecrets_AuditMessageHasNoBasename (P1-1) is an
+// explicit guard against any future change that re-introduces the
+// AI-supplied basename into the audit Message. The audit log is
+// operator-facing; injecting attacker-controlled bytes (via the
+// Command field) into that log enables log-poisoning and
+// taxonomy-grep evasion. Locked here so even a well-meaning refactor
+// trips the assertion.
+func TestHandleRunWithSecrets_AuditMessageHasNoBasename(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// A distinctive basename that would be obvious if it leaked.
+	const sentinel = "/zzz-attacker-poison-marker"
+	_, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: sentinel,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+
+	lines, err := tailAudit(50)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	for _, line := range lines {
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if strings.Contains(ev.Message, "zzz-attacker-poison-marker") {
+			t.Fatalf("AI-supplied basename leaked into audit Message: %q", line)
+		}
+	}
+}
+
+// TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath (P1-1)
+// drives the third WrapCommand-failure branch end-to-end. exec.LookPath
+// on an absolute path that does not exist returns an *exec.Error
+// wrapping syscall ENOENT — which does NOT satisfy
+// errors.Is(err, exec.ErrNotFound) (that sentinel is specifically for
+// the "bare name not on PATH" case). So the failure flows into the
+// catch-all third branch and must be audited as "wrap_command_failed".
+//
+// The taxonomy is deliberately NOT "sandbox_unavailable" for this
+// branch: an absent absolute path is not an infrastructure failure;
+// the pre-WrapCommand VerifySandboxAvailable branch retains the
+// sandbox_unavailable taxonomy for actual sandbox-broken cases. Naming
+// fix per Kimi gate 2.
+//
+// Recording this behavior also pins the taxonomy: if a future
+// LookPath change starts returning a more specific wrapped error for
+// absolute paths, this test breaks loudly and the maintainer can pick
+// a more accurate Message.
+func TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	// Absolute path that does not exist on disk.
+	const ghost = "/nonexistent-binary-for-test-only-xyz"
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: ghost,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError, got %+v", res)
+	}
+	if text := mcpResultText(res); !strings.Contains(text, "wrap_command_failed") {
+		t.Fatalf("expected wrap_command_failed in response, got %q", text)
+	}
+
+	ev, ok := findAuditDeniedWithMessage(t, "wrap_command_failed")
+	if !ok {
+		t.Fatalf("expected ActionDenied/mcp audit entry with Message=wrap_command_failed; none found")
+	}
+	if ev.Message != "wrap_command_failed" {
+		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
+	}
+	if strings.Contains(ev.Message, filepath.Base(ghost)) {
+		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
+	}
+}
