@@ -35,6 +35,12 @@ type RedactingWriter struct {
 // implement to signal that it has begun discarding bytes. RedactingWriter
 // checks it once per Write and flips to pass-through forever once true.
 // Keep this interface single-method and side-effect-free.
+//
+// NOTE: the wiring is a one-shot type assertion in NewRedactingWriter. Any
+// interposer between RedactingWriter and the truncating sink (e.g. a metering
+// or logging wrapper) MUST proxy Truncated() — otherwise the P1-1 short-circuit
+// silently disappears with no compile-time warning. Today only mcp.cappedWriter
+// implements it; review this assumption when adding a new wrapper.
 type truncatedReporter interface {
 	Truncated() bool
 }

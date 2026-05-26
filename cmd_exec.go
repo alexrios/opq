@@ -253,12 +253,18 @@ func (c *ExecCmd) Run() error {
 	// exec.Start (which copies env into the child) and GC of childEnv.
 
 	// done lets the signal-forwarding goroutine exit once Wait returns,
-	// instead of leaking blocked on sigCh.
+	// instead of leaking blocked on sigCh. fwdDone joins the goroutine before
+	// Run returns so the deferred signal.Stop cannot race the last forward.
 	done := make(chan struct{})
-	go forwardSignals(sigCh, done, func(sig os.Signal) { _ = cmd.Process.Signal(sig) })
+	fwdDone := make(chan struct{})
+	go func() {
+		defer close(fwdDone)
+		forwardSignals(sigCh, done, func(sig os.Signal) { _ = cmd.Process.Signal(sig) })
+	}()
 
 	waitErr := cmd.Wait()
 	close(done)
+	<-fwdDone
 	if !c.NoRedact {
 		_ = stdoutRW.Flush()
 		_ = stderrRW.Flush()
