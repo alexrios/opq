@@ -43,12 +43,16 @@ var blockedEnv = map[string]bool{
 	// GLIBC_TUNABLES: CVE-2023-4911 ("Looney Tunables"), read by ld.so before
 	// privilege drops. LOCALDOMAIN/HOSTALIASES/RES_OPTIONS: glibc resolver
 	// file/option redirects. MALLOC_TRACE: glibc writes to the named file.
+	// MALLOC_CONF: jemalloc analogue to GLIBC_TUNABLES / MALLOC_TRACE; allows
+	// prof_prefix and lg_prof_sample (writes profile dumps to attacker-named
+	// paths) and on some builds custom extent_hooks plugin loading.
 	// NLSPATH: gettext/iconv locale-path file inclusion.
 	"GLIBC_TUNABLES": true,
 	"LOCALDOMAIN":    true,
 	"HOSTALIASES":    true,
 	"RES_OPTIONS":    true,
 	"MALLOC_TRACE":   true,
+	"MALLOC_CONF":    true,
 	"NLSPATH":        true,
 
 	// shell startup — sourced/executed before the shell processes any input.
@@ -193,18 +197,18 @@ var blockedEnv = map[string]bool{
 	// LESSOPEN / LESSCLOSE: less executes these as shell commands to pre/post-
 	// process files (CVE-2024-32487 exploited LESSOPEN for command injection).
 	// GIT_PAGER / MANPAGER / SYSTEMD_PAGER: tool-specific $PAGER overrides.
-	"EDITOR":               true,
-	"VISUAL":               true,
-	"PAGER":                true,
-	"GIT_EDITOR":           true,
-	"GIT_SEQUENCE_EDITOR":  true,
-	"LESS":                 true,
-	"LESSOPEN":             true,
-	"LESSCLOSE":            true,
-	"SUDO_EDITOR":          true,
-	"GIT_PAGER":            true,
-	"MANPAGER":             true,
-	"SYSTEMD_PAGER":        true,
+	"EDITOR":              true,
+	"VISUAL":              true,
+	"PAGER":               true,
+	"GIT_EDITOR":          true,
+	"GIT_SEQUENCE_EDITOR": true,
+	"LESS":                true,
+	"LESSOPEN":            true,
+	"LESSCLOSE":           true,
+	"SUDO_EDITOR":         true,
+	"GIT_PAGER":           true,
+	"MANPAGER":            true,
+	"SYSTEMD_PAGER":       true,
 
 	// askpass programs — ssh / git / sudo execute these directly when they need
 	// a passphrase and have no TTY. The value is the executable path, so any
@@ -227,6 +231,147 @@ var blockedEnv = map[string]bool{
 	// OpenSSL — OPENSSL_CONF points to a config file that can load arbitrary
 	// engine .so modules, a well-known RCE vector in OpenSSL deployments.
 	"OPENSSL_CONF": true,
+
+	// downloader configs — CURL_HOME points curl at a directory whose .curlrc
+	// is loaded at startup; .curlrc supports -K (include another config file)
+	// and per-URL output paths, giving an attacker write-anywhere + read-from-
+	// anywhere primitives during any curl invocation. WGETRC is the explicit
+	// config-file path for wget; wget config supports post_file, exec, and
+	// other shell-out directives. Both fall in the "config-file pointer"
+	// class equivalent to OPENSSL_CONF.
+	"CURL_HOME": true,
+	"WGETRC":    true,
+
+	// terminfo — TERMINFO points to a single compiled terminfo database file;
+	// TERMINFO_DIRS is a colon-separated search path. ncurses parses these on
+	// startup for every curses-using program (vim, less, top, mc, ...); the
+	// terminfo parser has a long history of buffer-overflow CVEs and file-
+	// inclusion bugs (e.g. CVE-2023-50495, CVE-2023-29491).
+	"TERMINFO":      true,
+	"TERMINFO_DIRS": true,
+
+	// Kerberos — KRB5_CONFIG points to a krb5.conf that can specify plugin
+	// modules (arbitrary .so loaded by libkrb5). KRB5CCNAME is the credential
+	// cache path (FILE:/path or DIR:/path); pointing at an attacker-controlled
+	// file lets the AI swap in forged tickets. KRB5_KTNAME is the keytab path
+	// used for service authentication.
+	"KRB5_CONFIG": true,
+	"KRB5CCNAME":  true,
+	"KRB5_KTNAME": true,
+
+	// readline — INPUTRC is the readline init file path; readline parses it
+	// at first init, supports do-uppercase-version-style bindings and shell
+	// command sequences (CVE family in older readline). Affects bash
+	// interactive line editor, gdb, python -i, psql, mysql, etc.
+	"INPUTRC": true,
+
+	// SSH agent socket — under SandboxNetAllowed (allow_network=true), an AI
+	// that controls SSH_AUTH_SOCK can route ssh-add -l / ssh -A through the
+	// operator's loaded keys and authenticate to remote hosts as the operator.
+	// The private key bytes never leave the agent, but the AI gets to USE them,
+	// which is sufficient to e.g. push to the operator's git remotes.
+	"SSH_AUTH_SOCK": true,
+
+	// container runtimes — DOCKER_HOST redirects docker CLI to an arbitrary
+	// daemon socket/URL (defense-in-depth even after the v1.1.3 mask of host
+	// container sockets, since the operator may legitimately mount a writable
+	// docker bind under isolation="full"). DOCKER_TLS_VERIFY / DOCKER_CERT_PATH
+	// together let the AI redirect to an attacker daemon with attacker-supplied
+	// certs (Kimi joint-review). DOCKER_CONFIG redirects the CLI's plugin
+	// directory (~/.docker), allowing alias/plugin RCE. BUILDKIT_HOST is the
+	// BuildKit equivalent. CONTAINER_HOST is the generic podman/docker-variant
+	// override. Exact-match (no prefix ban) preserves user-defined DOCKER_USER
+	// / DOCKER_TOKEN style variables.
+	"DOCKER_HOST":       true,
+	"DOCKER_TLS_VERIFY": true,
+	"DOCKER_CERT_PATH":  true,
+	"DOCKER_CONFIG":     true,
+	"BUILDKIT_HOST":     true,
+	"CONTAINER_HOST":    true,
+
+	// PHP — PHPRC is the path to a directory containing php.ini, which can
+	// load arbitrary extensions via `extension=evil.so`. PHP_INI_SCAN_DIR is
+	// an additional ini-scan directory honored at PHP startup. Both fit the
+	// config-file pointer class (Kimi joint-review).
+	"PHPRC":            true,
+	"PHP_INI_SCAN_DIR": true,
+
+	// Mercurial — HGRCPATH is a search-path list of hgrc files; hg config
+	// supports [hooks] entries whose values are arbitrary shell commands run
+	// on commit / push / etc. Equivalent class to GIT_CONFIG_* (Kimi).
+	"HGRCPATH": true,
+
+	// git diff helper — GIT_EXTERNAL_DIFF is executed as a subprocess by git
+	// on every diff invocation (git diff, git log -p, git show); attacker
+	// value becomes RCE on next git diff. Companion to GIT_SSH / GIT_PAGER
+	// (Kimi).
+	"GIT_EXTERNAL_DIFF": true,
+
+	// CMake — CMAKE_TOOLCHAIN_FILE is loaded by every cmake invocation and
+	// can contain arbitrary cmake commands including execute_process(), so
+	// running `cmake .` after the AI sets this triggers the attacker payload
+	// (Kimi).
+	"CMAKE_TOOLCHAIN_FILE": true,
+
+	// generic compiler replacement — make and most build systems honor $CC
+	// and $CXX as the C / C++ compiler binary; setting either to an arbitrary
+	// path is the same class as RUSTC_WRAPPER and GOFLAGS=-toolexec= (Kimi).
+	"CC":  true,
+	"CXX": true,
+
+	// remote-shell command — rsync executes $RSYNC_RSH as the transport
+	// command; borg executes $BORG_RSH. Both are direct equivalents of
+	// GIT_SSH_COMMAND (Kimi).
+	"RSYNC_RSH": true,
+	"BORG_RSH":  true,
+
+	// GTK modules — GTK_MODULES is a colon-separated list of shared-library
+	// names; every GTK app dlopen()s them at startup. Functionally LD_PRELOAD
+	// for any GTK program (Kimi).
+	"GTK_MODULES": true,
+
+	// Qt plugins — QT_PLUGIN_PATH is searched by Qt for plugin .so modules
+	// loaded at QCoreApplication / QGuiApplication init; same class as
+	// GTK_MODULES (Kimi gate-2).
+	"QT_PLUGIN_PATH": true,
+
+	// vim startup — VIMINIT is executed as Ex commands when vim starts
+	// (commonly `!sh` and other shell-out forms are valid Ex commands);
+	// vim is regularly invoked by git commit, crontab -e, etc. so this
+	// is in the editors family (Kimi gate-2).
+	"VIMINIT": true,
+
+	// ripgrep preprocessor — RIPGREP_CONFIG_PATH is a config file whose
+	// entries can include --pre PATH, which ripgrep then exec()s as a
+	// preprocessor for every matched file (Kimi gate-2).
+	"RIPGREP_CONFIG_PATH": true,
+
+	// GnuPG home — GNUPGHOME is the gpg config directory containing
+	// gpg.conf / gpg-agent.conf; both can specify helper executables
+	// (e.g. pinentry-program). Sets up arbitrary exec on next gpg call
+	// (Kimi gate-2).
+	"GNUPGHOME": true,
+
+	// git hooks / dir overrides — GIT_TEMPLATE_DIR is copied (including
+	// executable hooks/) into every new repo created by git init or
+	// git clone. GIT_DIR overrides the .git directory path so that the
+	// AI can point git at a directory pre-seeded with malicious hooks
+	// that fire on the next commit / push / rebase (Kimi gate-2).
+	"GIT_TEMPLATE_DIR": true,
+	"GIT_DIR":          true,
+
+	// Gradle user home — GRADLE_USER_HOME redirects Gradle's init-script
+	// directory; any *.gradle file under init.d/ runs Groovy code on
+	// every Gradle invocation. Equivalent class to MAVEN_OPTS / GRADLE_OPTS
+	// but via an init-script directory rather than JVM flags (Kimi gate-2).
+	"GRADLE_USER_HOME": true,
+
+	// Note: XDG_CONFIG_HOME and XDG_CONFIG_DIRS were considered but rejected
+	// for the deny-list: they would redirect every XDG-compliant app's
+	// config search, breaking legitimate workflows where the operator pins
+	// a per-project config dir. The high-signal config pointers in this
+	// category (CURL_HOME, WGETRC, KRB5_CONFIG, INPUTRC, PHPRC, HGRCPATH,
+	// OPENSSL_CONF, CMAKE_TOOLCHAIN_FILE) are listed explicitly instead.
 }
 
 // Prefix bans — match is case-sensitive (env names are case-sensitive on
@@ -235,14 +380,19 @@ var blockedEnv = map[string]bool{
 // LD_ / DYLD_: dynamic-linker preload paths (Linux/macOS).
 // NSS_ / GIO_ / GCONV_: GLib / NSS escape hatches.
 // ERL_: covers ERL_FLAGS, ERL_LIBS, ERL_AFLAGS, ERL_ZFLAGS, and any
-//       future OTP env vars that control code loading.
+//
+//	future OTP env vars that control code loading.
+//
 // BASH_FUNC_: bash-exported-function namespace (post-Shellshock); bash
-//             processes these at startup, enabling override of builtins
-//             and command-not-found handlers. sudo strips these for this
-//             exact reason.
+//
+//	processes these at startup, enabling override of builtins
+//	and command-not-found handlers. sudo strips these for this
+//	exact reason.
+//
 // GIT_CONFIG_: covers GIT_CONFIG_KEY_N and GIT_CONFIG_VALUE_N (Git 2.31+)
-//              which inject arbitrary config entries; an attacker can use
-//              these to set alias.x = !/bin/sh, bypassing GIT_SSH blocks.
+//
+//	which inject arbitrary config entries; an attacker can use
+//	these to set alias.x = !/bin/sh, bypassing GIT_SSH blocks.
 var blockedPrefixes = []string{
 	"LD_",
 	"DYLD_",

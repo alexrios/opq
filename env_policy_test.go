@@ -50,7 +50,7 @@ func TestIsBlockedEnvName_ExactMap(t *testing.T) {
 	blocked := []string{
 		// dynamic linker / libc
 		"GLIBC_TUNABLES", "LOCALDOMAIN", "HOSTALIASES", "RES_OPTIONS",
-		"MALLOC_TRACE", "NLSPATH",
+		"MALLOC_TRACE", "MALLOC_CONF", "NLSPATH",
 		// shell startup
 		"PATH", "IFS", "HOME", "SHELL", "TERM", "TMPDIR", "TZ",
 		"BASH_ENV", "ENV", "PROMPT_COMMAND",
@@ -106,6 +106,45 @@ func TestIsBlockedEnvName_ExactMap(t *testing.T) {
 		// VCS / SSH / OpenSSL
 		"GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_CONFIG_COUNT",
 		"OPENSSL_CONF",
+		// downloader configs (joint-review 2026-05 P2-1)
+		"CURL_HOME", "WGETRC",
+		// terminfo (joint-review 2026-05 P2-1)
+		"TERMINFO", "TERMINFO_DIRS",
+		// Kerberos (joint-review 2026-05 P2-1)
+		"KRB5_CONFIG", "KRB5CCNAME", "KRB5_KTNAME",
+		// readline (joint-review 2026-05 P2-1)
+		"INPUTRC",
+		// SSH agent socket (joint-review 2026-05 P2-4)
+		"SSH_AUTH_SOCK",
+		// container runtimes (joint-review 2026-05 P2-5 + Kimi)
+		"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_CONFIG",
+		"BUILDKIT_HOST", "CONTAINER_HOST",
+		// PHP (Kimi gate-1)
+		"PHPRC", "PHP_INI_SCAN_DIR",
+		// Mercurial (Kimi gate-1)
+		"HGRCPATH",
+		// git diff helper (Kimi gate-1)
+		"GIT_EXTERNAL_DIFF",
+		// CMake (Kimi gate-1)
+		"CMAKE_TOOLCHAIN_FILE",
+		// generic compilers (Kimi gate-1)
+		"CC", "CXX",
+		// remote-shell command (Kimi gate-1)
+		"RSYNC_RSH", "BORG_RSH",
+		// GTK modules (Kimi gate-1)
+		"GTK_MODULES",
+		// Qt plugins (Kimi gate-2)
+		"QT_PLUGIN_PATH",
+		// vim startup (Kimi gate-2)
+		"VIMINIT",
+		// ripgrep preprocessor (Kimi gate-2)
+		"RIPGREP_CONFIG_PATH",
+		// GnuPG home (Kimi gate-2)
+		"GNUPGHOME",
+		// git hooks / dir overrides (Kimi gate-2)
+		"GIT_TEMPLATE_DIR", "GIT_DIR",
+		// Gradle user home (Kimi gate-2)
+		"GRADLE_USER_HOME",
 	}
 	for _, name := range blocked {
 		t.Run(name, func(t *testing.T) {
@@ -281,8 +320,8 @@ func TestIsBlockedEnvName_NewlyAddedRCEFamily(t *testing.T) {
 			reason: "CHEZSCHEMELIBDIRS / SCHEME_LIBRARY_PATH searched by (library ...) before system paths",
 		},
 		{
-			name: "Clojure_load_path",
-			vars: []string{"CLOJURE_LOAD_PATH"},
+			name:   "Clojure_load_path",
+			vars:   []string{"CLOJURE_LOAD_PATH"},
 			reason: "CLOJURE_LOAD_PATH added to Clojure load path for (load ...) / (require ...)",
 		},
 		{
@@ -340,6 +379,269 @@ func TestIsBlockedEnvName_NewlyAddedRCEFamily(t *testing.T) {
 				if !isBlockedEnvName(v) {
 					t.Errorf("isBlockedEnvName(%q) = false, want true — reason: %s", v, tc.reason)
 				}
+			}
+		})
+	}
+}
+
+// TestIsBlockedEnvName_JointReview2026_05_Additions documents the loader/exec
+// path for each cluster added during the joint Claude+Kimi review (2026-05).
+func TestIsBlockedEnvName_JointReview2026_05_Additions(t *testing.T) {
+	tests := []struct {
+		name   string
+		vars   []string
+		reason string
+	}{
+		{
+			name: "downloader_configs",
+			vars: []string{"CURL_HOME", "WGETRC"},
+			// curl reads $CURL_HOME/.curlrc at startup; .curlrc -K includes
+			// further config and supports per-URL output redirection. wget
+			// reads $WGETRC as its config-file path; wgetrc supports
+			// post_file and exec directives.
+			reason: "curl .curlrc / wget wgetrc are loaded at startup and shell out",
+		},
+		{
+			name: "terminfo",
+			vars: []string{"TERMINFO", "TERMINFO_DIRS"},
+			// ncurses parses the compiled terminfo file on startup for every
+			// curses-using program; long CVE history of parser overflows.
+			reason: "ncurses parses TERMINFO at startup (CVE family)",
+		},
+		{
+			name: "kerberos",
+			vars: []string{"KRB5_CONFIG", "KRB5CCNAME", "KRB5_KTNAME"},
+			// KRB5_CONFIG can load plugin .so modules. KRB5CCNAME points the
+			// credential cache; KRB5_KTNAME points the keytab.
+			reason: "krb5 honors these for config/credentials/keytab paths",
+		},
+		{
+			name: "readline_init",
+			vars: []string{"INPUTRC"},
+			// readline parses $INPUTRC on first init across bash, gdb,
+			// python -i, psql, mysql, etc.
+			reason: "readline parses INPUTRC at first init",
+		},
+		{
+			name: "jemalloc_tunables",
+			vars: []string{"MALLOC_CONF"},
+			// jemalloc analogue to MALLOC_TRACE / GLIBC_TUNABLES; supports
+			// prof_prefix (writes profile dumps) and extent_hooks plugin
+			// loading on some builds.
+			reason: "MALLOC_CONF drives jemalloc init: prof_prefix writes, extent_hooks loads",
+		},
+		{
+			name: "ssh_agent_socket",
+			vars: []string{"SSH_AUTH_SOCK"},
+			// With allow_network=true the AI can authenticate to remote
+			// hosts using the operator's loaded keys (cannot extract the
+			// key, but can use it).
+			reason: "SSH_AUTH_SOCK lets the AI use operator's loaded keys under allow_network",
+		},
+		{
+			name: "container_runtimes",
+			vars: []string{
+				"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+				"DOCKER_CONFIG", "BUILDKIT_HOST", "CONTAINER_HOST",
+			},
+			// Redirect docker / buildkit / podman CLI to an attacker-chosen
+			// daemon (DOCKER_HOST) or attacker certs (DOCKER_TLS_VERIFY +
+			// DOCKER_CERT_PATH). DOCKER_CONFIG redirects the CLI plugin dir.
+			reason: "container CLIs honor *_HOST and DOCKER_CONFIG to redirect daemon/plugins",
+		},
+		{
+			name: "php_config",
+			vars: []string{"PHPRC", "PHP_INI_SCAN_DIR"},
+			// PHPRC is the php.ini directory; php.ini can `extension=evil.so`.
+			// PHP_INI_SCAN_DIR adds another ini-scan directory.
+			reason: "PHP loads php.ini extensions from PHPRC / PHP_INI_SCAN_DIR",
+		},
+		{
+			name: "mercurial_hgrc",
+			vars: []string{"HGRCPATH"},
+			// hg config supports [hooks] entries that are arbitrary shell
+			// commands run on commit / push / etc.
+			reason: "HGRCPATH can register arbitrary hg [hooks] shell commands",
+		},
+		{
+			name: "git_external_diff",
+			vars: []string{"GIT_EXTERNAL_DIFF"},
+			// git executes $GIT_EXTERNAL_DIFF as a subprocess on every diff
+			// invocation; companion to GIT_SSH / GIT_PAGER.
+			reason: "git exec()s GIT_EXTERNAL_DIFF on every diff",
+		},
+		{
+			name: "cmake_toolchain",
+			vars: []string{"CMAKE_TOOLCHAIN_FILE"},
+			// CMake runs arbitrary commands inside the toolchain file
+			// (execute_process(), file(WRITE), etc.).
+			reason: "CMAKE_TOOLCHAIN_FILE is loaded by cmake and runs arbitrary commands",
+		},
+		{
+			name: "generic_compilers",
+			vars: []string{"CC", "CXX"},
+			// make and most build systems honor $CC / $CXX as the C / C++
+			// compiler binary; same class as RUSTC_WRAPPER.
+			reason: "make / configure honor CC / CXX as compiler binaries",
+		},
+		{
+			name: "remote_shell",
+			vars: []string{"RSYNC_RSH", "BORG_RSH"},
+			// rsync runs $RSYNC_RSH as its transport; borg runs $BORG_RSH.
+			reason: "rsync / borg exec RSH var as transport command",
+		},
+		{
+			name: "gtk_modules",
+			vars: []string{"GTK_MODULES"},
+			// Every GTK app dlopen()s the modules listed here at startup.
+			reason: "GTK dlopen()s GTK_MODULES entries on every GTK program startup",
+		},
+		{
+			name: "qt_plugins",
+			vars: []string{"QT_PLUGIN_PATH"},
+			// Qt searches QT_PLUGIN_PATH for plugin .so modules loaded at
+			// QCoreApplication / QGuiApplication init.
+			reason: "Qt loads plugin .so modules from QT_PLUGIN_PATH at app init",
+		},
+		{
+			name: "vim_init",
+			vars: []string{"VIMINIT"},
+			// VIMINIT is executed as Ex commands at vim startup; `!sh` is a
+			// valid Ex command. vim is invoked transitively by git commit /
+			// crontab -e / visudo.
+			reason: "VIMINIT runs as Ex commands at vim startup (shell-out via !)",
+		},
+		{
+			name: "ripgrep_preprocessor",
+			vars: []string{"RIPGREP_CONFIG_PATH"},
+			// ripgrep config file can include `--pre PATH`, which ripgrep
+			// exec()s as a preprocessor for every matched file.
+			reason: "ripgrep config --pre path is exec()d as a preprocessor",
+		},
+		{
+			name: "gnupg_home",
+			vars: []string{"GNUPGHOME"},
+			// gpg.conf / gpg-agent.conf can specify helper executables
+			// (pinentry-program etc.); GNUPGHOME redirects both.
+			reason: "GNUPGHOME redirects gpg.conf which can name helper binaries",
+		},
+		{
+			name: "git_dir_overrides",
+			vars: []string{"GIT_TEMPLATE_DIR", "GIT_DIR"},
+			// GIT_TEMPLATE_DIR seeds hooks/ into every new repo (init/clone).
+			// GIT_DIR points git at a directory whose hooks/ fires on commit.
+			reason: "GIT_TEMPLATE_DIR / GIT_DIR seed or activate git hooks",
+		},
+		{
+			name: "gradle_user_home",
+			vars: []string{"GRADLE_USER_HOME"},
+			// Gradle runs init.d/*.gradle Groovy scripts on every build.
+			reason: "GRADLE_USER_HOME init.d/*.gradle runs on every Gradle invocation",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			for _, v := range tc.vars {
+				if !isBlockedEnvName(v) {
+					t.Errorf("isBlockedEnvName(%q) = false, want true — reason: %s", v, tc.reason)
+				}
+			}
+		})
+	}
+}
+
+// TestIsBlockedEnvName_JointReview2026_05_Negatives asserts that similar-
+// looking names that are NOT the loader-honored canonical form remain
+// unblocked, so the new entries don't create friction for legitimate
+// user-defined secret env vars.
+func TestIsBlockedEnvName_JointReview2026_05_Negatives(t *testing.T) {
+	notBlocked := []string{
+		// CURL_HOME is the canonical curl config dir; CURL_API_KEY etc. are
+		// user-defined application secrets and must pass.
+		"CURL_API_KEY", "CURL_TOKEN", "CURL_USER",
+		// WGETRC is exact-match; WGET_USER / WGET_TOKEN are user-defined.
+		"WGET_USER", "WGET_TOKEN",
+		// KRB5_CONFIG / KRB5CCNAME / KRB5_KTNAME are exact-match; no KRB5_
+		// prefix ban (would block KRB5_TRACE etc. that don't load code).
+		"KRB5_BACKEND", "KRB5_TRACE", "KRB5_USER",
+		// TERMINFO / TERMINFO_DIRS are exact-match; TERMINFO_USER is fine.
+		"TERMINFO_USER",
+		// MALLOC_CONF is exact-match; MALLOC_USER is fine. MALLOC_ARENA_MAX
+		// is a glibc tunable in the GLIBC_TUNABLES era but not directly
+		// honored as a code-load path; not on the deny-list.
+		"MALLOC_USER", "MALLOC_ARENA_MAX",
+		// SSH_AUTH_SOCK is exact-match. SSH_CONNECTION / SSH_CLIENT etc.
+		// are informational and not honored as exec paths.
+		"SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "SSH_USER", "SSH_API_KEY",
+		// DOCKER_HOST is exact-match; DOCKER_USER / DOCKER_TOKEN are
+		// user-defined secret names.
+		"DOCKER_USER", "DOCKER_TOKEN", "DOCKER_PASSWORD",
+		// BUILDKIT_HOST is exact-match; other BUILDKIT_ vars are config.
+		"BUILDKIT_PROGRESS", "BUILDKIT_USER",
+		// CONTAINER_HOST is exact-match; CONTAINER_NAME / CONTAINER_USER pass.
+		"CONTAINER_NAME", "CONTAINER_USER",
+		// PHPRC / PHP_INI_SCAN_DIR are exact-match; PHP_USER / PHP_API_KEY pass.
+		"PHP_USER", "PHP_API_KEY",
+		// HGRCPATH is exact-match; HG_USER / HG_API_KEY pass.
+		"HG_USER", "HG_API_KEY",
+		// CC / CXX are exact-match. Substring "CC" in another name is fine.
+		"CCACHE_DIR", "CCT_USER", "MY_CC", "CXXFLAGS",
+		// INPUTRC is exact-match; INPUT_USER and similar pass.
+		"INPUT_USER", "INPUT_API_KEY",
+		// CMAKE_TOOLCHAIN_FILE is exact-match; other CMAKE_ flags pass
+		// (CMAKE_BUILD_TYPE, CMAKE_PREFIX_PATH are config knobs, not exec).
+		"CMAKE_BUILD_TYPE", "CMAKE_PREFIX_PATH", "CMAKE_USER",
+		// RSYNC_RSH / BORG_RSH exact-match; RSYNC_USER and BORG_PASSPHRASE pass.
+		"RSYNC_USER", "BORG_PASSPHRASE", "BORG_REPO",
+		// GTK_MODULES is exact-match; GTK_THEME / GTK_USER pass.
+		"GTK_THEME", "GTK_USER",
+		// QT_PLUGIN_PATH is exact-match; QT_QPA_PLATFORM / QT_USER pass
+		// (Qt's platform integration plugin name is configuration, not a
+		// plugin search path).
+		"QT_QPA_PLATFORM", "QT_USER",
+		// VIMINIT is exact-match; VIM_USER / VIMRUNTIME pass (VIMRUNTIME
+		// is a path but only honored if not overridden by an installed vim;
+		// the realistic exec-RCE path is VIMINIT itself).
+		"VIM_USER", "VIMRUNTIME",
+		// RIPGREP_CONFIG_PATH is exact-match; RIPGREP_USER passes.
+		"RIPGREP_USER",
+		// GNUPGHOME is exact-match; GPG_TTY / GPG_AGENT_INFO are not
+		// honored as code-load paths.
+		"GPG_TTY", "GPG_AGENT_INFO", "GNUPG_USER",
+		// GIT_DIR / GIT_TEMPLATE_DIR are exact-match. GIT_AUTHOR_NAME /
+		// GIT_COMMITTER_EMAIL etc. are user identity strings and must pass.
+		"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "GIT_USER",
+		// GRADLE_USER_HOME is exact-match; GRADLE_USER (a token/login) passes.
+		"GRADLE_USER",
+	}
+	for _, name := range notBlocked {
+		t.Run(name, func(t *testing.T) {
+			if isBlockedEnvName(name) {
+				t.Fatalf("isBlockedEnvName(%q) = true, want false (exact-match only, no overbroad prefix)", name)
+			}
+		})
+	}
+}
+
+// TestIsBlockedEnvName_GitConfigGlobalSystemViaPrefix proves that
+// GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM (Git 2.32+ override paths) are
+// already caught by the existing GIT_CONFIG_ prefix in blockedPrefixes;
+// no explicit entries are needed for them. Documented as part of the
+// joint-review 2026-05 verification step.
+func TestIsBlockedEnvName_GitConfigGlobalSystemViaPrefix(t *testing.T) {
+	cases := []string{
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_SYSTEM",
+		// future GIT_CONFIG_* vars are also pre-covered.
+		"GIT_CONFIG_NOSYSTEM",
+		"GIT_CONFIG_PARAMETERS",
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			if !isBlockedEnvName(name) {
+				t.Fatalf("isBlockedEnvName(%q) = false, want true — should be caught by GIT_CONFIG_ prefix in blockedPrefixes", name)
 			}
 		})
 	}
