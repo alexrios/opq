@@ -90,6 +90,26 @@ func TestSandboxNet_AllowsHostFS(t *testing.T) {
 	}
 }
 
+// TestSandboxNet_BlocksHostFSWrite (P0-1) — SandboxNet must prevent the AI
+// subprocess from writing to any persistent host path (e.g. /var/tmp).
+// Without this, a two-call exfil chain works: call 1 writes the secret to
+// /var/tmp/.leak, call 2 reads it back with an empty env (no redaction).
+// The fix is --ro-bind / / instead of --dev-bind / /.
+func TestSandboxNet_BlocksHostFSWrite(t *testing.T) {
+	out, code, err := runUnderSandbox(t, SandboxNet, "sh", "-c", "touch /var/tmp/opq_p01_test 2>&1")
+	if err != nil {
+		t.Fatalf("wrap err: %v", err)
+	}
+	// touch must fail because the host FS is read-only.
+	if code == 0 {
+		t.Fatalf("write to /var/tmp succeeded under SandboxNet (P0-1 regression): %q", out)
+	}
+	lower := strings.ToLower(out)
+	if !strings.Contains(lower, "read-only") && !strings.Contains(lower, "permission denied") && !strings.Contains(lower, "no such") {
+		t.Errorf("expected read-only or permission error, got: %q", out)
+	}
+}
+
 func TestSandboxFull_BlocksNetwork(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl not available")

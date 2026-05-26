@@ -54,7 +54,7 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	// C2 fix: SandboxNet must include PID namespace isolation and private /proc
 	// to prevent sibling run_with_secrets calls from reading each other's
 	// /proc/<pid>/environ (finding C2 from the v1.1.1 security review).
-	for _, want := range []string{"--unshare-net", "--unshare-pid", "--dev-bind", "--die-with-parent", "--new-session"} {
+	for _, want := range []string{"--unshare-net", "--unshare-pid", "--ro-bind", "--die-with-parent", "--new-session"} {
 		if !containsArg(gotArgs, want) {
 			t.Errorf("net argv missing %q: %v", want, gotArgs)
 		}
@@ -63,14 +63,14 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	if !hasSeq(gotArgs, []string{"--proc", "/proc"}) {
 		t.Errorf("net argv missing '--proc /proc' sequence: %v", gotArgs)
 	}
-	// --proc /proc must come AFTER --dev-bind / / so it masks the host procfs.
+	// --proc /proc must come AFTER --ro-bind / / so it masks the host procfs.
 	// bwrap applies mounts left-to-right; reversing this defeats PID ns isolation.
-	devBindIdx := indexOf(gotArgs, "--dev-bind")
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
 	procIdx := indexOf(gotArgs, "--proc")
-	if devBindIdx < 0 || procIdx < 0 {
-		t.Errorf("argv missing --dev-bind or --proc: %v", gotArgs)
-	} else if procIdx < devBindIdx {
-		t.Errorf("--proc (idx %d) must come after --dev-bind (idx %d) in argv: %v", procIdx, devBindIdx, gotArgs)
+	if roBindIdx < 0 || procIdx < 0 {
+		t.Errorf("argv missing --ro-bind or --proc: %v", gotArgs)
+	} else if procIdx < roBindIdx {
+		t.Errorf("--proc (idx %d) must come after --ro-bind (idx %d) in argv: %v", procIdx, roBindIdx, gotArgs)
 	}
 	// The command must be resolved to an absolute path before the `--`
 	// terminator, since bwrap exec's it inside the sandbox.
@@ -95,7 +95,7 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 // symlink to /run/user, and masking the symlink target after the parent
 // /var/run path becomes a stale symlink causes bwrap to fail with
 // "Can't mkdir /var/run/user". Each tmpfs sequence must appear AFTER
-// --dev-bind / / so it shadows the host bind-mount (bwrap applies mounts
+// --ro-bind / / so it shadows the host bind-mount (bwrap applies mounts
 // left-to-right).
 func TestSandboxNet_TmpfsMasksDBus(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -112,22 +112,22 @@ func TestSandboxNet_TmpfsMasksDBus(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 	maskedDirs := []string{"/run/user", "/tmp"}
-	devBindIdx := indexOf(gotArgs, "--dev-bind")
-	if devBindIdx < 0 {
-		t.Fatalf("--dev-bind missing from SandboxNet argv: %v", gotArgs)
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
+	if roBindIdx < 0 {
+		t.Fatalf("--ro-bind missing from SandboxNet argv: %v", gotArgs)
 	}
 	for _, dir := range maskedDirs {
 		if !hasSeq(gotArgs, []string{"--tmpfs", dir}) {
 			t.Errorf("SandboxNet argv missing '--tmpfs %s' mask: %v", dir, gotArgs)
 			continue
 		}
-		// The tmpfs must come AFTER --dev-bind / /. Find the --tmpfs <dir>
-		// pair and assert the --tmpfs token sits past the dev-bind index.
+		// The tmpfs must come AFTER --ro-bind / /. Find the --tmpfs <dir>
+		// pair and assert the --tmpfs token sits past the ro-bind index.
 		for i := 0; i+1 < len(gotArgs); i++ {
 			if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == dir {
-				if i < devBindIdx {
-					t.Errorf("--tmpfs %s (idx %d) must come AFTER --dev-bind (idx %d): %v",
-						dir, i, devBindIdx, gotArgs)
+				if i < roBindIdx {
+					t.Errorf("--tmpfs %s (idx %d) must come AFTER --ro-bind (idx %d): %v",
+						dir, i, roBindIdx, gotArgs)
 				}
 				break
 			}
@@ -295,13 +295,13 @@ func TestParseSandboxFlag(t *testing.T) {
 // -----------------------------------------------------------------------------
 // SandboxNet tmpfs-masks the audit directory (J-12 / P0-2).
 //
-// Background: under SandboxNet, --dev-bind / / makes the host filesystem
+// Background: under SandboxNet, --ro-bind / / makes the host filesystem
 // visible to the child. Without an explicit mask, the AI-spawned subprocess
 // could read $XDG_STATE_HOME/opq/audit.log (or the HOME fallback) and recover
 // raw_exit / elapsed_ms tokens that filterAuditMessageForAI strips from the
 // MCP audit_tail response. The fix in sandbox_linux.go appends
 // `--tmpfs <auditDir>` to the SandboxNet argv. These tests lock down:
-//   - the argv includes the tmpfs after --dev-bind / /
+//   - the argv includes the tmpfs after --ro-bind / /
 //   - the HOME fallback works when XDG_STATE_HOME is unset
 //   - the wrapper fails CLOSED (no argv produced) if neither path resolves
 //   - SandboxFull does NOT reach the audit-dir resolver (it tmpfs-masks /home
@@ -310,7 +310,7 @@ func TestParseSandboxFlag(t *testing.T) {
 
 // TestSandboxNet_TmpfsMasksAuditDir locks the canonical XDG_STATE_HOME path.
 // With XDG_STATE_HOME=<tmp>, the resolved audit dir is <tmp>/opq and the
-// argv must carry "--tmpfs <tmp>/opq" after --dev-bind / /.
+// argv must carry "--tmpfs <tmp>/opq" after --ro-bind / /.
 func TestSandboxNet_TmpfsMasksAuditDir(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only sandbox")
@@ -340,17 +340,17 @@ func TestSandboxNet_TmpfsMasksAuditDir(t *testing.T) {
 	if !hasSeq(gotArgs, []string{"--tmpfs", wantDir}) {
 		t.Fatalf("SandboxNet argv missing '--tmpfs %s': %v", wantDir, gotArgs)
 	}
-	devBindIdx := indexOf(gotArgs, "--dev-bind")
-	if devBindIdx < 0 {
-		t.Fatalf("--dev-bind missing from SandboxNet argv: %v", gotArgs)
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
+	if roBindIdx < 0 {
+		t.Fatalf("--ro-bind missing from SandboxNet argv: %v", gotArgs)
 	}
-	// The audit-dir tmpfs must come AFTER --dev-bind / / so it shadows the
+	// The audit-dir tmpfs must come AFTER --ro-bind / / so it shadows the
 	// inherited bind-mount (bwrap applies left-to-right).
 	for i := 0; i+1 < len(gotArgs); i++ {
 		if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == wantDir {
-			if i < devBindIdx {
-				t.Errorf("--tmpfs %s (idx %d) must come AFTER --dev-bind (idx %d): %v",
-					wantDir, i, devBindIdx, gotArgs)
+			if i < roBindIdx {
+				t.Errorf("--tmpfs %s (idx %d) must come AFTER --ro-bind (idx %d): %v",
+					wantDir, i, roBindIdx, gotArgs)
 			}
 			return
 		}

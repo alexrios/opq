@@ -49,13 +49,13 @@ func VerifySandboxAvailable() error {
 	// kernel CONFIG_USER_NS at runtime can each block namespace creation
 	// even when the static checks pass. Run a no-op `true` under flags
 	// that mirror WrapCommand's SandboxNet so failures here surface the
-	// same way real run_with_secrets calls would. --dev-bind / / is
+	// same way real run_with_secrets calls would. --ro-bind / / is
 	// included for fidelity with the real SandboxNet argv — a host that
 	// passes the probe is then more likely to pass real calls. The probe
 	// runs `true` which exits instantly; on AppArmor-blocked hosts the
 	// kernel returns EPERM immediately. No timeout / goroutine needed.
 	probe := exec.Command(path,
-		"--dev-bind", "/", "/",
+		"--ro-bind", "/", "/",
 		"--unshare-net", "--unshare-pid",
 		"--die-with-parent", "--new-session",
 		"true",
@@ -171,16 +171,16 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 		if err != nil {
 			return "", nil, fmt.Errorf("resolve audit dir for sandbox mask: %w", err)
 		}
-		// --unshare-pid + --proc /proc (after dev-bind): private PID namespace prevents
+		// --unshare-pid + --proc /proc (after ro-bind): private PID namespace prevents
 		// sibling run_with_secrets calls from reading each other's /proc/<pid>/environ.
-		// --proc must come after --dev-bind / / so it masks the host procfs (bwrap applies
+		// --proc must come after --ro-bind / / so it masks the host procfs (bwrap applies
 		// mounts left-to-right). Abstract Unix sockets are already isolated by --unshare-net.
 		//
 		// J-1: --unshare-net only blocks AF_INET/INET6/PACKET/NETLINK. AF_UNIX
 		// sockets reachable by filesystem path (e.g. /run/user/$UID/bus — the
 		// Secret Service / D-Bus session bus, KWallet, gpg-agent, legacy
 		// /tmp/dbus-*) survive the netns and would otherwise be mounted into
-		// the child by --dev-bind. Mask the standard socket directories with
+		// the child by --ro-bind. Mask the standard socket directories with
 		// empty tmpfs so the child cannot reach the keyring it was supposed to
 		// be insulated from. /tmp tmpfs also closes the cross-call multi-bit
 		// storage channel between sibling run_with_secrets invocations. On all
@@ -189,7 +189,7 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 		// — bwrap fails with "Can't mkdir /var/run/user" when /var/run is a
 		// symlink to a now-empty tmpfs (see TestSandboxNet_TmpfsMasksDBus).
 		bwArgs = []string{
-			"--dev-bind", "/", "/",
+			"--ro-bind", "/", "/",
 			"--unshare-net",
 			"--unshare-pid",
 			"--proc", "/proc",
@@ -197,7 +197,7 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 			"--tmpfs", "/run/user",
 			"--tmpfs", "/tmp",
 			// J-12/post-v1.1.2: audit log lives at $XDG_STATE_HOME/opq/ or
-			// $HOME/.local/state/opq/. Under --dev-bind / / the AI subprocess
+			// $HOME/.local/state/opq/. Under --ro-bind / / the AI subprocess
 			// could cat audit.log and read caller="cli" entries (which
 			// filterAuditLineForAI strips for MCP audit_tail) plus raw_exit /
 			// elapsed_ms tokens (which filterAuditMessageForAI strips). Masking
