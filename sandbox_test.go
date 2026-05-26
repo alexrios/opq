@@ -143,6 +143,7 @@ func TestSandboxNet_TmpfsMasksDBus(t *testing.T) {
 	}
 }
 
+
 func TestWrapCommand_SandboxFull_BwrapArgv(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only sandbox")

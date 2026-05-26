@@ -138,17 +138,139 @@ func resolveAuditDirForMask() (string, error) {
 	return real, nil
 }
 
+// runtimeSocketDirs lists filesystem-path-reachable AF_UNIX socket
+// DIRECTORIES that survive --unshare-net and (since they live under
+// --ro-bind / /) are connect()-reachable from the sandboxed child.
+// --ro-bind blocks WRITE, NOT connect(2). An AI under SandboxNet can
+// curl --unix-socket <path> to invoke privileged APIs (Docker daemon,
+// containerd, D-Bus -> Avahi mDNS, libvirt, etc.) and bypass the
+// "never sees plaintext" property:
+//
+//   - P0-1 (Docker / LXD / Incus / podman group membership): a single
+//     POST to /containers/create with -v /:/host yields arbitrary host
+//     read; the AI cat's the secret out of the container's view of /.
+//   - P1-2 (system D-Bus): Avahi typically permits unauthenticated
+//     org.freedesktop.Avahi.EntryGroup.AddService -> AI publishes the
+//     secret as an mDNS TXT record, broadcast to local LAN — defeats
+//     --unshare-net entirely (the broadcast is the OPERATOR's network
+//     stack handling the local-bus request).
+//
+// Each entry MUST be a directory (tmpfs cannot mount over a file).
+// Entries are stat()'d at WrapCommand time because bwrap 0.11.0 has
+// no --tmpfs-try and --tmpfs on a missing target fails "Can't mkdir".
+// Only directories present on the host are masked; absent ones are
+// silently skipped (TOCTOU: a runtime that appears between stat and
+// exec is unmasked for that call only — the worst-case is the existing
+// pre-fix state, never a stricter regression).
+//
+// Path policy: /run/X only, never /var/run/X. On systemd distros
+// /var/run is a symlink to /run; once the parent /run/X is masked,
+// bwrap fails to mkdir /var/run/X (same root cause as the J-1
+// /var/run/user regression documented in TestSandboxNet_TmpfsMasksDBus).
+var runtimeSocketDirs = []string{
+	"/run/dbus",          // system D-Bus: Avahi mDNS exfil (P1-2) + other system services
+	"/run/containerd",    // containerd CRI socket (kubernetes, nerdctl)
+	"/run/crio",          // CRI-O socket (OpenShift / Kubernetes)
+	"/run/podman",        // podman API socket
+	"/run/k3s",           // k3s embedded containerd
+	"/run/libvirt",       // libvirt / virtlogd: VM-escape vectors via qemu monitor
+	"/run/lxd",           // LXD: lxd group -> privileged container -> -v /:/host (Kimi gate 1)
+	"/run/incus",         // Incus (LXD fork): same primitive (Kimi gate 1)
+	"/run/avahi-daemon",  // Avahi native protocol (D-Bus bypass, Kimi gate 1)
+	"/run/buildkit",      // rootless BuildKit can build privileged images (Kimi gate 1)
+}
+
+// runtimeSocketFiles lists TOP-LEVEL AF_UNIX socket files that need
+// individual masking because tmpfs cannot mount over a file (bwrap
+// errors "Can't mkdir <socket>: Not a directory"). We use
+// --bind /dev/null <path> to replace the socket with a character
+// device that refuses connect().
+//
+// IMPORTANT: bwrap's --bind-try only skips when the SOURCE is missing
+// (/dev/null is always present), NOT when the destination is missing —
+// so --bind-try /dev/null /run/nonexistent.sock under --ro-bind / /
+// fails with "Can't create file ... Read-only file system". We must
+// stat each entry at WrapCommand time and only emit --bind if the
+// destination exists. Verified directly against bwrap 0.11.0
+// (Kimi gate 1).
+var runtimeSocketFiles = []string{
+	"/run/docker.sock",            // P0-1 primary: docker group -> -v /:/host -> arbitrary read
+	"/run/snapd.socket",           // snapd: privesc via 'snap install' of a hook-bearing snap
+	"/run/snapd-snap.socket",      // snapd control socket (Kimi gate 1)
+	"/var/lib/lxd/unix.socket",    // LXD alt path on Debian/Ubuntu (Kimi gate 1)
+	"/var/lib/incus/unix.socket",  // Incus alt path (Kimi gate 1)
+}
+
+// appendRuntimeSocketMasks appends --tmpfs and --bind entries for the
+// container/system-bus sockets reachable via --ro-bind / /. Called
+// after the static tmpfs masks so it preserves the load-bearing
+// left-to-right ordering (anything appended here still post-dates
+// --ro-bind / /). Indirected via os.Stat with a host-only view; in
+// tests the slices are package-level vars but stat() runs against
+// the real FS, which is the production behavior we want to lock down.
+//
+// Ordering within this function is also load-bearing: socket-file
+// --bind entries are emitted BEFORE directory --tmpfs entries
+// (Kimi gate 2 P1). The reverse order would crash bwrap if any future
+// runtimeSocketFiles entry lives inside a runtimeSocketDirs entry —
+// the tmpfs empties the parent and the subsequent --bind fails with
+// ENOENT. Today the lists are disjoint, but keeping files-then-dirs
+// is the defense against a future contributor adding e.g.
+// /run/docker/docker.sock to the file list without realizing the
+// /run/docker dir is being tmpfs'd ahead of it.
+//
+// Symlink handling: we use os.Stat (NOT Lstat) which follows
+// symlinks. Two reasons (Kimi gate 2 P1):
+//   - Linux mount(2) with MS_BIND follows DESTINATION symlinks, so a
+//     symlinked entry in runtimeSocketFiles would have bwrap bind
+//     /dev/null on the TARGET, not on the symlink — masking the wrong
+//     path while leaving the original socket reachable via the link.
+//     Using os.Stat at least guarantees the target exists; the actual
+//     bypass mitigation is to keep runtimeSocketFiles pointed at the
+//     canonical socket location and trust packagers to put it there.
+//   - A dangling symlink passes Lstat but crashes bwrap (ENOENT on
+//     the bind target). os.Stat fails on dangling symlinks, so the
+//     skip path covers that case.
+func appendRuntimeSocketMasks(args []string) []string {
+	// Files first (see comment above on ordering).
+	for _, path := range runtimeSocketFiles {
+		st, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		// Defense in depth: only mask if the target is actually a
+		// socket. A regular file in /run with the same name would
+		// suggest the host is in an unusual state; refuse to mask
+		// rather than risk a spurious bind on the wrong inode kind.
+		if st.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+		args = append(args, "--bind", "/dev/null", path)
+	}
+	for _, dir := range runtimeSocketDirs {
+		st, err := os.Stat(dir)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		args = append(args, "--tmpfs", dir)
+	}
+	return args
+}
+
 // sandboxNetArgvCommon returns the bwrap argv shared by SandboxNet and
 // SandboxNetAllowed. The two profiles differ only by whether the
 // caller adds --unshare-net; everything else (read-only host bind,
-// tmpfs masks on the socket/tmp/dev-shm/audit dirs, private PID
-// namespace, --die-with-parent, --new-session) is identical.
+// tmpfs masks on the socket/tmp/dev-shm/audit dirs, container-runtime
+// socket masks, private PID namespace, --die-with-parent,
+// --new-session) is identical.
 //
 // Ordering is load-bearing:
 //   - --ro-bind / / must be FIRST so subsequent --tmpfs entries
 //     shadow the host bind-mounts (bwrap applies mounts L→R).
 //   - --proc /proc must come AFTER --ro-bind / / so it masks the host
 //     procfs (PID-namespace isolation depends on this — finding C2).
+//   - The runtime-socket masks appended by appendRuntimeSocketMasks
+//     must come AFTER --ro-bind / / for the same shadowing reason.
 //
 // J-1: --unshare-net only blocks AF_INET/INET6/PACKET/NETLINK. AF_UNIX
 // sockets reachable by filesystem path (e.g. /run/user/$UID/bus — the
@@ -167,8 +289,15 @@ func resolveAuditDirForMask() (string, error) {
 // plus raw_exit / elapsed_ms tokens (filterAuditMessageForAI strips them).
 // Masking the audit directory with tmpfs closes that bypass. SandboxFull
 // already tmpfs-masks /home so it is covered there incidentally.
+//
+// P0-1 / P1-2 (joint-review 2026-05 post-v1.1.3): the container-runtime
+// AF_UNIX sockets (/run/docker.sock, /run/containerd, /run/podman, ...)
+// and /run/dbus survive --unshare-net because --ro-bind blocks WRITE
+// but not connect(2). The appendRuntimeSocketMasks call below closes
+// these vectors. See runtimeSocketDirs / runtimeSocketFiles for the
+// full list and per-entry rationale.
 func sandboxNetArgvCommon(auditDir string) []string {
-	return []string{
+	args := []string{
 		"--ro-bind", "/", "/",
 		"--unshare-pid",
 		"--proc", "/proc",
@@ -176,9 +305,13 @@ func sandboxNetArgvCommon(auditDir string) []string {
 		"--tmpfs", "/run/user",
 		"--tmpfs", "/tmp",
 		"--tmpfs", auditDir,
+	}
+	args = appendRuntimeSocketMasks(args)
+	args = append(args,
 		"--die-with-parent",
 		"--new-session",
-	}
+	)
+	return args
 }
 
 // insertAfterRoBind inserts a single bwrap flag immediately after the
