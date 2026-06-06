@@ -870,6 +870,97 @@ func TestRunWithSecretsOutput_NoTruncationFields(t *testing.T) {
 	}
 }
 
+// TestQuantizeOutputForAI_EmptyStaysEmpty: gap #3 mitigation only pads
+// non-empty streams. Empty stdout/stderr must remain empty so silent
+// commands do not inflate the response by 1 KiB each.
+func TestQuantizeOutputForAI_EmptyStaysEmpty(t *testing.T) {
+	if got := quantizeOutputForAI(""); got != "" {
+		t.Errorf("empty input should pass through; got len=%d %q", len(got), got)
+	}
+}
+
+// TestQuantizeOutputForAI_LengthIsBucketQuantized is the load-bearing
+// invariant for the gap-#3 mitigation: for any non-empty input shorter
+// than the cap, len(returned) must equal exactly nextOutputBucket(len(input)).
+// If this invariant is ever broken (e.g. an off-by-one in the padding
+// arithmetic), the AI's len(stdout) channel rate ticks back up.
+func TestQuantizeOutputForAI_LengthIsBucketQuantized(t *testing.T) {
+	// Sample inputs spanning every bucket boundary, including N-1, N,
+	// and N+1 for each bucket. Outputs above the largest bucket
+	// (mcpMaxOutputBytes) cannot occur in practice (cappedWriter
+	// truncates) so we test exactly at the cap as the boundary case.
+	checks := []int{1, 100, 1023, 1024, 1025, 4095, 4096, 4097, 16383, 16384,
+		16385, 65535, 65536, 65537, 262143, mcpMaxOutputBytes}
+	for _, n := range checks {
+		in := strings.Repeat("x", n)
+		out := quantizeOutputForAI(in)
+		want := nextOutputBucket(n)
+		if len(out) != want {
+			t.Errorf("quantizeOutputForAI(len=%d): got len=%d, want %d (bucket)", n, len(out), want)
+		}
+	}
+}
+
+// TestQuantizeOutputForAI_PadMarkerVisible: when the padding gap is
+// large enough to fit the marker, the marker must appear once between
+// the real output and the pad spaces. AI tooling parses on this marker
+// to skip the pad tail.
+func TestQuantizeOutputForAI_PadMarkerVisible(t *testing.T) {
+	out := quantizeOutputForAI("hello")
+	if !strings.Contains(out, outputPadMarker) {
+		t.Errorf("expected pad marker %q in output, got %q", outputPadMarker, out)
+	}
+	if !strings.HasPrefix(out, "hello") {
+		t.Errorf("real output should be at the head; got %q", out[:20])
+	}
+}
+
+// TestQuantizeOutputForAI_SmallPadGapNoMarker: when the gap to the
+// bucket is below len(outputPadMarker), we cannot fit the marker so we
+// emit only spaces. This is a correctness edge: the length invariant
+// still holds, just the marker is omitted.
+func TestQuantizeOutputForAI_SmallPadGapNoMarker(t *testing.T) {
+	// Input length such that bucket - len(input) < len(outputPadMarker).
+	in := strings.Repeat("x", 1024-3)
+	out := quantizeOutputForAI(in)
+	if len(out) != 1024 {
+		t.Fatalf("length invariant broken: got %d, want 1024", len(out))
+	}
+	if strings.Contains(out, outputPadMarker) {
+		t.Errorf("pad gap was smaller than marker length; marker should be omitted, got %q", out[len(in):])
+	}
+}
+
+// TestQuantizeOutputForAI_AtCapNoPadding: an input already at the cap
+// (cappedWriter's max output bytes) is the largest bucket; no padding is
+// added (no room above it).
+func TestQuantizeOutputForAI_AtCapNoPadding(t *testing.T) {
+	in := strings.Repeat("x", mcpMaxOutputBytes)
+	out := quantizeOutputForAI(in)
+	if len(out) != mcpMaxOutputBytes {
+		t.Errorf("at-cap input should not grow: got len=%d, want %d", len(out), mcpMaxOutputBytes)
+	}
+}
+
+// TestOutputBuckets_StartUnderCapEndAtCap locks the bucket-ladder
+// invariants required by quantizeOutputForAI: monotonic non-empty
+// power-of-two-ish, last entry equals the cap. Without these, the
+// fallback in nextOutputBucket fails and the AI-visible length channel
+// re-opens.
+func TestOutputBuckets_StartUnderCapEndAtCap(t *testing.T) {
+	if len(outputBuckets) == 0 {
+		t.Fatal("outputBuckets must be non-empty")
+	}
+	for i := 1; i < len(outputBuckets); i++ {
+		if outputBuckets[i] <= outputBuckets[i-1] {
+			t.Errorf("outputBuckets must be strictly increasing; got %v", outputBuckets)
+		}
+	}
+	if last := outputBuckets[len(outputBuckets)-1]; last != mcpMaxOutputBytes {
+		t.Errorf("final bucket must equal mcpMaxOutputBytes; got %d, want %d", last, mcpMaxOutputBytes)
+	}
+}
+
 // TestAIAuditMessageAllowlist_Invariant locks the exact set of keys
 // permitted in AI-visible audit Message fields. Every entry below is a
 // closed-set widening of the AI's audit channel and was reviewed for

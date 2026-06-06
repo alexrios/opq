@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -74,23 +77,107 @@ func (r *RedactingWriter) hasTruncationShortCircuit() bool {
 // NewRedactingWriter constructs a writer that redacts the given secrets.
 // The secrets slice is copied; the caller may destroy the source buffers
 // immediately after this returns. Empty secret values are skipped.
+//
+// Each registered secret is expanded into multiple byte sequences so the
+// redactor catches common encodings of the same value (base64 std, base64
+// URL, raw-no-pad variants of both, lower-hex, upper-hex). This closes
+// gap #2 (encoding bypass) for the headline encodings — a subprocess that
+// accidentally emits its API key in any of these forms still produces
+// `[REDACTED:NAME]` instead of the encoded plaintext. Encoded forms map
+// to the same NAME as the raw secret; from the caller's view there is one
+// secret with multiple wire representations. See encodedSecretForms for
+// the full expansion list and rationale.
 func NewRedactingWriter(w io.Writer, secrets []NamedSecret) *RedactingWriter {
 	rw := &RedactingWriter{w: w}
 	if tr, ok := w.(truncatedReporter); ok {
 		rw.downTrunc = tr
 	}
+	// De-dup: short / low-entropy secrets can produce encoded forms that
+	// collide with the raw value (e.g. raw "abc" lower-hex "616263" cannot
+	// collide, but a base64 form of a tiny secret could coincidentally
+	// equal another encoded form). The map-of-string key is fine here —
+	// we copy out into fresh []byte for each survivor before stashing.
+	seen := make(map[string]bool)
 	for _, s := range secrets {
-		if len(s.Value) == 0 {
-			continue
-		}
-		val := make([]byte, len(s.Value))
-		copy(val, s.Value)
-		rw.secrets = append(rw.secrets, redactSecret{name: s.Name, value: val})
-		if len(val) > rw.maxLen {
-			rw.maxLen = len(val)
+		for _, form := range encodedSecretForms(s.Value) {
+			if seen[string(form)] {
+				continue
+			}
+			seen[string(form)] = true
+			val := make([]byte, len(form))
+			copy(val, form)
+			rw.secrets = append(rw.secrets, redactSecret{name: s.Name, value: val})
+			if len(val) > rw.maxLen {
+				rw.maxLen = len(val)
+			}
 		}
 	}
 	return rw
+}
+
+// encodingMinRawLen is the minimum raw-secret byte length below which we
+// skip registering encoded forms. Short secrets (< 4 bytes) produce
+// encoded forms short enough to false-positive on innocuous subprocess
+// output (a 2-byte secret has a 4-char hex form like "ab12" that could
+// trivially appear in random text). The raw form is still registered.
+// 4 bytes is a deliberately conservative floor — any secret short enough
+// to fall below it is unlikely to be a real-world credential and the loss
+// of encoded-form coverage is acceptable.
+const encodingMinRawLen = 4
+
+// encodedSecretForms returns the byte sequences the redactor should
+// match for a given raw secret value: the raw bytes, plus base64 (std
+// and URL-safe, padded and unpadded) and hex (lower and upper) forms.
+// Empty values yield nil. Forms shorter than encodingMinRawLen-implied
+// thresholds are filtered upstream by skipping the encoded set entirely
+// for short secrets.
+//
+// Forms covered:
+//
+//	raw                      — verbatim bytes (always)
+//	base64 std (padded)      — RFC 4648 §4, `+/` alphabet, `=` padding
+//	base64 std (no padding)  — same alphabet, no `=` (common in JWTs)
+//	base64 URL (padded)      — RFC 4648 §5, `-_` alphabet, `=` padding
+//	base64 URL (no padding)  — same alphabet, no `=` (used in JWTs/JWS)
+//	hex lower                — `0-9a-f` (most CLI tools default to this)
+//	hex upper                — `0-9A-F` (some hex dumpers / Java toHex)
+//
+// Not covered (deliberate):
+//
+//	URL percent-encoding     — multiple flavors (PathEscape, QueryEscape,
+//	                           RFC 3986 unreserved set); for typical API
+//	                           keys the percent-encoded form equals the
+//	                           raw (alphanumeric is reserved-set safe).
+//	JSON-string escaping     — for alphanumeric/most-ASCII secrets the
+//	                           escaped form equals the raw.
+//	rot13 / other ciphers    — too many; out of scope.
+//	entropy-based heuristics — false-positive prone on legitimate
+//	                           hashes/UUIDs/tokens (file header gap #2).
+func encodedSecretForms(raw []byte) [][]byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	// Always include the raw form, even for tiny secrets — the raw match
+	// is the load-bearing one. We only suppress the ENCODED expansions
+	// below the length floor.
+	forms := [][]byte{append([]byte(nil), raw...)}
+	if len(raw) < encodingMinRawLen {
+		return forms
+	}
+	// base64 — both alphabets, padded and unpadded. EncodeToString gives
+	// the padded form; trimming trailing '=' yields the raw form, which
+	// is also what RawStdEncoding / RawURLEncoding emit directly.
+	stdPadded := base64.StdEncoding.EncodeToString(raw)
+	urlPadded := base64.URLEncoding.EncodeToString(raw)
+	stdRaw := base64.RawStdEncoding.EncodeToString(raw)
+	urlRaw := base64.RawURLEncoding.EncodeToString(raw)
+	// hex — lower (Go default) and upper (Java/some hexdumps).
+	hexLower := hex.EncodeToString(raw)
+	hexUpper := strings.ToUpper(hexLower)
+	for _, s := range []string{stdPadded, stdRaw, urlPadded, urlRaw, hexLower, hexUpper} {
+		forms = append(forms, []byte(s))
+	}
+	return forms
 }
 
 // NamedSecret pairs a logical name with its value for redactor registration.

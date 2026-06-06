@@ -3,8 +3,10 @@
 package main
 
 import (
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -206,5 +208,234 @@ func TestSandboxNetAllowed_InheritsRuntimeSocketMasks(t *testing.T) {
 				t.Errorf("SandboxNetAllowed argv missing '--bind /dev/null %s' (shared mask drift between profiles): %v", path, gotArgs)
 			}
 		}
+	}
+}
+
+// withFakeHome points homeDirForMask at a fresh tempdir for the duration of
+// the test and restores the original on cleanup. Returning the path is
+// convenient for fixture placement; restoring the var via t.Cleanup keeps
+// parallel-test isolation if the broader suite gains parallelism later.
+func withFakeHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := homeDirForMask
+	homeDirForMask = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { homeDirForMask = orig })
+	return dir
+}
+
+// TestSandboxNet_TmpfsMasksHomeDirSockets (gap #3 residual close) — the
+// home-directory credential-agent socket directories listed in
+// homeDirSocketTmpfsRel must be tmpfs-masked when they exist on the
+// (fake) host. The mask is what prevents an AI under default SandboxNet
+// from connecting to gpg-agent via $HOME/.gnupg/S.gpg-agent and signing
+// arbitrary payloads as the operator.
+func TestSandboxNet_TmpfsMasksHomeDirSockets(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	home := withFakeHome(t)
+	// Create every candidate dir so the positive assertion is non-vacuous.
+	for _, rel := range homeDirSocketTmpfsRel {
+		full := filepath.Join(home, rel)
+		if err := os.MkdirAll(full, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", full, err)
+		}
+	}
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
+	if roBindIdx < 0 {
+		t.Fatalf("--ro-bind missing from SandboxNet argv: %v", gotArgs)
+	}
+	for _, rel := range homeDirSocketTmpfsRel {
+		full := filepath.Join(home, rel)
+		if !hasSeq(gotArgs, []string{"--tmpfs", full}) {
+			t.Errorf("SandboxNet argv missing '--tmpfs %s' (home-dir socket dir mask): %v", full, gotArgs)
+			continue
+		}
+		// Mask must come AFTER --ro-bind / / for left-to-right shadowing.
+		for i := 0; i+1 < len(gotArgs); i++ {
+			if gotArgs[i] == "--tmpfs" && gotArgs[i+1] == full {
+				if i < roBindIdx {
+					t.Errorf("--tmpfs %s (idx %d) must come AFTER --ro-bind (idx %d): %v",
+						full, i, roBindIdx, gotArgs)
+				}
+				break
+			}
+		}
+	}
+}
+
+// TestSandboxNet_HomeDirMasksAbsentWhenDirMissing — when the candidate
+// home-dir socket dir does NOT exist on the host, no --tmpfs entry for
+// it may appear in the argv. Without existence-gating, bwrap fails with
+// "Can't mkdir <path>" on every run_with_secrets call on hosts where
+// the operator does not have e.g. ~/.gnupg.
+func TestSandboxNet_HomeDirMasksAbsentWhenDirMissing(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	home := withFakeHome(t)
+	// Do NOT create any of the candidate dirs / files under home.
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	for _, rel := range homeDirSocketTmpfsRel {
+		full := filepath.Join(home, rel)
+		if hasSeq(gotArgs, []string{"--tmpfs", full}) {
+			t.Errorf("SandboxNet argv contains '--tmpfs %s' but the dir does not exist (would fail bwrap): %v", full, gotArgs)
+		}
+	}
+	for _, rel := range homeDirSocketFileRel {
+		full := filepath.Join(home, rel)
+		if hasSeq(gotArgs, []string{"--bind", "/dev/null", full}) {
+			t.Errorf("SandboxNet argv contains '--bind /dev/null %s' but the file does not exist (would fail bwrap): %v", full, gotArgs)
+		}
+	}
+}
+
+// TestSandboxNet_BindNullMasksHomeDirSocketFiles — for each entry in
+// homeDirSocketFileRel that exists on the (fake) host AND is a socket,
+// the argv must contain '--bind /dev/null <path>'. The bind replaces
+// the socket with /dev/null which refuses connect(2). We create a real
+// AF_UNIX socket under the fake home so the ModeSocket gate in
+// appendHomeDirSocketMasks fires positively.
+func TestSandboxNet_BindNullMasksHomeDirSocketFiles(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	home := withFakeHome(t)
+	created := 0
+	for _, rel := range homeDirSocketFileRel {
+		full := filepath.Join(home, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatalf("mkdir parent of %s: %v", full, err)
+		}
+		// Create a real AF_UNIX listener so os.Stat sees ModeSocket.
+		// Closing the listener keeps the socket file on disk (closeRemove
+		// is not the default); we Close explicitly and let the file
+		// linger until t.TempDir cleanup.
+		l, err := net.Listen("unix", full)
+		if err != nil {
+			// Path length limits on some kernels (108 chars) may reject
+			// the fake-home path; skip the per-entry assertion and
+			// continue rather than failing.
+			t.Logf("could not create socket at %s: %v (skipping this entry)", full, err)
+			continue
+		}
+		_ = l.Close()
+		created++
+	}
+	if created == 0 {
+		t.Skip("could not create any home-dir socket fixtures (kernel sun_path limit?)")
+	}
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	roBindIdx := indexOf(gotArgs, "--ro-bind")
+	if roBindIdx < 0 {
+		t.Fatalf("--ro-bind missing from SandboxNet argv: %v", gotArgs)
+	}
+	for _, rel := range homeDirSocketFileRel {
+		full := filepath.Join(home, rel)
+		st, err := os.Stat(full)
+		if err != nil || st.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+		if !hasSeq(gotArgs, []string{"--bind", "/dev/null", full}) {
+			t.Errorf("SandboxNet argv missing '--bind /dev/null %s' (home-dir socket file mask): %v", full, gotArgs)
+			continue
+		}
+		for i := 0; i+2 < len(gotArgs); i++ {
+			if gotArgs[i] == "--bind" && gotArgs[i+1] == "/dev/null" && gotArgs[i+2] == full {
+				if i < roBindIdx {
+					t.Errorf("--bind /dev/null %s (idx %d) must come AFTER --ro-bind (idx %d): %v",
+						full, i, roBindIdx, gotArgs)
+				}
+				break
+			}
+		}
+	}
+}
+
+// TestSandboxNet_HomeDirRegularFileNotMasked — regression for the
+// ModeSocket gate: if the path exists but is a regular file (not a
+// socket), it must NOT be masked. Without this gate, an unusual host
+// state (file with the same name as the expected socket) would crash
+// bwrap with a Read-only filesystem error under --ro-bind / /.
+func TestSandboxNet_HomeDirRegularFileNotMasked(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	home := withFakeHome(t)
+	for _, rel := range homeDirSocketFileRel {
+		full := filepath.Join(home, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatalf("mkdir parent of %s: %v", full, err)
+		}
+		// Write a regular file (NOT a socket) at the path.
+		if err := os.WriteFile(full, []byte("not a socket"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", full, err)
+		}
+	}
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	for _, rel := range homeDirSocketFileRel {
+		full := filepath.Join(home, rel)
+		if hasSeq(gotArgs, []string{"--bind", "/dev/null", full}) {
+			t.Errorf("SandboxNet argv masked %s but it is a regular file, not a socket: %v", full, gotArgs)
+		}
+	}
+}
+
+// TestSandboxNet_HomeDirMaskHomeUnsetFallsOpen — when the operator's
+// $HOME cannot be resolved (no $HOME set, /etc/passwd missing), the
+// home-dir masks are skipped silently (fail-open) rather than refusing
+// the whole sandbox. The broader masks (/run/user, /run/dbus, etc.)
+// still apply; the residual is that custom home-dir sockets remain
+// reachable — same posture opq has always had on hosts where $HOME
+// is unset. CLI calls would fail elsewhere (HOME=/tmp injected for
+// the child) so this case is only reachable in adversarial test envs,
+// but the fail-open behavior is the right invariant.
+func TestSandboxNet_HomeDirMaskHomeUnsetFallsOpen(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only sandbox")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not present")
+	}
+	orig := homeDirForMask
+	homeDirForMask = func() (string, error) { return "", os.ErrNotExist }
+	t.Cleanup(func() { homeDirForMask = orig })
+	_, gotArgs, err := WrapCommand(SandboxNet, "true", nil)
+	if err != nil {
+		t.Fatalf("err = %v (home-unset must fall open, not error)", err)
+	}
+	// Sanity: the rest of the argv (--ro-bind, --tmpfs /run/user) is
+	// still present so we didn't accidentally skip the whole common slice.
+	if !hasSeq(gotArgs, []string{"--ro-bind", "/", "/"}) {
+		t.Errorf("home-unset path dropped --ro-bind / /: %v", gotArgs)
+	}
+	if !hasSeq(gotArgs, []string{"--tmpfs", "/run/user"}) {
+		t.Errorf("home-unset path dropped --tmpfs /run/user: %v", gotArgs)
 	}
 }

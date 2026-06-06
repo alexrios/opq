@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -393,5 +396,142 @@ func TestRedact_Destroy(t *testing.T) {
 	// After Destroy the redactor has no secrets, so passthrough.
 	if buf.String() != "secret value" {
 		t.Errorf("got %q", buf.String())
+	}
+}
+
+// TestRedact_EncodingBypass_Base64Std locks the gap-#2 close: a subprocess
+// that emits the secret base64-encoded (standard alphabet, with padding)
+// gets the same `[REDACTED:NAME]` treatment as the raw form. Closing this
+// matters because base64 is the single most common accidental encoding for
+// secrets — many CLI tools (curl --data-binary @-, openssl enc, jq -r) round
+// trip through it.
+func TestRedact_EncodingBypass_Base64Std(t *testing.T) {
+	raw := []byte("sk-1234567890")
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: raw}})
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	rw.Write([]byte("token: " + encoded + "\n"))
+	rw.Flush()
+	got := buf.String()
+	if strings.Contains(got, encoded) {
+		t.Errorf("base64-std form leaked: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED:K]") {
+		t.Errorf("expected redaction marker, got %q", got)
+	}
+}
+
+// TestRedact_EncodingBypass_Base64URL covers URL-safe base64 — used by JWT/JWS
+// (`-_` alphabet, no `=` padding). A subprocess piping the secret through a
+// JWT signer or through `base64 --url` must not leak.
+func TestRedact_EncodingBypass_Base64URL(t *testing.T) {
+	raw := []byte("sk-abc+def/123")
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: raw}})
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+	rw.Write([]byte("jwt: " + encoded + "\n"))
+	rw.Flush()
+	got := buf.String()
+	if strings.Contains(got, encoded) {
+		t.Errorf("base64-url-raw form leaked: %q", got)
+	}
+}
+
+// TestRedact_EncodingBypass_HexLower covers lower-case hex — the Go default
+// (`hex.EncodeToString`) and what `openssl rand -hex` / `xxd -p` emit.
+func TestRedact_EncodingBypass_HexLower(t *testing.T) {
+	raw := []byte("sekret")
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: raw}})
+	encoded := hex.EncodeToString(raw)
+	rw.Write([]byte("hex: " + encoded + "\n"))
+	rw.Flush()
+	got := buf.String()
+	if strings.Contains(got, encoded) {
+		t.Errorf("hex-lower form leaked: %q", got)
+	}
+}
+
+// TestRedact_EncodingBypass_HexUpper covers upper-case hex — used by some
+// hex dumpers and Java's HexFormat.of().formatHex.
+func TestRedact_EncodingBypass_HexUpper(t *testing.T) {
+	raw := []byte("sekret")
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: raw}})
+	encoded := strings.ToUpper(hex.EncodeToString(raw))
+	rw.Write([]byte("HEX: " + encoded + "\n"))
+	rw.Flush()
+	got := buf.String()
+	if strings.Contains(got, encoded) {
+		t.Errorf("hex-upper form leaked: %q", got)
+	}
+}
+
+// TestRedact_EncodingBypass_AllFormsAtOnce drives every covered encoding in
+// a single stream so the structural expansion in NewRedactingWriter is
+// exercised end-to-end.
+func TestRedact_EncodingBypass_AllFormsAtOnce(t *testing.T) {
+	raw := []byte("sk-1234567890abcdef")
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: raw}})
+	parts := []string{
+		string(raw),
+		base64.StdEncoding.EncodeToString(raw),
+		base64.RawStdEncoding.EncodeToString(raw),
+		base64.URLEncoding.EncodeToString(raw),
+		base64.RawURLEncoding.EncodeToString(raw),
+		hex.EncodeToString(raw),
+		strings.ToUpper(hex.EncodeToString(raw)),
+	}
+	rw.Write([]byte(strings.Join(parts, " ")))
+	rw.Flush()
+	got := buf.String()
+	for _, p := range parts {
+		if strings.Contains(got, p) {
+			t.Errorf("encoded form %q leaked through redactor: full output %q", p, got)
+		}
+	}
+}
+
+// TestRedact_EncodingBypass_ShortSecretSkipsEncodedForms verifies the
+// encodingMinRawLen floor: a 3-byte secret has its raw form registered
+// but no encoded forms — otherwise the 6-char hex "616263" of "abc" would
+// false-positive on innocuous logs.
+func TestRedact_EncodingBypass_ShortSecretSkipsEncodedForms(t *testing.T) {
+	raw := []byte("abc")
+	var buf bytes.Buffer
+	rw := NewRedactingWriter(&buf, []NamedSecret{{Name: "K", Value: raw}})
+	hexForm := hex.EncodeToString(raw) // "616263"
+	// Raw "abc" should still redact.
+	// Hex form should pass through verbatim (below the encoding floor).
+	rw.Write([]byte("raw=abc hex=" + hexForm))
+	rw.Flush()
+	got := buf.String()
+	if !strings.Contains(got, "[REDACTED:K]") {
+		t.Errorf("raw form should still redact for short secrets: %q", got)
+	}
+	if !strings.Contains(got, hexForm) {
+		t.Errorf("hex form of short secret should NOT be registered (false-positive risk); got %q", got)
+	}
+}
+
+// TestEncodedSecretForms_NoDuplicates locks that the de-dup path in
+// NewRedactingWriter eats coincidentally-equal forms (e.g. an input
+// where base64-std and base64-url happen to render identically because
+// the value uses no `+/` characters). A duplicate would not cause a
+// correctness problem but does bloat the per-byte scan loop.
+func TestEncodedSecretForms_NoDuplicates(t *testing.T) {
+	// Pick a value whose std-base64 and URL-base64 outputs are identical
+	// (no `+/` chars in the encoded form). 4 bytes "abcd" -> "YWJjZA==".
+	raw := []byte("abcd")
+	rw := NewRedactingWriter(&bytes.Buffer{}, []NamedSecret{{Name: "K", Value: raw}})
+	seen := make(map[string]int)
+	for _, s := range rw.secrets {
+		seen[string(s.value)]++
+	}
+	for v, n := range seen {
+		if n > 1 {
+			t.Errorf("duplicate registered form %q (count=%d) — de-dup missing", v, n)
+		}
 	}
 }

@@ -24,26 +24,39 @@
 //     Output redaction is a guard against the subprocess *accidentally*
 //     echoing the secret, not a sandbox.
 //
-//  2. ENCODING BYPASS. The redactor matches the raw secret bytes
-//     verbatim. An AI that wants the value can ask the subprocess to
-//     emit it base64-, hex-, URL-, or rot13-encoded and the redactor
-//     will pass it through untouched. Entropy detection was considered
-//     and rejected (false positives on legitimate hashes/UUIDs/tokens).
+//  2. ENCODING BYPASS. The redactor now registers each secret in
+//     multiple wire forms (raw, base64 std/URL with and without
+//     padding, lower- and upper-hex — see encodedSecretForms in
+//     redact.go), so a subprocess accidentally emitting the value in
+//     any of those encodings is still caught. NOT covered: URL
+//     percent-encoding (no-op for typical alphanumeric API keys),
+//     JSON-string escaping (no-op for the same), arbitrary ciphers
+//     (rot13, XOR, base32), and entropy-based heuristics (rejected
+//     because false-positive prone on legitimate hashes/UUIDs/tokens).
+//     The high-value common cases are closed; an adversarial AI can
+//     still pick an encoding outside the set, so the file-header
+//     guarantee remains "redaction is a guard against accidental
+//     echo, not a sandbox".
 //
 //  3. OUTPUT-VOLUME SIDE CHANNEL. The AI controls the subprocess, so
 //     it can craft a command whose stdout/stderr byte count is a
 //     function of a secret byte (e.g. `printf '%*s' "$X" ""` or a
 //     Python one-liner that emits `ord(secret[0])` characters). The
 //     AI then measures len(stdout) in the returned tool result and
-//     recovers the secret one byte at a time. The redactor cannot
-//     help — the emitted bytes are not the secret, they are a
-//     length-encoded function of it. We have removed the cleanest
-//     convenience oracle (the stdout_truncated/stderr_truncated
-//     booleans previously surfaced on both the tool result and via
-//     audit_tail), but the underlying len(stdout) channel remains.
-//     Operators concerned about this should run high-risk callers
-//     under the policy-enforcing wrapper described below, or pair
-//     this server with rate-limiting at the MCP transport layer.
+//     recovers information about the secret. To reduce the channel
+//     rate we quantize each of stdout/stderr to fixed power-of-two
+//     buckets (see outputBuckets / quantizeOutputForAI): every
+//     non-empty stream is padded up to the next bucket boundary
+//     with a clearly-marked tail (`\n[opq-pad]\n` + spaces). That
+//     collapses the previous ~8 bits/call channel (full byte-count
+//     visibility) to ~log2(len(outputBuckets)) bits/call — recovering
+//     one secret byte now requires several calls of carefully crafted
+//     command output rather than one. The channel is reduced, not
+//     eliminated: an adversarial AI can still binary-search bucket
+//     boundaries. Operators concerned about that residual should run
+//     high-risk callers under the policy-enforcing wrapper described
+//     below, or pair this server with rate-limiting at the MCP
+//     transport layer.
 //
 // The supported deployment model for high-risk environments is a
 // policy-enforcing wrapper: a second MCP server that proxies into opq
@@ -234,10 +247,14 @@ func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, err
 // and binary-searches the cap threshold). Truncation still happens
 // silently in cappedWriter, and the operator-facing audit log still
 // records `stdout_truncated=true` / `stderr_truncated=true` tokens
-// for diagnostics, but the AI no longer gets a clean flag. The
-// residual len(stdout) channel is documented as gap #3 in the file
-// header — there is no defense against it short of refusing to
-// return subprocess output at all.
+// for diagnostics, but the AI no longer gets a clean flag.
+//
+// Stdout and Stderr are passed through quantizeOutputForAI before
+// landing here, so len(Stdout) and len(Stderr) are bucketed to the
+// outputBuckets ladder. The bucketing reduces — but does not eliminate
+// — the underlying len(stdout) channel (gap #3 in the file header).
+// The padding tail is preceded by an `[opq-pad]` marker so AI tooling
+// can skip it when parsing output.
 type runWithSecretsOutput struct {
 	Succeeded bool   `json:"succeeded"`
 	ExitCode  int    `json:"exit_code"`
@@ -553,11 +570,20 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	// for diagnostics) but are deliberately NOT exposed to the AI via
 	// the response struct or the textual header. See the godoc on
 	// runWithSecretsOutput for the side-channel reasoning.
+	//
+	// Output bucketing (gap #3): pad stdout and stderr independently to
+	// the next outputBuckets boundary. After quantizeOutputForAI runs,
+	// len(out.Stdout) and len(out.Stderr) take only one of the discrete
+	// bucket values (or zero), reducing the AI-observable output-volume
+	// channel rate from ~17 bits/call (full 0..262144 visibility) to
+	// ~log2(len(outputBuckets)) bits/call. The padding is plain spaces
+	// preceded by a one-shot `[opq-pad]` marker the AI can use to skip
+	// it when consuming output.
 	out := runWithSecretsOutput{
 		Succeeded: succeeded,
 		ExitCode:  normalizedExit,
-		Stdout:    stdoutBuf.String(),
-		Stderr:    stderrBuf.String(),
+		Stdout:    quantizeOutputForAI(stdoutBuf.String()),
+		Stderr:    quantizeOutputForAI(stderrBuf.String()),
 		TimedOut:  timedOut,
 	}
 
@@ -613,6 +639,80 @@ func auditMCPRunMessage(rawExit int, stdoutTrunc, stderrTrunc, timedOut bool, el
 // be injected. If a future need to pass through specific vars arises,
 // add an allowlist field to runWithSecretsInput.
 func envFromMap() []string { return nil }
+
+// ----- output bucketing (gap #3 mitigation) -----
+
+// outputBuckets is the closed set of stdout/stderr lengths the AI may
+// observe in a run_with_secrets response. Every non-empty stream is
+// padded up to the smallest bucket >= its real length. The cap value
+// (mcpMaxOutputBytes) MUST be present as the final entry — outputs at
+// the cap have already been truncated by cappedWriter and need no
+// padding. Earlier buckets follow the geometric power-of-two ladder
+// 1 KiB → 4 KiB → 16 KiB → 64 KiB so a small command's response is not
+// inflated more than ~4x while the channel remains coarse-grained.
+//
+// Bits leaked per call (worst case, adversary controls the volume
+// function): log2(len(outputBuckets)) bits per stream — today
+// log2(5) ≈ 2.3 bits, down from ~17 bits (262144 distinct lengths).
+// Recovering one 8-bit secret byte under this regime requires ~4 calls
+// instead of 1; expanding the bucket set (more granularity) would
+// invert that trade. Do not add intermediate buckets without justifying
+// the per-call channel rate against the bandwidth cost.
+//
+// Empty (len==0) streams are NOT padded; an empty result is a coarse
+// 1-bit signal (command emitted nothing) already implicit in the
+// AI-controlled command and not worth the bandwidth cost of always
+// emitting at least 1 KiB.
+var outputBuckets = []int{1024, 4096, 16384, 65536, mcpMaxOutputBytes}
+
+// outputPadMarker is the visible token appended once at the boundary
+// between real output and padding. Tooling consuming the response can
+// scan for this token and strip the trailing padding. The marker plus
+// padding are bytes inside the JSON string value, so a naive
+// byte-counter (`len(stdout)`) sees the bucket-quantized total — that
+// is the whole point. The marker length is short enough that the
+// smallest pad gap (4 bytes when n is 1020 and bucket is 1024) can
+// fall below it; in that case we emit only space-padding without the
+// marker. The marker bytes themselves are constant across calls and
+// therefore not a channel.
+const outputPadMarker = "\n[opq-pad]\n"
+
+// nextOutputBucket returns the smallest bucket >= n, or n if n is
+// already at or above the largest bucket (which equals mcpMaxOutputBytes).
+func nextOutputBucket(n int) int {
+	for _, b := range outputBuckets {
+		if n <= b {
+			return b
+		}
+	}
+	return n
+}
+
+// quantizeOutputForAI pads s up to the next outputBuckets boundary so the
+// AI-visible len(s) does not reveal fine-grained per-byte information
+// about a subprocess output volume. Empty input is returned unchanged
+// (see outputBuckets godoc for why). When the padding gap is large
+// enough, an `[opq-pad]` marker is included once so AI tooling can
+// recognize the suffix as padding; smaller gaps emit only spaces.
+//
+// Padding is byte-quantized to the bucket length: the returned string
+// length is exactly bucket if s was non-empty. Tests verify this
+// invariant — do not break it by adding "if pad <= 0 return s" style
+// short-circuits past the initial empty check.
+func quantizeOutputForAI(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	bucket := nextOutputBucket(len(s))
+	pad := bucket - len(s)
+	if pad <= 0 {
+		return s
+	}
+	if pad >= len(outputPadMarker) {
+		return s + outputPadMarker + strings.Repeat(" ", pad-len(outputPadMarker))
+	}
+	return s + strings.Repeat(" ", pad)
+}
 
 // ----- cappedWriter -----
 

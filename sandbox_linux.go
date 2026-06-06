@@ -187,6 +187,104 @@ func resolveAuditDirForMask() (string, error) {
 	return real, nil
 }
 
+// homeDirSocketTmpfsRel lists DIRECTORIES under the operator's $HOME
+// that contain credential-agent AF_UNIX sockets. With --ro-bind / /,
+// the host home directory is bind-mounted read-only into the sandbox —
+// blocking writes but NOT connect(2). Without a tmpfs mask over these
+// directories, an AI under default SandboxNet can connect() to the
+// sockets and either:
+//
+//   - sign arbitrary payloads as the operator (gpg-agent's S.gpg-agent),
+//   - dump keyring contents (gnome-keyring's control socket if exposed
+//     via $HOME/.cache),
+//   - drive rootless Docker (covered by homeDirSocketFileRel for the
+//     canonical socket path).
+//
+// Each entry is checked at WrapCommand time with os.Stat in the
+// operator's process — the AI cannot redirect $HOME of the parent — and
+// only directories that actually exist are masked, mirroring the
+// existence-gated pattern used by runtimeSocketDirs.
+//
+// Scope is intentionally narrow: only canonical, widely-deployed paths.
+// Custom per-app sockets the operator placed in $HOME are out of scope
+// and remain a residual under SandboxNet — `isolation="full"` is the
+// answer for those, not piecemeal additions to this list.
+//
+// IMPORTANT: tmpfs-masking $HOME/.gnupg breaks `gpg` running INSIDE the
+// sandbox (it loses access to its own keys/config). This is the correct
+// trade — opq's sandbox is meant for arbitrary AI-driven commands, not
+// for running gpg with the operator's keys. An AI that legitimately
+// needs gpg should use isolation="full" with an explicit gpg
+// configuration, or run gpg outside opq.
+var homeDirSocketTmpfsRel = []string{
+	".gnupg", // gpg-agent socket family (S.gpg-agent, .ssh, .extra, .browser, .scdaemon)
+}
+
+// homeDirSocketFileRel lists individual AF_UNIX socket FILES under the
+// operator's $HOME. tmpfs cannot mount over a file (bwrap errors
+// "Not a directory"), so these are masked individually via
+// `--bind /dev/null <path>`. Same existence + ModeSocket gating as
+// runtimeSocketFiles — only entries that exist AND are sockets are
+// masked, so a regular file at the same path on an unusual host does
+// not get spurious /dev/null treatment.
+var homeDirSocketFileRel = []string{
+	".docker/run/docker.sock", // rootless Docker (Docker Desktop / rootlesskit)
+}
+
+// appendHomeDirSocketMasks appends --tmpfs / --bind entries for the
+// credential-agent socket locations under the operator's $HOME (or
+// $XDG_RUNTIME_DIR-style equivalent already covered by /run/user).
+// Called from sandboxNetArgvCommon after the runtime-socket masks so
+// the left-to-right shadowing order with --ro-bind / / is preserved.
+//
+// $HOME is read with os.UserHomeDir() which consults the parent
+// process's environment. The AI subprocess cannot influence this —
+// it only controls its own (childEnv) environment, which we override
+// with HOME=/tmp before exec. If $HOME is unset for the operator
+// (extremely unusual; e.g. a stripped systemd unit), no masks are
+// emitted and the call falls back to the broader /run masks plus the
+// home-dir-untouched state. We do NOT fail closed here because that
+// would block every MCP call on an environment opq already runs in
+// successfully when SandboxNet is requested via the CLI.
+func appendHomeDirSocketMasks(args []string) []string {
+	home, err := homeDirForMask()
+	if err != nil || home == "" {
+		return args
+	}
+	// Files first, mirroring appendRuntimeSocketMasks: a future
+	// contributor adding a file path inside one of the tmpfs dirs
+	// would crash bwrap if tmpfs landed first. Today the lists are
+	// disjoint but the ordering is defensive.
+	for _, rel := range homeDirSocketFileRel {
+		path := filepath.Join(home, rel)
+		st, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if st.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+		args = append(args, "--bind", "/dev/null", path)
+	}
+	for _, rel := range homeDirSocketTmpfsRel {
+		path := filepath.Join(home, rel)
+		st, err := os.Stat(path)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		args = append(args, "--tmpfs", path)
+	}
+	return args
+}
+
+// homeDirForMask returns the operator's $HOME for the purpose of
+// building socket-mask paths. Indirected so tests can override without
+// using t.Setenv on a process-global var (which would race with
+// parallel tests). Production calls os.UserHomeDir.
+var homeDirForMask = func() (string, error) {
+	return os.UserHomeDir()
+}
+
 // runtimeSocketDirs lists filesystem-path-reachable AF_UNIX socket
 // DIRECTORIES that survive --unshare-net and (since they live under
 // --ro-bind / /) are connect()-reachable from the sandboxed child.
@@ -345,6 +443,13 @@ func appendRuntimeSocketMasks(args []string) []string {
 // but not connect(2). The appendRuntimeSocketMasks call below closes
 // these vectors. See runtimeSocketDirs / runtimeSocketFiles for the
 // full list and per-entry rationale.
+//
+// Residual close (post joint-review): home-directory credential-agent
+// sockets ($HOME/.gnupg/* — gpg-agent family; $HOME/.docker/run/docker.sock
+// — rootless Docker) also survive --unshare-net for the same connect(2)
+// reason. appendHomeDirSocketMasks below masks the canonical paths.
+// See homeDirSocketTmpfsRel / homeDirSocketFileRel for the scope and
+// the per-entry rationale.
 func sandboxNetArgvCommon(auditDir string) []string {
 	args := []string{
 		"--ro-bind", "/", "/",
@@ -356,6 +461,12 @@ func sandboxNetArgvCommon(auditDir string) []string {
 		"--tmpfs", auditDir,
 	}
 	args = appendRuntimeSocketMasks(args)
+	// Home-directory credential-agent sockets (gap #3 residual close):
+	// --ro-bind / / still exposes $HOME/.gnupg (gpg-agent) and
+	// $HOME/.docker/run/docker.sock (rootless Docker) for connect(2).
+	// Mask the canonical ones; custom AF_UNIX sockets elsewhere in
+	// $HOME remain a residual that requires isolation="full".
+	args = appendHomeDirSocketMasks(args)
 	args = append(args,
 		"--die-with-parent",
 		"--new-session",
