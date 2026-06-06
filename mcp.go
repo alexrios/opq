@@ -107,10 +107,10 @@ const (
 // deliberately NO tool that returns a plaintext secret value — that's the
 // whole point of this CLI. Tools exposed:
 //
-//   list_secrets         — names only.
-//   run_with_secrets     — execute a subprocess with secrets injected as env
-//                          vars; stdout/stderr are redacted before return.
-//   audit_tail           — recent audit-log entries (JSON lines).
+//	list_secrets         — names only.
+//	run_with_secrets     — execute a subprocess with secrets injected as env
+//	                       vars; stdout/stderr are redacted before return.
+//	audit_tail           — recent audit-log entries (JSON lines).
 func newMCPServer() (*mcp.Server, error) {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "opq",
@@ -131,7 +131,7 @@ func newMCPServer() (*mcp.Server, error) {
 			"FILESYSTEM ISOLATION (opt-in): set `isolation=\"full\"` to additionally replace /home and /tmp with empty tmpfs mounts (only minimal /usr, /etc, /lib, /lib64, /bin, /sbin are exposed read-only). Use this when you want defense in depth against the subprocess reading other files on the host.",
 			"SECURITY CAVEATS — read before relying on this tool:",
 			"(1) Even with the network sandbox, the subprocess shares the kernel with the host. Loopback channels, kernel-keyring inheritance, and timing side-channels are NOT blocked.",
-			"(2) The redactor is byte-exact. base64/hex/URL-encoded forms of a secret will NOT be redacted.",
+			"(2) The redactor is byte-exact. Raw, common base64, and common hex forms are redacted; URL percent-encoding, base32, and arbitrary custom encodings are NOT covered.",
 			"(3) The output you receive does not reveal which secrets were resolved or their values; that information is in the operator's audit log only.",
 			"Use this whenever you need a tool to consume an API key, token, or password — but assume the operator is treating any command you run as authorized use of every secret you ask for.",
 		}, " "),
@@ -207,10 +207,10 @@ type runWithSecretsInput struct {
 // SandboxProfile. The default (both unset) is SandboxNet — the AI
 // gets the secret but cannot ship it off-box.
 //
-//   AllowNetwork=true  + Isolation=""|"net" -> SandboxNetAllowed (audit network_allowed)
-//   AllowNetwork=true  + Isolation="full"   -> error (incompatible in v1.1)
-//   AllowNetwork=false + Isolation=""|"net" -> SandboxNet (default)
-//   AllowNetwork=false + Isolation="full"   -> SandboxFull
+//	AllowNetwork=true  + Isolation=""|"net" -> SandboxNetAllowed (audit network_allowed)
+//	AllowNetwork=true  + Isolation="full"   -> error (incompatible in v1.1)
+//	AllowNetwork=false + Isolation=""|"net" -> SandboxNet (default)
+//	AllowNetwork=false + Isolation="full"   -> SandboxFull
 //
 // Note: AllowNetwork=true no longer routes to SandboxNone. A previous
 // version did, which let an AI write the resolved secret to /var/tmp
@@ -331,31 +331,8 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		// H1: validation text is entirely our own literals; safe.
 		return aiUserErr(err.Error()), runWithSecretsOutput{}, nil
 	}
-	if profile != SandboxNone {
-		if err := VerifySandboxAvailable(); err != nil {
-			// H1: may contain bwrap binary path or OS error; sanitize.
-			return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
-		}
-	}
 
-	backend, err := OpenDefaultBackend()
-	if err != nil {
-		// H1: may contain keyring/D-Bus text; sanitize.
-		return aiErr("backend_error"), runWithSecretsOutput{}, nil
-	}
-
-	type resolved struct {
-		envName string
-		buf     *Buffer
-	}
-	var bufs []resolved
-	defer func() {
-		for _, b := range bufs {
-			b.buf.Destroy()
-		}
-	}()
-
-	resolvedSecretNames := make([]string, 0, len(input.Env))
+	envMappings := make([]envMapping, 0, len(input.Env))
 	// Sort env names so the "first failure" is stable across calls. Go's
 	// map iteration is randomized; without the sort the audit log would
 	// show a different first-rejected secret on every invocation, making
@@ -389,6 +366,90 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_secret_name"})
 			return aiUserErr("invalid_secret_name"), runWithSecretsOutput{}, nil
 		}
+		envMappings = append(envMappings, envMapping{envName: envName, secretName: secretName})
+	}
+
+	if err := preflightExecutable(input.Command); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			_ = AppendAudit(AuditEvent{
+				Action:  ActionDenied,
+				Caller:  callerTag(),
+				Message: "exec_not_found",
+			})
+			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		if errors.Is(err, fs.ErrPermission) {
+			_ = AppendAudit(AuditEvent{
+				Action:  ActionDenied,
+				Caller:  callerTag(),
+				Message: "exec_permission_denied",
+			})
+			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		_ = AppendAudit(AuditEvent{
+			Action:  ActionDenied,
+			Caller:  callerTag(),
+			Message: "wrap_command_failed",
+		})
+		return aiErr("wrap_command_failed"), runWithSecretsOutput{}, nil
+	}
+	if profile != SandboxNone {
+		if err := VerifySandboxAvailable(); err != nil {
+			// H1: may contain bwrap binary path or OS error; sanitize.
+			return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
+		}
+	}
+	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
+	if err != nil {
+		// H1: WrapCommand may include sandbox binary paths; sanitize. But
+		// distinguish caller-fixable cases (binary missing / not executable)
+		// from infrastructure problems so the AI can act on its own input.
+		// WrapCommand's exec.LookPath wraps ErrNotFound and ErrPermission;
+		// errors.Is sees through the wrap.
+		if errors.Is(err, exec.ErrNotFound) {
+			_ = AppendAudit(AuditEvent{
+				Action:  ActionDenied,
+				Caller:  callerTag(),
+				Message: "exec_not_found",
+			})
+			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		if errors.Is(err, fs.ErrPermission) {
+			_ = AppendAudit(AuditEvent{
+				Action:  ActionDenied,
+				Caller:  callerTag(),
+				Message: "exec_permission_denied",
+			})
+			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
+		}
+		_ = AppendAudit(AuditEvent{
+			Action:  ActionDenied,
+			Caller:  callerTag(),
+			Message: "wrap_command_failed",
+		})
+		return aiErr("wrap_command_failed"), runWithSecretsOutput{}, nil
+	}
+
+	backend, err := OpenDefaultBackend()
+	if err != nil {
+		// H1: may contain keyring/D-Bus text; sanitize.
+		return aiErr("backend_error"), runWithSecretsOutput{}, nil
+	}
+
+	type resolved struct {
+		envName string
+		buf     *Buffer
+	}
+	var bufs []resolved
+	defer func() {
+		for _, b := range bufs {
+			b.buf.Destroy()
+		}
+	}()
+
+	resolvedSecretNames := make([]string, 0, len(envMappings))
+	for _, m := range envMappings {
+		secretName := m.secretName
 		// resolveSecret enforces TTL/revocation before any value is returned
 		// (read-only: it never mutates the keyring). Expired or revoked secrets
 		// are refused here just like a not-found, so the AI can never inject a
@@ -410,7 +471,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			}
 			return aiErr("backend_error"), runWithSecretsOutput{}, nil
 		}
-		bufs = append(bufs, resolved{envName: envName, buf: buf})
+		bufs = append(bufs, resolved{envName: m.envName, buf: buf})
 		resolvedSecretNames = append(resolvedSecretNames, secretName)
 	}
 
@@ -446,81 +507,6 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
-	if err != nil {
-		// H1: WrapCommand may include sandbox binary paths; sanitize. But
-		// distinguish caller-fixable cases (binary missing / not executable)
-		// from infrastructure problems so the AI can act on its own input.
-		// WrapCommand's exec.LookPath wraps ErrNotFound and ErrPermission;
-		// errors.Is sees through the wrap.
-		//
-		// P1-1 (joint-review 2026-05): every branch here MUST audit before
-		// returning. Without an audit entry, an AI can enumerate
-		// /usr/bin/* path existence and permission state one call at a
-		// time by reading the response taxonomy, leaving zero forensic
-		// trace in the operator's audit log.
-		//
-		// The Message uses bare-token taxonomy (exec_not_found /
-		// exec_permission_denied / wrap_command_failed). The
-		// AI-visibility of these tokens via audit_tail is governed by
-		// filterAuditLineForAI's action-coverage gate, which scopes the
-		// allowlist-based stripper (filterAuditMessageForAI) to
-		// ActionMCPRun and ActionNetworkAllowed only — ActionDenied
-		// entries pass through unchanged. That's intentional: the AI
-		// already learns the same taxonomy from the synchronous
-		// run_with_secrets response, so re-exposing it via audit_tail
-		// adds no new information.
-		//
-		// CRITICAL: filepath.Base(input.Command) is NOT included in the
-		// Message — that would be an AI-controlled-bytes channel into the
-		// operator's log. The basename is still echoed back to the AI
-		// (the AI supplied it), just not into the audit record.
-		// SecretNames mirrors the ActionMCPRun / ActionNetworkAllowed
-		// entries above: at this point every requested secret was
-		// resolved successfully (the failure happened in the sandbox
-		// wrap, after backend.Get), so the operator can see which
-		// secrets were live for the rejected call.
-		//
-		// Branch 3 ("wrap_command_failed") covers the catch-all case
-		// where WrapCommand returns a non-ErrNotFound / non-ErrPermission
-		// error. The most common in-practice trigger today is
-		// exec.LookPath on an ABSOLUTE path that does not exist —
-		// LookPath wraps fs.ENOENT in an *exec.Error that does NOT
-		// satisfy errors.Is(err, exec.ErrNotFound) (that sentinel is
-		// reserved for the "bare name not on PATH" case). Naming the
-		// taxonomy wrap_command_failed rather than sandbox_unavailable
-		// avoids falsely blaming sandbox infrastructure for what is
-		// usually a bad caller-supplied path. The pre-WrapCommand
-		// VerifySandboxAvailable branch at line ~313 keeps the
-		// sandbox_unavailable taxonomy because it actually does mean
-		// the sandbox infrastructure is broken.
-		if errors.Is(err, exec.ErrNotFound) {
-			_ = AppendAudit(AuditEvent{
-				Action:      ActionDenied,
-				Caller:      callerTag(),
-				SecretNames: resolvedSecretNames,
-				Message:     "exec_not_found",
-			})
-			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
-		}
-		if errors.Is(err, fs.ErrPermission) {
-			_ = AppendAudit(AuditEvent{
-				Action:      ActionDenied,
-				Caller:      callerTag(),
-				SecretNames: resolvedSecretNames,
-				Message:     "exec_permission_denied",
-			})
-			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
-		}
-		_ = AppendAudit(AuditEvent{
-			Action:      ActionDenied,
-			Caller:      callerTag(),
-			SecretNames: resolvedSecretNames,
-			Message:     "wrap_command_failed",
-		})
-		return aiErr("wrap_command_failed"), runWithSecretsOutput{}, nil
-	}
-
 	if input.AllowNetwork {
 		// SecretNames mirrors the ActionMCPRun entry below so operators
 		// reviewing the audit log can correlate WHICH secrets were live
@@ -542,7 +528,13 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	cmd.Stdout = stdoutRW
 	cmd.Stderr = stderrRW
 
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	clearEnvStrings(childEnv)
+	childEnv = nil
+	cmd.Env = nil
+	if runErr == nil {
+		runErr = cmd.Wait()
+	}
 	elapsed := time.Since(start)
 	_ = stdoutRW.Flush()
 	_ = stderrRW.Flush()
@@ -916,11 +908,12 @@ func stripSelfAuditTailEntry(filtered []string, nonce string) []string {
 // audit log; only the AI-visible CallToolResult uses the sanitized form.
 //
 // Call context: this helper is reached from handleRunWithSecrets ONLY for
-// process-start failures (cmd.Run errors not matching *exec.ExitError and
-// not timed out). The fallthrough is therefore exec_start_failed, not a
-// generic catch-all. Backend errors and sandbox-unavailable errors are
-// mapped to fixed strings at their own call sites (see "backend_error" and
-// "sandbox_unavailable" literals in this file).
+// process-start failures (cmd.Start errors not matching preflight/sandbox
+// validation and cmd.Wait errors not matching *exec.ExitError or timeout).
+// The fallthrough is therefore exec_start_failed, not a generic catch-all.
+// Backend errors and sandbox-unavailable errors are mapped to fixed strings
+// at their own call sites (see "backend_error" and "sandbox_unavailable"
+// literals in this file).
 //
 // Taxonomy keys (stable interface — do not change without a version bump):
 //
@@ -1092,4 +1085,3 @@ func filterAuditMessageForAI(msg string) string {
 	}
 	return strings.Join(out, " ")
 }
-

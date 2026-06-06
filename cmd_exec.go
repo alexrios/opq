@@ -149,6 +149,23 @@ func (c *ExecCmd) Run() error {
 		return err
 	}
 
+	profile, err := parseSandboxFlag(c.Sandbox)
+	if err != nil {
+		return err
+	}
+	if err := preflightExecutable(c.Command[0]); err != nil {
+		return err
+	}
+	if profile != SandboxNone {
+		if err := VerifySandboxAvailable(); err != nil {
+			return fmt.Errorf("sandbox=%s requested but unavailable: %w", profile, err)
+		}
+	}
+	execCmd, execArgs, err := WrapCommand(profile, c.Command[0], c.Command[1:])
+	if err != nil {
+		return fmt.Errorf("wrap command for sandbox: %w", err)
+	}
+
 	ctx := context.Background()
 	backend, err := OpenDefaultBackend()
 	if err != nil {
@@ -197,22 +214,9 @@ func (c *ExecCmd) Run() error {
 	for _, r := range resolvedSecrets {
 		// We must construct one string per env var. The Go runtime copies
 		// these into the exec's argv-equivalent. Keep the lifetime short:
-		// build, hand to exec.Cmd, then wipe our local copies.
+		// all validation and command wrapping has succeeded, so build, hand
+		// to exec.Cmd, then drop references as soon as Start copies them.
 		childEnv = append(childEnv, r.envName+"="+string(r.buf.Bytes()))
-	}
-
-	profile, err := parseSandboxFlag(c.Sandbox)
-	if err != nil {
-		return err
-	}
-	if profile != SandboxNone {
-		if err := VerifySandboxAvailable(); err != nil {
-			return fmt.Errorf("sandbox=%s requested but unavailable: %w", profile, err)
-		}
-	}
-	execCmd, execArgs, err := WrapCommand(profile, c.Command[0], c.Command[1:])
-	if err != nil {
-		return fmt.Errorf("wrap command for sandbox: %w", err)
 	}
 
 	cmd := exec.CommandContext(ctx, execCmd, execArgs...)
@@ -246,13 +250,19 @@ func (c *ExecCmd) Run() error {
 	defer signal.Stop(sigCh)
 
 	if err := cmd.Start(); err != nil {
+		clearEnvStrings(childEnv)
+		childEnv = nil
+		cmd.Env = nil
 		return fmt.Errorf("start child: %w", err)
 	}
 	// childEnv contains strings holding the secret values. Go strings are
-	// immutable, so we cannot wipe them in place — they persist on the heap
-	// until GC reclaims them. The mlocked source lives in resolvedSecrets
-	// and is Destroyed via defer above; the leak window is the time between
-	// exec.Start (which copies env into the child) and GC of childEnv.
+	// immutable, so we cannot wipe their backing bytes in place. Clear every
+	// reference we control immediately after exec.Start copies the environment
+	// into the child; the mlocked source lives in resolvedSecrets and is
+	// Destroyed via defer above.
+	clearEnvStrings(childEnv)
+	childEnv = nil
+	cmd.Env = nil
 
 	// done lets the signal-forwarding goroutine exit once Wait returns,
 	// instead of leaking blocked on sigCh. fwdDone joins the goroutine before

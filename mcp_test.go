@@ -1538,7 +1538,7 @@ func findAuditDeniedWithMessage(t *testing.T, wantMsg string) (AuditEvent, bool)
 
 // TestHandleRunWithSecrets_AuditsOnExecNotFound (P1-1, joint-review 2026-05)
 // locks the audit-before-return invariant for the exec_not_found branch
-// of handleRunWithSecrets's WrapCommand-failure handler. An AI probing
+// of handleRunWithSecrets's command-preflight handler. An AI probing
 // filesystem path existence one call at a time by reading the response
 // taxonomy ("exec_not_found: <basename>") must leave a forensic trace
 // in the operator's audit log. Previously this branch returned without
@@ -1586,6 +1586,37 @@ func TestHandleRunWithSecrets_AuditsOnExecNotFound(t *testing.T) {
 	}
 	if strings.Contains(ev.Message, ghost) {
 		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
+	}
+}
+
+func TestHandleRunWithSecrets_CommandPreflightBeforeSecretResolution(t *testing.T) {
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	const ghost = "zzz-no-such-bin-before-secret-resolution"
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: ghost,
+		Env:     map[string]string{"API": "some_secret"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError for missing command, got %+v", res)
+	}
+	if text := mcpResultText(res); !strings.Contains(text, "exec_not_found") {
+		t.Fatalf("expected command preflight taxonomy before secret resolution, got %q", text)
+	}
+
+	lines, err := tailAudit(50)
+	if err != nil {
+		t.Fatalf("tailAudit: %v", err)
+	}
+	for _, line := range lines {
+		if strings.Contains(line, `"msg":"not_found"`) || strings.Contains(line, `"msg":"backend_error"`) {
+			t.Fatalf("secret/backend resolution ran before command preflight: %s", line)
+		}
 	}
 }
 
@@ -1669,7 +1700,7 @@ func TestHandleRunWithSecrets_AuditMessageHasNoBasename(t *testing.T) {
 }
 
 // TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath (P1-1)
-// drives the third WrapCommand-failure branch end-to-end. exec.LookPath
+// drives the catch-all command-preflight branch end-to-end. exec.LookPath
 // on an absolute path that does not exist returns an *exec.Error
 // wrapping syscall ENOENT — which does NOT satisfy
 // errors.Is(err, exec.ErrNotFound) (that sentinel is specifically for
