@@ -15,14 +15,10 @@ type Buffer struct {
 	inner *memguard.LockedBuffer
 }
 
-// ErrSecretContainsNUL is returned when a secret value carries a NUL byte
-// (joint-review 2026-05 P3 defense-in-depth). Go's os/exec rejects env
-// entries containing NUL bytes before invoking execve, so any NUL-bearing
-// secret is unusable in the primary opq workflow (`opq exec --env` and
-// MCP run_with_secrets) — every invocation would fail with an unhelpful
-// "exec_start_failed". Rejecting at constructor time turns that confusing
-// runtime failure into a clear error at the point where the secret enters
-// the system (typically `opq set`).
+// ErrSecretContainsNUL is returned when a secret value carries a NUL byte.
+// os/exec rejects env entries with NUL before execve, so a NUL-bearing secret is
+// unusable in every opq workflow; rejecting at the constructor turns an opaque
+// runtime "exec_start_failed" into a clear error at `opq set`.
 var ErrSecretContainsNUL = errors.New("secret value contains NUL byte (not usable as an environment variable; reject at source)")
 
 // NewBufferFromBytes copies src into a locked buffer and wipes src in place.

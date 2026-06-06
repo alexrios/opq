@@ -11,33 +11,21 @@ import (
 	"time"
 )
 
-// metaKeyPrefix namespaces companion metadata items inside the keyring. A
-// valid secret name matches validSecretName ([A-Za-z0-9_.-]{1,128}), which can
-// never contain '/', so a "meta/"-prefixed key cannot collide with any secret
-// the operator is able to store. Metadata rides the same encrypted keyring as
-// the secret it describes (Alex's chosen storage model) — it is co-located,
-// backed up together, and tamper-resistant to the same degree as the secret.
-//
-// Because metadata items share the keyring keyspace with secrets, every code
-// path that enumerates keys for a CALLER (CLI `list`, MCP `list_secrets`) must
-// account for the prefix: the CLI surfaces them as policy status, the MCP tool
-// MUST filter them out (isMetaKey) so the AI never sees the internal scheme.
+// metaKeyPrefix namespaces a secret's companion policy item. A valid secret
+// name can't contain '/', so a "meta/" key never collides with a real secret.
+// Callers enumerating keys must account for it: the CLI shows these as status,
+// but list_secrets MUST filter them (isMetaKey) so the AI never sees the scheme
+// or a revoked tombstone.
 const metaKeyPrefix = "meta/"
 
-// secretMetaVersion is the schema version stamped into every SecretMeta we
-// write. Bumped only on an incompatible JSON-shape change; loadMeta tolerates
-// older versions by virtue of json's permissive field matching.
+// secretMetaVersion stamps each SecretMeta; bump only on an incompatible
+// JSON-shape change.
 const secretMetaVersion = 1
 
 func metaKey(name string) string { return metaKeyPrefix + name }
 
-// isMetaKey reports whether a raw keyring key is a companion metadata item
-// rather than a secret. Used by callers that enumerate keys to keep the two
-// keyspaces separate.
 func isMetaKey(key string) bool { return strings.HasPrefix(key, metaKeyPrefix) }
 
-// secretNameFromMetaKey returns the secret name a metadata key describes, and
-// whether the key was in fact a metadata key.
 func secretNameFromMetaKey(key string) (string, bool) {
 	if !isMetaKey(key) {
 		return "", false
@@ -45,20 +33,16 @@ func secretNameFromMetaKey(key string) (string, bool) {
 	return key[len(metaKeyPrefix):], true
 }
 
-// ErrSecretExpired / ErrSecretRevoked are returned by resolveSecret when a
-// secret's policy metadata forbids returning its value. They are distinct from
-// ErrSecretNotFound so call sites can emit a precise audit taxonomy and a
-// precise caller-facing error.
+// ErrSecretExpired and ErrSecretRevoked are distinct from ErrSecretNotFound so
+// the read paths can report a precise audit taxonomy.
 var (
 	ErrSecretExpired = errors.New("secret has expired")
 	ErrSecretRevoked = errors.New("secret has been revoked")
 )
 
-// SecretMeta is the policy envelope stored in a companion keyring item next to
-// a secret. All times are UTC; a zero time means "unset". The struct is JSON
-// serialized and stored through the ordinary Backend.Set path (wrapped in a
-// Buffer) — it is not itself secret, but living in the encrypted keyring keeps
-// it co-located with and as tamper-resistant as the secret it governs.
+// SecretMeta is a secret's policy, stored as a companion keyring item. Times are
+// UTC; a zero time means unset. It rides the encrypted keyring (not a sidecar)
+// so it is co-located with, and as tamper-resistant as, the secret it governs.
 type SecretMeta struct {
 	V         int       `json:"v"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
@@ -66,24 +50,21 @@ type SecretMeta struct {
 	RevokedAt time.Time `json:"revoked_at,omitempty"`
 }
 
-// IsRevoked reports whether the secret carries a revocation tombstone. Safe on
-// a nil receiver (a secret with no metadata has no policy).
+// IsRevoked reports a revocation tombstone. Nil-safe (no metadata = no policy).
 func (m *SecretMeta) IsRevoked() bool { return m != nil && !m.RevokedAt.IsZero() }
 
-// HasExpiry reports whether the secret has a TTL set at all.
+// HasExpiry reports whether a TTL is set. Nil-safe.
 func (m *SecretMeta) HasExpiry() bool { return m != nil && !m.ExpiresAt.IsZero() }
 
-// IsExpiredAt reports whether the secret's TTL has lapsed as of now. The
-// boundary is inclusive: a secret whose ExpiresAt equals now is expired. Safe
-// on a nil receiver.
+// IsExpiredAt reports whether the TTL has lapsed; the boundary is inclusive
+// (now == ExpiresAt is expired). Nil-safe.
 func (m *SecretMeta) IsExpiredAt(now time.Time) bool {
 	return m.HasExpiry() && !now.Before(m.ExpiresAt)
 }
 
-// loadMeta fetches and parses a secret's companion metadata. Returns
-// (nil, nil) when no metadata item exists — legacy secrets stored before this
-// feature, and any secret the keyring holds without a policy. Callers treat a
-// nil meta as "no policy" (the nil-receiver methods above make that ergonomic).
+// loadMeta returns (nil, nil) when a secret has no companion item — legacy and
+// policy-free secrets alike — so callers treat nil as "no policy" (the nil-safe
+// methods above make that ergonomic).
 func loadMeta(ctx context.Context, backend Backend, name string) (*SecretMeta, error) {
 	buf, err := backend.Get(ctx, metaKey(name))
 	if errors.Is(err, ErrSecretNotFound) {
@@ -100,10 +81,8 @@ func loadMeta(ctx context.Context, backend Backend, name string) (*SecretMeta, e
 	return &m, nil
 }
 
-// storeMeta serializes m and writes it to the companion keyring item. The
-// metadata JSON is routed through the same locked-Buffer path as a secret so
-// it never lingers on the heap; the bytes are not actually secret, but reusing
-// one storage path keeps the code surface small.
+// storeMeta writes m to the companion item. The JSON is not secret, but it
+// reuses the locked-Buffer storage path to avoid a second write path.
 func storeMeta(ctx context.Context, backend Backend, name string, m *SecretMeta) error {
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -117,9 +96,9 @@ func storeMeta(ctx context.Context, backend Backend, name string, m *SecretMeta)
 	return backend.Set(ctx, metaKey(name), buf)
 }
 
-// deleteMeta removes a secret's companion metadata item. A missing item is not
-// an error — deleteMeta is idempotent so the set/delete paths can call it
-// unconditionally to clear any stale policy (including a revoked tombstone).
+// deleteMeta is idempotent (a missing item is not an error) so the set and
+// delete paths can call it unconditionally to clear any prior policy or
+// tombstone.
 func deleteMeta(ctx context.Context, backend Backend, name string) error {
 	err := backend.Delete(ctx, metaKey(name))
 	if errors.Is(err, ErrSecretNotFound) {
@@ -128,26 +107,15 @@ func deleteMeta(ctx context.Context, backend Backend, name string) error {
 	return err
 }
 
-// resolveSecret is the single read path for secret VALUES (cmd_get, cmd_exec,
-// MCP run_with_secrets) so TTL and revocation are enforced uniformly wherever a
-// plaintext value would otherwise be handed out.
-//
-// The check is READ-ONLY: an expired or revoked secret is refused but never
-// mutated here. Destruction is an explicit operator action — `opq revoke` wipes
-// the value eagerly and `opq prune` sweeps lapsed TTLs — keeping the hot read
-// path free of keyring writes (Alex's chosen invariant for the first cut).
-//
-// Order matters: revoked beats expired beats fetch. A revoked secret has had
-// its value wiped already (revoke deletes the secret item and leaves only the
-// tombstone), so checking IsRevoked first means backend.Get is never even
-// attempted and the caller gets the precise ErrSecretRevoked rather than a
-// generic not-found.
+// resolveSecret is the single read path for plaintext secret values, so TTL and
+// revocation are enforced everywhere a value could escape. It never mutates the
+// keyring — expiry only refuses; wiping is left to revoke/prune. Revoked is
+// checked before expired so a deliberately-killed secret reports the precise
+// ErrSecretRevoked.
 func resolveSecret(ctx context.Context, backend Backend, name string, now time.Time) (*Buffer, error) {
-	// Defense in depth: every current caller already runs validSecretName, and
-	// a valid name cannot contain '/', so it can never address the "meta/"
-	// namespace. Re-checking here means a future caller that forgets the guard
-	// still cannot turn resolveSecret into a namespace-confusion primitive — an
-	// invalid name simply cannot exist, so we fail closed as not-found.
+	// Defense in depth: a valid name can't contain '/', so it can't reach the
+	// meta/ namespace. Re-checking here stops a future caller that skips the
+	// guard from turning this into a namespace-confusion primitive.
 	if !validSecretName(name) {
 		return nil, ErrSecretNotFound
 	}
@@ -164,10 +132,9 @@ func resolveSecret(ctx context.Context, backend Backend, name string, now time.T
 	return backend.Get(ctx, name)
 }
 
-// filterVisibleSecretNames drops companion metadata keys from a raw keyring
-// listing, returning only the secret names a caller should see. The MCP
-// list_secrets tool MUST route through this so the internal "meta/" scheme —
-// and any revoked secret's surviving tombstone — never reaches the AI.
+// filterVisibleSecretNames drops companion meta/ keys from a raw listing. The
+// MCP list_secrets tool MUST use it so the AI never sees the scheme or a revoked
+// secret's surviving tombstone.
 func filterVisibleSecretNames(keys []string) []string {
 	out := make([]string, 0, len(keys))
 	for _, k := range keys {
@@ -179,12 +146,9 @@ func filterVisibleSecretNames(keys []string) []string {
 	return out
 }
 
-// sanitizePolicyErr maps a resolveSecret error to a stable, side-channel-free
-// audit token. It extends sanitizeBackendErr with the policy outcomes so the
-// get/exec/MCP read paths emit a precise taxonomy (secret_revoked /
-// secret_expired / not_found / backend_error) without leaking raw error text.
-// The tokens are bare (no '='), so they bypass the AI-visible message
-// allowlist by the same rule as env_blocked / invalid_secret_name.
+// sanitizePolicyErr maps a resolveSecret error to a stable audit token,
+// extending sanitizeBackendErr with the policy outcomes. Tokens are bare (no
+// '=') so they pass the AI-visible message allowlist like the other taxonomy.
 func sanitizePolicyErr(err error) string {
 	switch {
 	case errors.Is(err, ErrSecretRevoked):
@@ -196,11 +160,8 @@ func sanitizePolicyErr(err error) string {
 	}
 }
 
-// parseTTL parses a TTL duration string. It extends Go's time.ParseDuration
-// with day ("d") and week ("w") units — natural for secret lifetimes but
-// unsupported by the stdlib, which stops at hours. A plain Go duration ("24h",
-// "90m", "1h30m") still works. Fractional day/week values are allowed ("0.5d"
-// → 12h). The result must be strictly positive.
+// parseTTL accepts Go durations plus "d"/"w" units, which time.ParseDuration
+// lacks; fractional values are allowed ("0.5d"). Must be strictly positive.
 func parseTTL(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -217,11 +178,10 @@ func parseTTL(s string) (time.Duration, error) {
 			if s[n-1] == 'w' {
 				base = 7 * 24 * time.Hour
 			}
-			// Compute in float64 and bound-check BEFORE the int64 conversion:
-			// time.Duration(huge_float) is implementation-defined and wraps,
-			// which could yield a tiny/negative duration that slips past a
-			// post-conversion <=0 check and makes now.Add(ttl) overflow into the
-			// past. Rejecting NaN/Inf also covers ParseFloat accepting "nan"/"inf".
+			// Bound-check in float64 before the int64 conversion: time.Duration
+			// of an out-of-range float wraps, which could pass a <=0 check and
+			// make now.Add overflow into the past. Also rejects ParseFloat's
+			// nan/inf.
 			ns := num * float64(base)
 			if math.IsNaN(ns) || math.IsInf(ns, 0) || ns <= 0 {
 				return 0, fmt.Errorf("ttl must be positive: %q", s)

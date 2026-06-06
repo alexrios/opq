@@ -17,12 +17,10 @@ import (
 	"golang.org/x/term"
 )
 
-// exitCodeError carries a child process exit code back to main() without
-// calling os.Exit at the deep call site. Calling os.Exit here would skip
-// all pending defers (memguard buffer Destroy, RedactingWriter Destroy,
-// signal.Stop, and the top-level memguard.Purge), leaving secret pages
-// reclaimed-but-not-zeroed on the way out. main() unwraps this error and
-// calls os.Exit AFTER all defers have run.
+// exitCodeError carries a child exit code to main() without calling os.Exit at
+// the deep call site, which would skip the deferred memguard wipes and leave
+// secret pages reclaimed-but-not-zeroed. main() unwraps it and exits after the
+// defers run.
 type exitCodeError struct {
 	code int
 }
@@ -83,11 +81,10 @@ type noRedactGateConfig struct {
 	openConfirmTTY func() (io.Reader, io.Writer, io.Closer, error)
 }
 
-// checkNoRedactGate runs the layered checks before --no-redact disables
-// the RedactingWriter. The bypass it closes: an AI calls MCP run_with_secrets
-// with `opq exec --no-redact --env X=key -- sh -c 'printf %s "$X"'`; the
-// outer MCP RedactingWriter has no secrets registered for the inner exec's
-// argv, so the resolved plaintext flows straight back to the AI.
+// checkNoRedactGate gates --no-redact (which disables the RedactingWriter). The
+// bypass it closes: an AI runs `opq exec --no-redact ...` via run_with_secrets;
+// the outer MCP redactor has no secrets registered for the inner argv, so
+// plaintext would flow straight back. Same TTY+env+retype gate as get --plaintext.
 func checkNoRedactGate(cfg noRedactGateConfig) (userReason, auditReason string, err error) {
 	if !cfg.stdoutIsTTY {
 		return "stdout not a tty", GateReasonStdoutNoTTY, errNoRedactGate
@@ -209,13 +206,9 @@ func (c *ExecCmd) Run() error {
 		})
 	}
 
-	// Build child env: copy parent, drop our internal vars, append secrets.
+	// Build child env after command validation and wrapping have succeeded.
 	childEnv := filterParentEnv(os.Environ())
 	for _, r := range resolvedSecrets {
-		// We must construct one string per env var. The Go runtime copies
-		// these into the exec's argv-equivalent. Keep the lifetime short:
-		// all validation and command wrapping has succeeded, so build, hand
-		// to exec.Cmd, then drop references as soon as Start copies them.
 		childEnv = append(childEnv, r.envName+"="+string(r.buf.Bytes()))
 	}
 
@@ -255,11 +248,7 @@ func (c *ExecCmd) Run() error {
 		cmd.Env = nil
 		return fmt.Errorf("start child: %w", err)
 	}
-	// childEnv contains strings holding the secret values. Go strings are
-	// immutable, so we cannot wipe their backing bytes in place. Clear every
-	// reference we control immediately after exec.Start copies the environment
-	// into the child; the mlocked source lives in resolvedSecrets and is
-	// Destroyed via defer above.
+	// Start has copied the child env; drop our references to those strings.
 	clearEnvStrings(childEnv)
 	childEnv = nil
 	cmd.Env = nil

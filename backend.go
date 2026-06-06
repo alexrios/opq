@@ -117,17 +117,10 @@ func (b *keyringBackend) List(_ context.Context) ([]string, error) {
 	return keys, nil
 }
 
-// sanitizeBackendErr maps any backend error to one of a fixed
-// taxonomy of strings safe to write to the audit log. We deliberately
-// never put raw err.Error() into the audit Message, because:
-//
-//	(a) a buggy or future malicious backend could embed secret bytes
-//	    in its error text, which would then be visible via the
-//	    AI-callable audit_tail MCP tool;
-//	(b) operators parsing audit messages benefit from a stable taxonomy.
-//
-// The wrapped error returned to the caller still carries the full
-// detail — only the audit-log Message goes through this filter.
+// sanitizeBackendErr maps any backend error to a fixed audit-safe taxonomy.
+// Raw err.Error() never enters the audit log: a buggy or hostile backend could
+// embed secret bytes there, and audit Messages are AI-readable via audit_tail.
+// The wrapped error returned to the caller still carries the full detail.
 func sanitizeBackendErr(err error) string {
 	if errors.Is(err, ErrSecretNotFound) {
 		return "not_found"

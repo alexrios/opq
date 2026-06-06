@@ -19,12 +19,10 @@ type GetCmd struct {
 	Plaintext bool   `name:"plaintext" help:"Print the secret value. REQUIRED — refuses to run unless stdout is a TTY AND OPQ_I_AM_HUMAN=1 is set in the environment AND the user confirms on the controlling terminal."`
 }
 
-// envHumanConfirm is the env-var a human must inline-set to prove they (not
-// an AI agent in a PTY) are running 'opq get --plaintext'. The check exists
-// because modern agent runtimes (Claude Code, Cursor, tmux, script(1),
-// expect, pexpect) allocate a PTY, so isatty(stdout) is bypassable — but
-// such runtimes will not by default inherit an inline env override unless
-// the human consciously prepends it on the command line.
+// envHumanConfirm is the env var a human must inline-set to prove they (not an
+// AI agent in a PTY) are running 'opq get --plaintext'. Agent runtimes allocate
+// a PTY, so isatty(stdout) alone is bypassable; they won't inherit an inline
+// override the operator consciously prepends.
 const envHumanConfirm = "OPQ_I_AM_HUMAN"
 
 // confirmInputPrompt is the canonical prompt copy. Exported as a constant
@@ -48,13 +46,10 @@ type getGateConfig struct {
 	openConfirmTTY func() (io.Reader, io.Writer, io.Closer, error)
 }
 
-// checkInteractiveGate runs the layered checks. On success, returns
-// ("", "", nil). On failure, returns a verbose user-facing reason, a
-// stable audit-log taxonomy key, and errInteractiveGate. Splitting
-// the user reason from the audit reason keeps verbose, possibly
-// caller-influenced text (e.g. raw /dev/tty errno strings) out of
-// the AI-readable audit log while still giving the operator at the
-// terminal an actionable message.
+// checkInteractiveGate runs the layered checks: success returns ("","",nil),
+// failure returns a verbose user reason, a stable audit key, and the error. The
+// split keeps caller-influenced text (e.g. /dev/tty errno) out of the
+// AI-readable audit log while still giving the operator an actionable message.
 func checkInteractiveGate(name string, cfg getGateConfig) (userReason, auditReason string, err error) {
 	if !cfg.stdoutIsTTY {
 		return "stdout not a tty", GateReasonStdoutNoTTY, errInteractiveGate

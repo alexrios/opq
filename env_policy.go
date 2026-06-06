@@ -5,38 +5,22 @@ import (
 	"strings"
 )
 
-// secretNameRe constrains the shape of a secret name accepted by either
-// the CLI (--env VAR=secret_name) or the MCP run_with_secrets tool's
-// Env map. The character class matches the shape of identifiers used
-// in keyring labels and audit logs:
-//
-//   - alphanumeric, underscore, dot, dash
-//   - 1..128 chars
-//
-// Names outside this shape are rejected at the call site; the keyring
-// library itself may accept wider character classes, but allowing
-// caller-controlled bytes to flow into the operator-visible audit log
-// (even JSON-escaped) is an avoidable readability and parser-hazard
-// risk. The cap also bounds the audit-log line size.
+// secretNameRe constrains a secret name (CLI --env VAR=name or the MCP Env map)
+// to [A-Za-z0-9_.-]{1,128}. Tighter than the keyring allows, to keep
+// caller-controlled bytes out of the operator-visible audit log and bound line
+// size.
 var secretNameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
-// validSecretName reports whether name is on the accepted shape for a
-// secret-name argument. Returns false for the empty string.
+// validSecretName reports whether name has the accepted shape (false if empty).
 func validSecretName(name string) bool {
 	return secretNameRe.MatchString(name)
 }
 
-// Variables on this list change how the dynamic linker, libc, or common
-// interpreters locate code, libraries, or config. Allowing an AI caller
-// of run_with_secrets (or the operator via --env on the CLI) to set any
-// of these to a secret value would amount to RCE — PATH hijacking,
-// LD_PRELOAD library injection, BASH_ENV startup-file sourcing, etc.
-//
-// Scope: this deny-list applies only to *injected* env vars (the --env
-// flag on `opq exec` and the Env map on the MCP run_with_secrets tool).
-// It deliberately does NOT touch the parent environment of opq itself,
-// which is the operator's own shell and out of opaque's threat model
-// (see filterParentEnv in cmd_exec.go for the parent-env policy).
+// blockedEnv lists env var NAMES that change how the dynamic linker, libc, or
+// interpreters locate code/libs/config — setting any to a secret value would be
+// RCE (PATH hijack, LD_PRELOAD, BASH_ENV, ...). Applies only to INJECTED env
+// (--env, MCP Env); the operator's own parent env is out of scope (see
+// filterParentEnv).
 var blockedEnv = map[string]bool{
 
 	// dynamic linker / libc (Linux) — see also blockedPrefixes (LD_*, DYLD_*).

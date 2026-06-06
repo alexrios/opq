@@ -23,12 +23,9 @@ type SetCmd struct {
 // API tokens and certs; rejects accidental piping of large files.
 const maxSecretSize = 64 * 1024
 
-// Bracketed-paste terminal sequences. Shells (fish, bash w/ readline) put the
-// terminal into bracketed-paste mode, so a paste arrives wrapped in
-// ESC[200~ ... ESC[201~. term.ReadPassword runs the tty in raw mode and does
-// not interpret these, so the markers land verbatim in the read bytes and the
-// value is corrupted. We disable the mode for the duration of the read and
-// strip any markers defensively.
+// Bracketed-paste sequences: shells wrap a paste in ESC[200~ … ESC[201~, and
+// term.ReadPassword's raw mode doesn't strip them, so they'd corrupt the value.
+// We disable the mode during the read and strip any markers defensively.
 const (
 	bracketedPasteDisable = "\x1b[?2004l"
 	bracketedPasteEnable  = "\x1b[?2004h"
@@ -57,14 +54,11 @@ func stripBytesInPlace(b, sep []byte) []byte {
 	return b[:w]
 }
 
-// sanitizePastedSecret cleans bytes read from the hidden TTY prompt: it strips
-// any bracketed-paste markers that survived raw-mode reading, then trims
-// surrounding whitespace (spaces, tabs, CR, LF) that a paste commonly carries
-// when a token is copied from a web page or a `.env` line. All work is in
-// place on raw's backing array; the result is a subslice of raw. Only the
-// interactive path trims — the piped path (NewBufferFromReader) stores exact
-// bytes, so a value that legitimately needs surrounding whitespace can be
-// supplied via stdin.
+// sanitizePastedSecret strips bracketed-paste markers that survived raw-mode
+// reading, then trims surrounding whitespace a paste often carries. Works in
+// place on raw's backing array. Only the interactive path trims; the piped path
+// stores bytes verbatim, so a value needing surrounding whitespace must come via
+// stdin.
 func sanitizePastedSecret(raw []byte) []byte {
 	b := stripBytesInPlace(raw, []byte(bracketedPasteStart))
 	b = stripBytesInPlace(b, []byte(bracketedPasteEnd))
@@ -96,9 +90,8 @@ func (c *SetCmd) Run() error {
 	var value *Buffer
 	stdinFd := int(os.Stdin.Fd())
 	if term.IsTerminal(stdinFd) {
-		// Disable bracketed-paste mode while reading so a paste delivers clean
-		// bytes instead of ESC[200~...ESC[201~-wrapped ones. Only emit when
-		// stderr is the terminal (the prompt also goes there); restore after.
+		// Disable bracketed-paste while reading (only when stderr is the
+		// terminal); restore after.
 		if term.IsTerminal(int(os.Stderr.Fd())) {
 			fmt.Fprint(os.Stderr, bracketedPasteDisable)
 			defer fmt.Fprint(os.Stderr, bracketedPasteEnable)
@@ -114,9 +107,8 @@ func (c *SetCmd) Run() error {
 			memguard.WipeBytes(raw)
 			return errors.New("empty secret value")
 		}
-		// NewBufferFromBytes copies cleaned into the locked buffer and wipes
-		// cleaned (a subslice of raw); WipeBytes(raw) then clears any residue
-		// left by marker stripping / whitespace trimming.
+		// NewBufferFromBytes wipes cleaned (a subslice of raw); WipeBytes(raw)
+		// then clears any residue left by stripping/trimming.
 		value, err = NewBufferFromBytes(cleaned)
 		memguard.WipeBytes(raw)
 		if err != nil {

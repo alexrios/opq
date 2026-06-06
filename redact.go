@@ -23,27 +23,18 @@ type RedactingWriter struct {
 	secrets  []redactSecret
 	maxLen   int
 	holdover []byte
-	// downTrunc is non-nil iff the downstream writer implements
-	// truncatedReporter. Cached at construction to avoid a per-Write type
-	// assertion. Once downTrunc.Truncated() returns true, passThrough flips
-	// permanently and subsequent Writes bypass scan() entirely (P1-1: CPU
-	// DoS short-circuit — without it, a high-volume producer like `yes`
-	// burns the full MCP timeout window scanning bytes the cappedWriter
-	// downstream silently drops).
+	// downTrunc, if set, lets Write short-circuit to pass-through once the
+	// downstream starts dropping bytes — otherwise a high-volume producer
+	// (`yes`) burns the whole timeout scanning bytes the cap will discard.
 	downTrunc   truncatedReporter
 	passThrough bool
 }
 
-// truncatedReporter is the optional contract a downstream io.Writer can
-// implement to signal that it has begun discarding bytes. RedactingWriter
-// checks it once per Write and flips to pass-through forever once true.
-// Keep this interface single-method and side-effect-free.
-//
-// NOTE: the wiring is a one-shot type assertion in NewRedactingWriter. Any
-// interposer between RedactingWriter and the truncating sink (e.g. a metering
-// or logging wrapper) MUST proxy Truncated() — otherwise the P1-1 short-circuit
-// silently disappears with no compile-time warning. Today only mcp.cappedWriter
-// implements it; review this assumption when adding a new wrapper.
+// truncatedReporter is the optional contract a downstream writer implements to
+// signal it has begun discarding bytes. Wired by a one-shot assertion in
+// NewRedactingWriter — any interposer between RedactingWriter and the truncating
+// sink MUST proxy Truncated() or the short-circuit silently disappears. Today
+// only mcp.cappedWriter implements it.
 type truncatedReporter interface {
 	Truncated() bool
 }
@@ -53,50 +44,24 @@ type redactSecret struct {
 	value []byte
 }
 
-// hasTruncationShortCircuit reports whether the downstream's Truncated()
-// short-circuit is wired (i.e. the constructor's one-shot type assertion
-// against truncatedReporter succeeded). Test-only introspection used by
-// the P2-6 regression test to lock the P1-1 pipeline invariant — if a
-// future refactor inserts an interposer between RedactingWriter and the
-// truncating sink that does not proxy Truncated(), this returns false
-// and the regression test fails before production damage. Production
-// code does not use this; it is intentionally lowercase (package-private)
-// so it stays out of the public API surface.
-//
-// NOTE: this checks structural wiring only (downTrunc != nil). It does
-// NOT verify that the downstream's Truncated() actually returns true
-// when bytes are dropped — an interposer that proxies the interface but
-// always returns false would pass this check. That semantic correctness
-// is covered by the companion behavioral test
-// TestRunWithSecretsPipeline_ShortCircuitFiresUnderTruncation, which
-// asserts that passThrough flips after a real truncation event.
+// hasTruncationShortCircuit reports whether the downstream Truncated()
+// short-circuit is wired. Test-only: lets a regression test catch a future
+// interposer that fails to proxy Truncated(). Structural check only (downTrunc
+// != nil); a behavioral test covers that passThrough actually flips.
 func (r *RedactingWriter) hasTruncationShortCircuit() bool {
 	return r.downTrunc != nil
 }
 
-// NewRedactingWriter constructs a writer that redacts the given secrets.
-// The secrets slice is copied; the caller may destroy the source buffers
-// immediately after this returns. Empty secret values are skipped.
-//
-// Each registered secret is expanded into multiple byte sequences so the
-// redactor catches common encodings of the same value (base64 std, base64
-// URL, raw-no-pad variants of both, lower-hex, upper-hex). This closes
-// gap #2 (encoding bypass) for the headline encodings — a subprocess that
-// accidentally emits its API key in any of these forms still produces
-// `[REDACTED:NAME]` instead of the encoded plaintext. Encoded forms map
-// to the same NAME as the raw secret; from the caller's view there is one
-// secret with multiple wire representations. See encodedSecretForms for
-// the full expansion list and rationale.
+// NewRedactingWriter copies the given secrets (the caller may destroy the
+// sources after) and registers each one's encoded forms too (see
+// encodedSecretForms), so an accidental base64/hex emission is still redacted
+// to the same NAME.
 func NewRedactingWriter(w io.Writer, secrets []NamedSecret) *RedactingWriter {
 	rw := &RedactingWriter{w: w}
 	if tr, ok := w.(truncatedReporter); ok {
 		rw.downTrunc = tr
 	}
-	// De-dup: short / low-entropy secrets can produce encoded forms that
-	// collide with the raw value (e.g. raw "abc" lower-hex "616263" cannot
-	// collide, but a base64 form of a tiny secret could coincidentally
-	// equal another encoded form). The map-of-string key is fine here —
-	// we copy out into fresh []byte for each survivor before stashing.
+	// De-dup: a secret's encoded forms can coincide; one entry suffices.
 	seen := make(map[string]bool)
 	for _, s := range secrets {
 		for _, form := range encodedSecretForms(s.Value) {
@@ -115,44 +80,18 @@ func NewRedactingWriter(w io.Writer, secrets []NamedSecret) *RedactingWriter {
 	return rw
 }
 
-// encodingMinRawLen is the minimum raw-secret byte length below which we
-// skip registering encoded forms. Short secrets (< 4 bytes) produce
-// encoded forms short enough to false-positive on innocuous subprocess
-// output (a 2-byte secret has a 4-char hex form like "ab12" that could
-// trivially appear in random text). The raw form is still registered.
-// 4 bytes is a deliberately conservative floor — any secret short enough
-// to fall below it is unlikely to be a real-world credential and the loss
-// of encoded-form coverage is acceptable.
+// encodingMinRawLen is the floor below which encoded forms are skipped: a short
+// secret's hex/base64 (e.g. 4-char hex of 2 bytes) false-positives on innocuous
+// output. The raw form is always registered regardless.
 const encodingMinRawLen = 4
 
-// encodedSecretForms returns the byte sequences the redactor should
-// match for a given raw secret value: the raw bytes, plus base64 (std
-// and URL-safe, padded and unpadded) and hex (lower and upper) forms.
-// Empty values yield nil. Forms shorter than encodingMinRawLen-implied
-// thresholds are filtered upstream by skipping the encoded set entirely
-// for short secrets.
+// encodedSecretForms returns the byte sequences to match for a secret: the raw
+// bytes, plus (for secrets >= encodingMinRawLen) base64 std/URL ±padding and hex
+// lower/upper — the encodings a tool is likely to emit by accident.
 //
-// Forms covered:
-//
-//	raw                      — verbatim bytes (always)
-//	base64 std (padded)      — RFC 4648 §4, `+/` alphabet, `=` padding
-//	base64 std (no padding)  — same alphabet, no `=` (common in JWTs)
-//	base64 URL (padded)      — RFC 4648 §5, `-_` alphabet, `=` padding
-//	base64 URL (no padding)  — same alphabet, no `=` (used in JWTs/JWS)
-//	hex lower                — `0-9a-f` (most CLI tools default to this)
-//	hex upper                — `0-9A-F` (some hex dumpers / Java toHex)
-//
-// Not covered (deliberate):
-//
-//	URL percent-encoding     — multiple flavors (PathEscape, QueryEscape,
-//	                           RFC 3986 unreserved set); for typical API
-//	                           keys the percent-encoded form equals the
-//	                           raw (alphanumeric is reserved-set safe).
-//	JSON-string escaping     — for alphanumeric/most-ASCII secrets the
-//	                           escaped form equals the raw.
-//	rot13 / other ciphers    — too many; out of scope.
-//	entropy-based heuristics — false-positive prone on legitimate
-//	                           hashes/UUIDs/tokens (file header gap #2).
+// Deliberately NOT covered: URL percent-encoding and JSON escaping (both equal
+// the raw for typical alphanumeric keys), arbitrary ciphers (unbounded), and
+// entropy heuristics (false-positive prone on real hashes/UUIDs).
 func encodedSecretForms(raw []byte) [][]byte {
 	if len(raw) == 0 {
 		return nil
@@ -199,11 +138,8 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 		return r.w.Write(p)
 	}
 
-	// P1-1: if the downstream has already started dropping bytes (e.g. the
-	// MCP cappedWriter past its 256 KiB cap), every further byte scanned is
-	// wasted CPU. Flip to pass-through once and drop any retained holdover
-	// — those bytes are already past the cap and will be dropped downstream
-	// regardless.
+	// Once the downstream starts dropping bytes, scanning is wasted CPU — flip
+	// to pass-through and drop the holdover (those bytes are past the cap too).
 	if !r.passThrough && r.downTrunc != nil && r.downTrunc.Truncated() {
 		r.passThrough = true
 		if len(r.holdover) > 0 {
@@ -226,13 +162,9 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 	r.holdover = hold
 	if len(out) > 0 {
 		if _, err := r.w.Write(out); err != nil {
-			// All of p has been consumed: some bytes are now in
-			// r.holdover, others were transformed into out and handed
-			// to r.w. The io.Writer contract requires n to reflect
-			// bytes consumed from p, not bytes accepted downstream;
-			// returning 0 here would invite the caller to retry bytes
-			// we have already taken. Holdover is intentionally kept
-			// so a subsequent successful Write resumes cleanly.
+			// Return len(p): all of p was consumed (some into holdover, some
+			// into out). Reporting fewer would invite a retry of bytes we
+			// already took; the holdover resumes on the next Write.
 			return len(p), err
 		}
 	}
@@ -275,25 +207,14 @@ func (r *RedactingWriter) Destroy() {
 	r.holdover = nil
 }
 
-// scan walks work byte-by-byte. At each position:
-//   - if a registered secret exactly matches starting here, emit
-//     "[REDACTED:NAME]" (longest match wins on tie) and mark the matched
-//     region as covered; every position inside the region is still tested as
-//     a potential secret start so overlapping secrets are also redacted;
-//   - else if the byte is inside a previously matched region, suppress it;
-//   - else if the remaining suffix could be a prefix of any secret (and we
-//     are not in finalize mode), hold it for the next Write;
-//   - else emit one byte and advance.
+// scan walks work byte-by-byte, emitting [REDACTED:NAME] for the longest secret
+// matching at each position and suppressing bytes inside an already-matched
+// region. A tail that could be a secret prefix is held over for the next Write
+// (unless finalize, when no more input is coming).
 //
-// When finalize is true, partial-prefix bytes are emitted verbatim (we know
-// no more input is coming).
-//
-// Overlapping secrets are handled via two cursors:
-//   - i advances by 1 each iteration so every byte position is tested as a
-//     potential secret start.
-//   - emitUpTo tracks the furthest position already covered by a redaction
-//     token; bytes below emitUpTo that do not start a new secret are
-//     suppressed rather than emitted verbatim.
+// Two cursors make overlapping secrets work: i tests every position as a
+// potential start; emitUpTo tracks how far coverage extends so inner bytes are
+// suppressed rather than re-emitted.
 func (r *RedactingWriter) scan(work []byte, finalize bool) (out, holdover []byte) {
 	out = make([]byte, 0, len(work))
 	emitUpTo := 0 // bytes [0, emitUpTo) are already covered by a redaction token

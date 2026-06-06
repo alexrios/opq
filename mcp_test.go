@@ -1536,27 +1536,14 @@ func findAuditDeniedWithMessage(t *testing.T, wantMsg string) (AuditEvent, bool)
 	return AuditEvent{}, false
 }
 
-// TestHandleRunWithSecrets_AuditsOnExecNotFound (P1-1, joint-review 2026-05)
-// locks the audit-before-return invariant for the exec_not_found branch
-// of handleRunWithSecrets's command-preflight handler. An AI probing
-// filesystem path existence one call at a time by reading the response
-// taxonomy ("exec_not_found: <basename>") must leave a forensic trace
-// in the operator's audit log. Previously this branch returned without
-// auditing — joint-review 2026-05 P1.
-//
-// The Message MUST be the bare taxonomy token "exec_not_found" with
-// no AI-supplied bytes (no basename echo) — that would be an
-// AI-controlled-bytes channel into the operator log.
+// TestHandleRunWithSecrets_AuditsOnExecNotFound verifies missing-command
+// responses are audited without caller-controlled bytes in the audit message.
 func TestHandleRunWithSecrets_AuditsOnExecNotFound(t *testing.T) {
 	withAuditTmpDir(t)
 	SetCallerTag("mcp")
 	t.Cleanup(func() { SetCallerTag("cli") })
 
-	// A bare name guaranteed not to be on PATH. exec.LookPath only wraps
-	// exec.ErrNotFound for bare-name lookups — an absolute path that does
-	// not exist returns an os-level fs.ErrNotExist that does NOT satisfy
-	// errors.Is(err, exec.ErrNotFound) (it falls into the wrap_command_failed
-	// catch-all instead, see TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath).
+	// A bare name exercises exec.ErrNotFound rather than absolute-path ENOENT.
 	const ghost = "zzz-no-such-bin-anywhere-for-test-xyz"
 	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
 		Command: ghost,
@@ -1576,11 +1563,7 @@ func TestHandleRunWithSecrets_AuditsOnExecNotFound(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected ActionDenied/mcp audit entry with Message=exec_not_found; none found")
 	}
-	// CRITICAL: the basename ("nonexistent-binary-for-test-only-xyz") must
-	// NOT appear anywhere in the audit Message. If it does, an AI can
-	// inject controlled bytes into the operator-facing audit log via
-	// `Command`. Exact-match on the taxonomy token catches any future
-	// regression that concatenates the basename in.
+	// Audit messages stay taxonomy-only; the response may echo caller input.
 	if ev.Message != "exec_not_found" {
 		t.Errorf("audit Message must be the bare taxonomy token, got %q", ev.Message)
 	}
@@ -1589,6 +1572,8 @@ func TestHandleRunWithSecrets_AuditsOnExecNotFound(t *testing.T) {
 	}
 }
 
+// TestHandleRunWithSecrets_CommandPreflightBeforeSecretResolution verifies
+// command lookup fails before any secret/backend resolution path.
 func TestHandleRunWithSecrets_CommandPreflightBeforeSecretResolution(t *testing.T) {
 	withAuditTmpDir(t)
 	SetCallerTag("mcp")
@@ -1620,10 +1605,8 @@ func TestHandleRunWithSecrets_CommandPreflightBeforeSecretResolution(t *testing.
 	}
 }
 
-// TestHandleRunWithSecrets_AuditsOnExecPermissionDenied (P1-1) locks the
-// audit-before-return invariant for the exec_permission_denied branch.
-// An AI enumerating which paths exist-but-aren't-executable (a common
-// signal for "this host has the binary I want") must leave a trace.
+// TestHandleRunWithSecrets_AuditsOnExecPermissionDenied verifies permission
+// failures are audited without caller-controlled bytes in the audit message.
 func TestHandleRunWithSecrets_AuditsOnExecPermissionDenied(t *testing.T) {
 	withAuditTmpDir(t)
 	SetCallerTag("mcp")
@@ -1663,13 +1646,8 @@ func TestHandleRunWithSecrets_AuditsOnExecPermissionDenied(t *testing.T) {
 	}
 }
 
-// TestHandleRunWithSecrets_AuditMessageHasNoBasename (P1-1) is an
-// explicit guard against any future change that re-introduces the
-// AI-supplied basename into the audit Message. The audit log is
-// operator-facing; injecting attacker-controlled bytes (via the
-// Command field) into that log enables log-poisoning and
-// taxonomy-grep evasion. Locked here so even a well-meaning refactor
-// trips the assertion.
+// TestHandleRunWithSecrets_AuditMessageHasNoBasename keeps command input out
+// of operator-facing audit messages.
 func TestHandleRunWithSecrets_AuditMessageHasNoBasename(t *testing.T) {
 	withAuditTmpDir(t)
 	SetCallerTag("mcp")
@@ -1699,24 +1677,8 @@ func TestHandleRunWithSecrets_AuditMessageHasNoBasename(t *testing.T) {
 	}
 }
 
-// TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath (P1-1)
-// drives the catch-all command-preflight branch end-to-end. exec.LookPath
-// on an absolute path that does not exist returns an *exec.Error
-// wrapping syscall ENOENT — which does NOT satisfy
-// errors.Is(err, exec.ErrNotFound) (that sentinel is specifically for
-// the "bare name not on PATH" case). So the failure flows into the
-// catch-all third branch and must be audited as "wrap_command_failed".
-//
-// The taxonomy is deliberately NOT "sandbox_unavailable" for this
-// branch: an absent absolute path is not an infrastructure failure;
-// the pre-WrapCommand VerifySandboxAvailable branch retains the
-// sandbox_unavailable taxonomy for actual sandbox-broken cases. Naming
-// fix per Kimi gate 2.
-//
-// Recording this behavior also pins the taxonomy: if a future
-// LookPath change starts returning a more specific wrapped error for
-// absolute paths, this test breaks loudly and the maintainer can pick
-// a more accurate Message.
+// TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath verifies absolute
+// missing paths use the wrapper-failure taxonomy, not sandbox_unavailable.
 func TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath(t *testing.T) {
 	withAuditTmpDir(t)
 	SetCallerTag("mcp")

