@@ -318,8 +318,9 @@ func TestExitCodeError(t *testing.T) {
 // --no-redact gate tests (P0-1).
 //
 // The gate sits in ExecCmd.Run() ahead of any keyring access. The tests below
-// drive checkNoRedactGate directly with mocked openConfirmTTY just like
-// cmd_get_test.go does for the --plaintext gate.
+// drive the shared checkRetypeGate directly (with the --no-redact prompt and
+// literal) using a mocked openConfirmTTY, just like cmd_get_test.go does for
+// the --plaintext gate.
 // -----------------------------------------------------------------------------
 
 // fakeNoRedactTTY models the controlling-terminal pair as buffers. Both the
@@ -356,12 +357,12 @@ func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
 func TestCheckNoRedactGate_Allows_HappyPath(t *testing.T) {
 	t.Helper()
 	open, tty := newNoRedactTTYOpener(noRedactConfirmInputLiteral + "\n")
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err != nil {
 		t.Fatalf("expected gate pass, got err=%v userReason=%q auditReason=%q", err, userReason, auditReason)
 	}
@@ -384,12 +385,12 @@ func TestCheckNoRedactGate_Allows_HappyPath(t *testing.T) {
 func TestCheckNoRedactGate_Refuses_StdoutNotTTY(t *testing.T) {
 	t.Helper()
 	open, _ := newNoRedactTTYOpener(noRedactConfirmInputLiteral + "\n")
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    false,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err == nil {
 		t.Fatal("expected gate refusal when stdout is not a TTY")
 	}
@@ -406,12 +407,12 @@ func TestCheckNoRedactGate_Refuses_EnvMissing(t *testing.T) {
 	for _, val := range []string{"", "0", "true", "TRUE", " 1", "1 "} {
 		t.Run("env="+val, func(t *testing.T) {
 			open, _ := newNoRedactTTYOpener(noRedactConfirmInputLiteral + "\n")
-			cfg := noRedactGateConfig{
+			cfg := retypeGateConfig{
 				stdoutIsTTY:    true,
 				envHumanFlag:   val,
 				openConfirmTTY: open,
 			}
-			userReason, auditReason, err := checkNoRedactGate(cfg)
+			userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 			if err == nil {
 				t.Fatalf("expected refusal for env value %q", val)
 			}
@@ -430,12 +431,12 @@ func TestCheckNoRedactGate_Refuses_TTYOpenFailure(t *testing.T) {
 	openFail := func() (io.Reader, io.Writer, io.Closer, error) {
 		return nil, nil, nil, errors.New("no /dev/tty")
 	}
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: openFail,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err == nil {
 		t.Fatal("expected gate refusal when /dev/tty cannot be opened")
 	}
@@ -457,12 +458,12 @@ func TestCheckNoRedactGate_Refuses_TTYWriteFailure(t *testing.T) {
 			fakeCloser{f: func() error { return nil }},
 			nil
 	}
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: openErr,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err == nil {
 		t.Fatal("expected gate refusal on TTY write failure")
 	}
@@ -483,12 +484,12 @@ func TestCheckNoRedactGate_Refuses_TTYReadFailure(t *testing.T) {
 			fakeCloser{f: func() error { return nil }},
 			nil
 	}
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: openErr,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err == nil {
 		t.Fatal("expected gate refusal on TTY read failure")
 	}
@@ -507,12 +508,12 @@ func TestCheckNoRedactGate_Refuses_TTYReadFailure(t *testing.T) {
 // newline ever arrives.
 func TestCheckNoRedactGate_Refuses_EOFWithoutLine(t *testing.T) {
 	open, _ := newNoRedactTTYOpener("") // empty input → immediate EOF
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err == nil {
 		t.Fatal("expected refusal on EOF without confirmation line")
 	}
@@ -541,12 +542,12 @@ func TestCheckNoRedactGate_Refuses_LineMismatch(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			open, _ := newNoRedactTTYOpener(tc.input)
-			cfg := noRedactGateConfig{
+			cfg := retypeGateConfig{
 				stdoutIsTTY:    true,
 				envHumanFlag:   "1",
 				openConfirmTTY: open,
 			}
-			userReason, auditReason, err := checkNoRedactGate(cfg)
+			userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 			if err == nil {
 				t.Fatalf("expected refusal for input %q", tc.input)
 			}
@@ -565,12 +566,12 @@ func TestCheckNoRedactGate_Refuses_LineMismatch(t *testing.T) {
 func TestCheckNoRedactGate_Allows_TrailingCR(t *testing.T) {
 	t.Helper()
 	open, _ := newNoRedactTTYOpener(noRedactConfirmInputLiteral + "\r\n")
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkNoRedactGate(cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err != nil {
 		t.Fatalf("expected gate pass with CRLF, got err=%v userReason=%q auditReason=%q", err, userReason, auditReason)
 	}
@@ -634,14 +635,14 @@ func TestNoRedactGate_AuditMessageFormat(t *testing.T) {
 
 	// Drive the gate to a known failure (stdout not a TTY) and replay the
 	// production AppendAudit call shape from cmd_exec.go.
-	cfg := noRedactGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:  false,
 		envHumanFlag: "1",
 		openConfirmTTY: func() (io.Reader, io.Writer, io.Closer, error) {
 			return &bytes.Buffer{}, &bytes.Buffer{}, fakeCloser{f: func() error { return nil }}, nil
 		},
 	}
-	_, auditReason, err := checkNoRedactGate(cfg)
+	_, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}

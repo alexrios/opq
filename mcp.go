@@ -240,6 +240,34 @@ func clampAuditTailN(requested int) int {
 	return requested
 }
 
+// auditExecResolutionErr maps an exec-resolution failure (from
+// preflightExecutable or WrapCommand, both of which run BEFORE any secret is
+// resolved) to an audited, AI-safe CallToolResult. It writes the operator audit
+// entry with a bare-token taxonomy Message and returns the response. Shared by
+// the two pre-resolution call sites so their taxonomy can't drift.
+//
+// CRITICAL: the AI-supplied basename is NOT placed in the audit Message — that
+// would be an AI-controlled-bytes channel into the operator's log
+// (log-poisoning + grep-evasion). It IS echoed back to the AI in the
+// not_found/permission cases because the AI supplied input.Command itself; the
+// generic fallback carries no caller bytes. The third branch is named
+// wrap_command_failed (not sandbox_unavailable) because its most common trigger
+// is LookPath on a non-existent absolute path, which does not satisfy
+// errors.Is(err, exec.ErrNotFound). See the matching invariant in CLAUDE.md.
+func auditExecResolutionErr(err error, command string) *mcp.CallToolResult {
+	switch {
+	case errors.Is(err, exec.ErrNotFound):
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "exec_not_found"})
+		return aiUserErr("exec_not_found: " + filepath.Base(command))
+	case errors.Is(err, fs.ErrPermission):
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "exec_permission_denied"})
+		return aiUserErr("exec_permission_denied: " + filepath.Base(command))
+	default:
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "wrap_command_failed"})
+		return aiErr("wrap_command_failed")
+	}
+}
+
 func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input runWithSecretsInput) (*mcp.CallToolResult, runWithSecretsOutput, error) {
 	if input.Command == "" {
 		// Our own validation message; safe to return verbatim.
@@ -294,28 +322,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	}
 
 	if err := preflightExecutable(input.Command); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			_ = AppendAudit(AuditEvent{
-				Action:  ActionDenied,
-				Caller:  callerTag(),
-				Message: "exec_not_found",
-			})
-			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
-		}
-		if errors.Is(err, fs.ErrPermission) {
-			_ = AppendAudit(AuditEvent{
-				Action:  ActionDenied,
-				Caller:  callerTag(),
-				Message: "exec_permission_denied",
-			})
-			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
-		}
-		_ = AppendAudit(AuditEvent{
-			Action:  ActionDenied,
-			Caller:  callerTag(),
-			Message: "wrap_command_failed",
-		})
-		return aiErr("wrap_command_failed"), runWithSecretsOutput{}, nil
+		return auditExecResolutionErr(err, input.Command), runWithSecretsOutput{}, nil
 	}
 	if profile != SandboxNone {
 		if err := VerifySandboxAvailable(); err != nil {
@@ -326,28 +333,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
 	if err != nil {
 		// Sanitize wrapper errors while preserving caller-fixable taxonomy.
-		if errors.Is(err, exec.ErrNotFound) {
-			_ = AppendAudit(AuditEvent{
-				Action:  ActionDenied,
-				Caller:  callerTag(),
-				Message: "exec_not_found",
-			})
-			return aiUserErr("exec_not_found: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
-		}
-		if errors.Is(err, fs.ErrPermission) {
-			_ = AppendAudit(AuditEvent{
-				Action:  ActionDenied,
-				Caller:  callerTag(),
-				Message: "exec_permission_denied",
-			})
-			return aiUserErr("exec_permission_denied: " + filepath.Base(input.Command)), runWithSecretsOutput{}, nil
-		}
-		_ = AppendAudit(AuditEvent{
-			Action:  ActionDenied,
-			Caller:  callerTag(),
-			Message: "wrap_command_failed",
-		})
-		return aiErr("wrap_command_failed"), runWithSecretsOutput{}, nil
+		return auditExecResolutionErr(err, input.Command), runWithSecretsOutput{}, nil
 	}
 
 	backend, err := OpenDefaultBackend()

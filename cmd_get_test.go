@@ -35,12 +35,12 @@ func newFakeTTYOpener(input string) (func() (io.Reader, io.Writer, io.Closer, er
 
 func TestCheckInteractiveGate_AllowsHappyPath(t *testing.T) {
 	open, tty := newFakeTTYOpener("api_key\n")
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 	if err != nil {
 		t.Fatalf("expected gate pass, got err=%v userReason=%q auditReason=%q", err, userReason, auditReason)
 	}
@@ -54,12 +54,12 @@ func TestCheckInteractiveGate_AllowsHappyPath(t *testing.T) {
 
 func TestCheckInteractiveGate_RefusesNonTTYStdout(t *testing.T) {
 	open, _ := newFakeTTYOpener("api_key\n")
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    false,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
@@ -73,12 +73,12 @@ func TestCheckInteractiveGate_RefusesNonTTYStdout(t *testing.T) {
 
 func TestCheckInteractiveGate_RefusesMissingEnvVar(t *testing.T) {
 	open, _ := newFakeTTYOpener("api_key\n")
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
@@ -94,12 +94,12 @@ func TestCheckInteractiveGate_RefusesNonOneEnvVar(t *testing.T) {
 	// Common typo / loose values must not satisfy the gate.
 	for _, val := range []string{"true", "yes", "0", "TRUE", " 1"} {
 		open, _ := newFakeTTYOpener("api_key\n")
-		cfg := getGateConfig{
+		cfg := retypeGateConfig{
 			stdoutIsTTY:    true,
 			envHumanFlag:   val,
 			openConfirmTTY: open,
 		}
-		_, _, err := checkInteractiveGate("api_key", cfg)
+		_, _, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 		if err == nil {
 			t.Errorf("expected refusal for env value %q", val)
 		}
@@ -110,12 +110,12 @@ func TestCheckInteractiveGate_RefusesWhenTTYUnavailable(t *testing.T) {
 	openFail := func() (io.Reader, io.Writer, io.Closer, error) {
 		return nil, nil, nil, errors.New("no /dev/tty")
 	}
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: openFail,
 	}
-	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
@@ -129,12 +129,12 @@ func TestCheckInteractiveGate_RefusesWhenTTYUnavailable(t *testing.T) {
 
 func TestCheckInteractiveGate_RefusesOnNameMismatch(t *testing.T) {
 	open, _ := newFakeTTYOpener("wrong_name\n")
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	userReason, auditReason, err := checkInteractiveGate("api_key", cfg)
+	userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 	if err == nil {
 		t.Fatal("expected gate refusal")
 	}
@@ -150,12 +150,12 @@ func TestCheckInteractiveGate_AcceptsCRLF(t *testing.T) {
 	// Windows-style line endings should not break the comparison if the
 	// user pasted a name from a terminal that supplies them.
 	open, _ := newFakeTTYOpener("api_key\r\n")
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	if userReason, auditReason, err := checkInteractiveGate("api_key", cfg); err != nil {
+	if userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate); err != nil {
 		t.Fatalf("expected gate pass with CRLF, got err=%v userReason=%q auditReason=%q", err, userReason, auditReason)
 	}
 }
@@ -167,12 +167,12 @@ func TestCheckInteractiveGate_RefusesOnEOFBeforeNewline(t *testing.T) {
 	// release requires the user to type something non-empty equal to the
 	// name. We test with a real secret name here.
 	open, _ := newFakeTTYOpener("")
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    true,
 		envHumanFlag:   "1",
 		openConfirmTTY: open,
 	}
-	_, _, err := checkInteractiveGate("api_key", cfg)
+	_, _, err := checkRetypeGate(cfg, confirmInputPrompt, "api_key", errInteractiveGate)
 	if err == nil {
 		t.Fatal("expected refusal on empty TTY input")
 	}

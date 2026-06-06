@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -33,62 +29,6 @@ const confirmInputPrompt = "Type the secret name to confirm release: "
 // outer Run() converts it into the user-facing error and audit message.
 var errInteractiveGate = errors.New("interactive release gate")
 
-// getGateConfig holds the dependencies that the gate uses, factored out so
-// tests can drive the logic without touching real TTYs or env vars.
-type getGateConfig struct {
-	stdoutIsTTY  bool
-	envHumanFlag string // value of OPQ_I_AM_HUMAN as read by caller
-	// openConfirmTTY returns a reader/writer pair representing the
-	// controlling terminal (/dev/tty in production), plus a closer the
-	// caller must invoke. If the TTY cannot be opened, err is returned and
-	// the gate fails — humans always have a /dev/tty even when stdin is
-	// redirected; AI runtimes that redirect both ends do not.
-	openConfirmTTY func() (io.Reader, io.Writer, io.Closer, error)
-}
-
-// checkInteractiveGate runs the layered checks: success returns ("","",nil),
-// failure returns a verbose user reason, a stable audit key, and the error. The
-// split keeps caller-influenced text (e.g. /dev/tty errno) out of the
-// AI-readable audit log while still giving the operator an actionable message.
-func checkInteractiveGate(name string, cfg getGateConfig) (userReason, auditReason string, err error) {
-	if !cfg.stdoutIsTTY {
-		return "stdout not a tty", GateReasonStdoutNoTTY, errInteractiveGate
-	}
-	if cfg.envHumanFlag != "1" {
-		return "missing OPQ_I_AM_HUMAN=1", GateReasonEnvMissing, errInteractiveGate
-	}
-	r, w, closer, openErr := cfg.openConfirmTTY()
-	if openErr != nil {
-		return "no controlling tty: " + openErr.Error(), GateReasonNoTTY, errInteractiveGate
-	}
-	defer closer.Close()
-	if _, werr := fmt.Fprintf(w, "%s", confirmInputPrompt); werr != nil {
-		return "tty write: " + werr.Error(), GateReasonTTYWrite, errInteractiveGate
-	}
-	br := bufio.NewReader(r)
-	line, rerr := br.ReadString('\n')
-	if rerr != nil && rerr != io.EOF {
-		return "tty read: " + rerr.Error(), GateReasonTTYRead, errInteractiveGate
-	}
-	got := strings.TrimRight(line, "\r\n")
-	if got != name {
-		return "confirmation mismatch", GateReasonConfirmMismatch, errInteractiveGate
-	}
-	return "", "", nil
-}
-
-// openControllingTTY opens /dev/tty for read/write. It returns an error if
-// the process has no controlling terminal (e.g. detached / daemonized /
-// some CI runners). On systems without /dev/tty (Windows) this will fail —
-// acceptable because opaque's production target is linux.
-func openControllingTTY() (io.Reader, io.Writer, io.Closer, error) {
-	f, err := os.OpenFile("/dev/tty", os.O_RDWR|syscall.O_NOCTTY, 0)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return f, f, f, nil
-}
-
 func (c *GetCmd) Run() error {
 	if !c.Plaintext {
 		return errors.New("refusing to print a secret without --plaintext; use `opq exec` to use the secret without exposing it")
@@ -97,12 +37,12 @@ func (c *GetCmd) Run() error {
 		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
 	}
 
-	cfg := getGateConfig{
+	cfg := retypeGateConfig{
 		stdoutIsTTY:    term.IsTerminal(int(os.Stdout.Fd())),
 		envHumanFlag:   os.Getenv(envHumanConfirm),
 		openConfirmTTY: openControllingTTY,
 	}
-	if userReason, auditReason, err := checkInteractiveGate(c.Name, cfg); err != nil {
+	if userReason, auditReason, err := checkRetypeGate(cfg, confirmInputPrompt, c.Name, errInteractiveGate); err != nil {
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: "get_plaintext_refused:" + auditReason})
 		return fmt.Errorf("refusing to release plaintext secret (%s). "+
 			"This command is gated to human operators: stdout must be a TTY, "+

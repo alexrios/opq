@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -68,49 +66,11 @@ const noRedactConfirmInputLiteral = "no-redact"
 // fail. Run() converts it into the user-facing error and audit message.
 var errNoRedactGate = errors.New("no-redact release gate")
 
-// noRedactGateConfig holds the dependencies that the gate uses, factored
-// out so tests can drive the logic without touching real TTYs or env vars.
-type noRedactGateConfig struct {
-	stdoutIsTTY  bool
-	envHumanFlag string // value of OPQ_I_AM_HUMAN as read by caller
-	// openConfirmTTY returns a reader/writer pair representing the
-	// controlling terminal (/dev/tty in production), plus a closer the
-	// caller must invoke. If the TTY cannot be opened, err is returned and
-	// the gate fails — humans always have a /dev/tty even when stdin is
-	// redirected; AI runtimes that redirect both ends do not.
-	openConfirmTTY func() (io.Reader, io.Writer, io.Closer, error)
-}
-
-// checkNoRedactGate gates --no-redact (which disables the RedactingWriter). The
-// bypass it closes: an AI runs `opq exec --no-redact ...` via run_with_secrets;
-// the outer MCP redactor has no secrets registered for the inner argv, so
-// plaintext would flow straight back. Same TTY+env+retype gate as get --plaintext.
-func checkNoRedactGate(cfg noRedactGateConfig) (userReason, auditReason string, err error) {
-	if !cfg.stdoutIsTTY {
-		return "stdout not a tty", GateReasonStdoutNoTTY, errNoRedactGate
-	}
-	if cfg.envHumanFlag != "1" {
-		return "missing OPQ_I_AM_HUMAN=1", GateReasonEnvMissing, errNoRedactGate
-	}
-	r, w, closer, openErr := cfg.openConfirmTTY()
-	if openErr != nil {
-		return "no controlling tty: " + openErr.Error(), GateReasonNoTTY, errNoRedactGate
-	}
-	defer closer.Close()
-	if _, werr := fmt.Fprintf(w, "%s", noRedactConfirmInputPrompt); werr != nil {
-		return "tty write: " + werr.Error(), GateReasonTTYWrite, errNoRedactGate
-	}
-	br := bufio.NewReader(r)
-	line, rerr := br.ReadString('\n')
-	if rerr != nil && rerr != io.EOF {
-		return "tty read: " + rerr.Error(), GateReasonTTYRead, errNoRedactGate
-	}
-	got := strings.TrimRight(line, "\r\n")
-	if got != noRedactConfirmInputLiteral {
-		return "confirmation mismatch", GateReasonConfirmMismatch, errNoRedactGate
-	}
-	return "", "", nil
-}
+// The --no-redact gate (which disables the RedactingWriter) reuses
+// checkRetypeGate — it is gated identically to `get --plaintext`. The bypass it
+// closes: an AI runs `opq exec --no-redact ...` via run_with_secrets; the outer
+// MCP redactor has no secrets registered for the inner argv, so plaintext would
+// flow straight back.
 
 func (c *ExecCmd) Run() error {
 	// kong's passthrough captures "--" literally as the first positional;
@@ -123,12 +83,12 @@ func (c *ExecCmd) Run() error {
 	}
 
 	if c.NoRedact {
-		cfg := noRedactGateConfig{
+		cfg := retypeGateConfig{
 			stdoutIsTTY:    term.IsTerminal(int(os.Stdout.Fd())),
 			envHumanFlag:   os.Getenv(envHumanConfirm),
 			openConfirmTTY: openControllingTTY,
 		}
-		if userReason, auditReason, err := checkNoRedactGate(cfg); err != nil {
+		if userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate); err != nil {
 			_ = AppendAudit(AuditEvent{
 				Action:  ActionDenied,
 				Caller:  callerTag(),
@@ -216,7 +176,6 @@ func (c *ExecCmd) Run() error {
 	cmd.Env = childEnv
 	cmd.Stdin = os.Stdin
 
-	var stdoutW, stderrW = os.Stdout, os.Stderr
 	var stdoutRW, stderrRW *RedactingWriter
 	if !c.NoRedact {
 		named := make([]NamedSecret, 0, len(resolvedSecrets))
@@ -230,11 +189,9 @@ func (c *ExecCmd) Run() error {
 		// Destroy after subprocess exits — done below.
 		defer stdoutRW.Destroy()
 		defer stderrRW.Destroy()
-		_ = stdoutW // suppress unused if branch differs
-		_ = stderrW
 	} else {
-		cmd.Stdout = stdoutW
-		cmd.Stderr = stderrW
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 	}
 
 	// Forward signals to the child so users can ^C cleanly.
