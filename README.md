@@ -94,13 +94,24 @@ opq audit --tail 10
 
 | Command | Behavior |
 | --- | --- |
-| `opq set <name>` | Read value from stdin (or hidden TTY prompt). Never accepts values on argv. |
-| `opq list` | Print stored secret names. |
-| `opq delete <name>` | Remove a secret. |
+| `opq set <name> [--ttl 24h\|7d\|2w]` | Read value from stdin (or hidden TTY prompt). Never accepts values on argv. `--ttl` sets a time-to-live after which reads are refused; omit for no expiry. |
+| `opq list` | Print stored secret names, annotated with `expires <ts>` / `EXPIRED` / `REVOKED` where a policy applies. |
+| `opq delete <name>` | Remove a secret (and any TTL/revocation record). |
+| `opq revoke <name>` | Wipe a secret's value immediately and leave a revoked tombstone; reads are refused until the name is re-set or deleted. |
+| `opq prune [--dry-run]` | Delete every expired secret (value + policy). `--dry-run` previews without deleting. |
 | `opq get <name> --plaintext` | Print value to stdout. **Refuses** to run unless stdout is a TTY. |
 | `opq exec --env VAR=name [...] -- cmd args` | Run `cmd` with named secrets injected as env vars. Subprocess output is redacted by default. Env-var names are capped at 256 bytes and secret names must match `[A-Za-z0-9_.-]{1,128}`. The `--no-redact` flag disables redaction and is **gated identically to `get --plaintext`** — stdout must be a TTY, `OPQ_I_AM_HUMAN=1` must be set inline on the command, and the operator must retype `no-redact` on the controlling terminal. |
 | `opq audit [--tail N]` | Show audit-log entries. |
 | `opq mcp` | Run as a Model Context Protocol server over stdio. |
+
+## Secret lifetime (TTL & revocation)
+
+Secrets are durable by default. Two mechanisms bound their usable life:
+
+- **TTL** — `opq set NAME --ttl 24h` (also `90m`, `7d`, `2w`) records an expiry. After it lapses, every read path (`get`, `exec`, and the MCP `run_with_secrets` tool) **refuses** to return the value. Expiry is enforced lazily on read and never mutates the keyring, so the plaintext lingers until you sweep it with `opq prune` (or `opq delete`). TTL is access control, not auto-destruction.
+- **Revocation** — `opq revoke NAME` is the "this leaked, kill it now" tool: it wipes the value from the keyring immediately and leaves a *revoked tombstone* so `get` reports the secret as revoked (distinct from never-existed) and `list` shows it as `REVOKED`. Re-running `opq set NAME` clears the tombstone and makes the name usable again; `opq delete NAME` removes the record entirely.
+
+Policy metadata lives in a companion keyring item alongside each secret, so it is encrypted and backed up together with the value. The MCP surface never exposes it: `list_secrets` filters the internal items out, and `run_with_secrets` collapses revoked/expired/missing into a single `not_found` so an AI cannot use the error taxonomy as a state oracle. The precise reason (`secret_revoked` / `secret_expired`) is recorded in the operator's audit log only.
 
 ## MCP server
 

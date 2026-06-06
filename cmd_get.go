@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -120,9 +121,9 @@ func (c *GetCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	val, err := backend.Get(ctx, c.Name)
+	val, err := resolveSecret(ctx, backend, c.Name, time.Now().UTC())
 	if err != nil {
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizeBackendErr(err)})
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizePolicyErr(err)})
 		return err
 	}
 	defer val.Destroy()

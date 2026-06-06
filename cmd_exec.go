@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -167,10 +168,11 @@ func (c *ExecCmd) Run() error {
 	}
 	defer cleanup()
 
+	now := time.Now().UTC()
 	for _, m := range envMappings {
-		buf, err := backend.Get(ctx, m.secretName)
+		buf, err := resolveSecret(ctx, backend, m.secretName, now)
 		if err != nil {
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: m.secretName, Caller: callerTag(), Message: sanitizeBackendErr(err)})
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: m.secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
 			return fmt.Errorf("resolve %s: %w", m.secretName, err)
 		}
 		resolvedSecrets = append(resolvedSecrets, resolved{envName: m.envName, buf: buf})

@@ -181,9 +181,15 @@ func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecret
 		// H1: backend errors may contain keyring/D-Bus text; sanitize.
 		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
+	// backend.List returns the raw keyring keyspace, which includes companion
+	// policy items ("meta/<name>"). Those are an internal scheme — the AI must
+	// never see them, and a revoked secret (whose value is wiped but whose
+	// tombstone item survives) must not reappear as a live name. Filter to
+	// real secret keys only.
+	visible := filterVisibleSecretNames(names)
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(names, "\n")}},
-	}, listSecretsOutput{Names: names}, nil
+		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(visible, "\n")}},
+	}, listSecretsOutput{Names: visible}, nil
 }
 
 // ----- run_with_secrets -----
@@ -383,12 +389,23 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_secret_name"})
 			return aiUserErr("invalid_secret_name"), runWithSecretsOutput{}, nil
 		}
-		buf, err := backend.Get(ctx, secretName)
+		// resolveSecret enforces TTL/revocation before any value is returned
+		// (read-only: it never mutates the keyring). Expired or revoked secrets
+		// are refused here just like a not-found, so the AI can never inject a
+		// lapsed credential and the refusal is audited.
+		buf, err := resolveSecret(ctx, backend, secretName, time.Now().UTC())
 		if err != nil {
-			// Audit with full error detail for the operator; AI sees only taxonomy.
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizeBackendErr(err)})
-			// H1: include secretName (AI supplied it) but not the backend error.
-			if errors.Is(err, ErrSecretNotFound) {
+			// Operator audit keeps the precise taxonomy (secret_revoked /
+			// secret_expired / not_found); the AI gets a single, state-free
+			// token. Collapsing revoked/expired/not_found denies the AI a state
+			// oracle: list_secrets already hides revoked tombstones
+			// (filterVisibleSecretNames), so distinguishing "revoked" or
+			// "expired" from "never existed" here would re-leak exactly the fact
+			// that filter was added to hide. H1: secretName is AI-supplied and
+			// validated, so echoing it back is safe; the backend error is not.
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
+			switch {
+			case errors.Is(err, ErrSecretRevoked), errors.Is(err, ErrSecretExpired), errors.Is(err, ErrSecretNotFound):
 				return aiErr("not_found: " + secretName), runWithSecretsOutput{}, nil
 			}
 			return aiErr("backend_error"), runWithSecretsOutput{}, nil
@@ -988,14 +1005,18 @@ func filterAuditLineForAI(line string) (string, bool) {
 	// `key=value` shape down to a small AI-safe allowlist. The gate
 	// must cover EVERY action whose Message uses that shape; today
 	// those are ActionMCPRun (raw_exit / elapsed_ms / *_truncated /
-	// timed_out) and ActionNetworkAllowed (command / args). Bare-token
+	// timed_out), ActionNetworkAllowed (command / args), and ActionSet
+	// (expires_at). ActionSet is CLI-only today so the M3 caller filter
+	// already drops it before this gate runs; it is listed anyway so the
+	// key=value `expires_at` token would still be stripped if a future MCP
+	// set path ever emitted it under an "mcp" caller. Bare-token
 	// taxonomy actions (ActionDenied with "env_blocked",
 	// "invalid_input", etc.) intentionally bypass this filter because
 	// the allowlist's bare-token rule would drop their entire payload.
 	// audit_tail's "n=<int>" Message is also AI-supplied so leaving it
 	// through is a no-op in security terms.
 	switch ev.Action {
-	case ActionMCPRun, ActionNetworkAllowed:
+	case ActionMCPRun, ActionNetworkAllowed, ActionSet:
 		if ev.Message != "" {
 			ev.Message = filterAuditMessageForAI(ev.Message)
 		}

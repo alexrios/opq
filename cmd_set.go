@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/awnumar/memguard"
 	"golang.org/x/term"
@@ -15,6 +16,7 @@ import (
 
 type SetCmd struct {
 	Name string `arg:"" help:"Secret name (e.g. openai_api_key)."`
+	TTL  string `name:"ttl" help:"Optional time-to-live after which reads are refused (e.g. 24h, 90m, 7d, 2w). Omit for no expiry."`
 }
 
 // maxSecretSize bounds the buffer we read for a single secret. Generous for
@@ -74,6 +76,17 @@ func (c *SetCmd) Run() error {
 		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
 	}
 
+	// Validate the TTL up front so a bad value fails before we prompt for or
+	// store anything.
+	var ttl time.Duration
+	if c.TTL != "" {
+		d, err := parseTTL(c.TTL)
+		if err != nil {
+			return err
+		}
+		ttl = d
+	}
+
 	ctx := context.Background()
 	backend, err := OpenDefaultBackend()
 	if err != nil {
@@ -125,8 +138,45 @@ func (c *SetCmd) Run() error {
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 		return err
 	}
-	_ = AppendAudit(AuditEvent{Action: ActionSet, SecretName: c.Name, Caller: callerTag()})
-	fmt.Fprintf(os.Stderr, "stored %q in %s\n", c.Name, backend.Name())
+
+	// Reconcile policy metadata. A plain secret carries NO companion item; a
+	// TTL'd secret gets one. Either way the prior policy for this name is
+	// cleared — in particular a revoked tombstone — so re-storing a revoked
+	// secret makes it usable again.
+	now := time.Now().UTC()
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = now.Add(ttl)
+		meta := &SecretMeta{V: secretMetaVersion, CreatedAt: now, ExpiresAt: expiresAt}
+		if err := storeMeta(ctx, backend, c.Name, meta); err != nil {
+			// Fail closed: never leave a secret whose requested TTL was not
+			// recorded (it would be usable forever). Roll back the value — and
+			// if the rollback ALSO fails, say so loudly, because a no-TTL value
+			// is now live in the keyring and the operator must remove it.
+			rbErr := backend.Delete(ctx, c.Name)
+			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: "ttl_write_failed"})
+			if rbErr != nil && !errors.Is(rbErr, ErrSecretNotFound) {
+				return fmt.Errorf("set %q: failed to record TTL AND failed to roll back the stored value (%v); the secret is present WITHOUT a TTL — run `opq delete %s`: %w", c.Name, rbErr, c.Name, err)
+			}
+			return fmt.Errorf("set %q: failed to record TTL; secret rolled back: %w", c.Name, err)
+		}
+	} else if err := deleteMeta(ctx, backend, c.Name); err != nil {
+		// The value is stored, but a stale tombstone may survive and wrongly
+		// refuse it as revoked. Surface so the operator can retry.
+		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: "meta_clear_failed"})
+		return fmt.Errorf("set %q: secret stored but prior policy could not be cleared (it may still be refused); retry: %w", c.Name, err)
+	}
+
+	auditMsg := ""
+	if ttl > 0 {
+		auditMsg = "expires_at=" + expiresAt.Format(time.RFC3339)
+	}
+	_ = AppendAudit(AuditEvent{Action: ActionSet, SecretName: c.Name, Caller: callerTag(), Message: auditMsg})
+	fmt.Fprintf(os.Stderr, "stored %q in %s", c.Name, backend.Name())
+	if ttl > 0 {
+		fmt.Fprintf(os.Stderr, " (expires %s)", expiresAt.Format(time.RFC3339))
+	}
+	fmt.Fprintln(os.Stderr)
 	return nil
 }
 
