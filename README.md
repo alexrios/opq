@@ -1,4 +1,4 @@
-# opaque
+# opq
 
 > **Status:** v1.1.5 — Linux only for now; macOS Keychain backend planned for v1.2.
 
@@ -58,12 +58,12 @@ When you let an AI agent run shell commands, the agent shouldn't see your API ke
 - **Loopback channels (`curl http://127.0.0.1:6379`, `redis-cli`, `psql -h 127.0.0.1`).** The MCP network sandbox blocks egress at the namespace boundary, but loopback to co-resident services is NOT blocked. If you run opq on a host with any local service that can forward externally (an HTTP proxy, a database with `COPY TO PROGRAM`, a message queue with a webhook sink), the sandbox is bypassable from inside `run_with_secrets`. Treat loopback as an open egress unless you have audited every listening port.
 - **Process-level resource exhaustion by the AI.** Per-call limits exist (60s default timeout / 600s ceiling, 256 KiB per output stream, 32 env vars per call, 200 audit-tail entries) to bound the blast radius of a single call, but a determined AI calling the tool in a tight loop can still consume keyring/CPU/network. Rate-limiting and per-secret allowlists belong in a deployment-side policy proxy (see below).
 
-For high-risk MCP deployments, the recommended pattern is to front `opq mcp` with a small policy-enforcing wrapper MCP server that allowlists `(command, args pattern, env var set)` tuples per secret, denies anything else, and forwards approved calls to `opq`. The opaque CLI itself deliberately ships as a low-trust building block.
+For high-risk MCP deployments, the recommended pattern is to front `opq mcp` with a small policy-enforcing wrapper MCP server that allowlists `(command, args pattern, env var set)` tuples per secret, denies anything else, and forwards approved calls to `opq`. The opq CLI itself deliberately ships as a low-trust building block.
 
 ## Install
 
 ```
-go install github.com/alexrios/opaque@latest
+go install github.com/alexrios/opq@latest
 ```
 
 The installed binary is named `opq`.
@@ -207,7 +207,7 @@ audit_tail({ n: 3 })
 
 The operator sees which secrets were used and when (full detail via `opq audit`); the AI's own view through `audit_tail` is allowlist-filtered to deny it the exit-code / timing / output-volume oracles. The trailing `\n[opq-pad]\n` + spaces in run outputs (omitted above for brevity) is the output-volume side-channel mitigation — each stream is padded to a fixed bucket so response *length* can't leak secret bytes either.
 
-**Net result:** an agent wielded the secret to do real work and was structurally unable to read it, encode it out, ship it off-box, or hide that it tried. That is the entire point of `opaque`.
+**Net result:** an agent wielded the secret to do real work and was structurally unable to read it, encode it out, ship it off-box, or hide that it tried. That is the entire point of `opq`.
 
 **The MCP sandbox blocks network exfiltration, PID-namespace cross-inspection, session-bus keyring access, container-runtime API access, system-D-Bus access, and the canonical home-directory credential-agent sockets — but it is not a complete jail.** With the default SandboxNet profile active, `curl`, `dig`, `nc`, and any other network-capable binary the AI chooses cannot reach external hosts — egress fails at the kernel namespace boundary, not in the binary. Each subprocess also runs in its own PID namespace with a private `/proc`, so concurrent calls cannot read each other's `/proc/<pid>/environ`. The host filesystem is exposed read-only (`--ro-bind / /`), and `/run/user`, `/tmp`, `/dev/shm`, the audit directory, `/run/dbus`, every detected container-runtime socket path (Docker, containerd, podman, CRI-O, k3s, libvirt, LXD, Incus, Avahi, BuildKit, snapd), and the canonical home-dir credential-agent socket locations (`$HOME/.gnupg`, `$HOME/.docker/run/docker.sock`) are masked with empty tmpfs / `--bind /dev/null` mounts. This closes the v1.1.1 D-Bus exploit, the v1.1.2 P0-1 two-call persistent-write exfil chain, the v1.1.3 P0-1/P1-2 container-runtime and Avahi-mDNS exfil chains, and the v1.1.4 home-dir credential-agent (gpg-agent / rootless-Docker) reach-out. The redactor is the second line of defense against the subprocess *accidentally* echoing the secret on stdout/stderr; as of v1.1.4 it expands each registered secret into base64 (std/URL, padded/raw) and hex (lower/upper) forms so common encoding-emit accidents are still caught, but exotic encodings (URL percent, JSON-escape, rot13, base32, custom ciphers) are NOT covered. Residual risks the default sandbox does NOT cover: custom home-directory Unix sockets outside the masked paths (e.g., `~/.local/share/kwalletd/*.socket` or any AF_UNIX endpoint the operator placed under `$HOME` for a custom service), loopback channels to other services on the host, timing side-channels, kernel-keyring inheritance, and pre-compromise of binaries under `/usr`. Pick `isolation="full"` for complete filesystem isolation when any of those reach an attacker-relevant agent. See the [Threat model](#threat-model) section for the recommended policy-proxy deployment pattern for high-risk environments.
 

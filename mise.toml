@@ -1,8 +1,3 @@
 [tasks.install]
-description = "Build and install the opq binary to OPQ_INSTALL_DIR (default ~/.local/bin)"
-run = '''
-dir="${OPQ_INSTALL_DIR:-$HOME/.local/bin}"
-mkdir -p "$dir"
-go build -o "$dir/opq" .
-echo "installed opq -> $dir/opq"
-'''
+description = "Install the opq binary via go install (override location with GOBIN)"
+run = "go install ."

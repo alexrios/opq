@@ -1,4 +1,4 @@
-module github.com/alexrios/opaque
+module github.com/alexrios/opq
 
 go 1.25.0
 
