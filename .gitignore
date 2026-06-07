@@ -1,5 +1,9 @@
 /opq
 /opaque
+/dist
 *.test
 *.out
 coverage.txt
+
+## AI Stuff
+.claude

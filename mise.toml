@@ -1,3 +1,49 @@
+[tools]
+go = "1.26.3"
+
+[tasks.build]
+description = "Build the opq binary into dist/ (gitignored)"
+dir = "{{config_root}}"
+run = "go build -o dist/opq ."
+
+[tasks.test]
+description = "Run all unit tests (no network or keyring required)"
+dir = "{{config_root}}"
+run = "go test ./..."
+
+[tasks.vet]
+description = "Run go vet"
+dir = "{{config_root}}"
+run = "go vet ./..."
+
+[tasks.tidy]
+description = "Tidy and verify go.mod / go.sum"
+dir = "{{config_root}}"
+run = "go mod tidy && go mod verify"
+
+[tasks.vulncheck]
+description = "Scan for known vulnerabilities (re-run after any dependency bump)"
+dir = "{{config_root}}"
+# Pinned for reproducible scans — bump deliberately, not implicitly via @latest.
+run = "go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./..."
+
+[tasks.check]
+description = "Pre-commit gate: vet + test + build"
+depends = ["vet", "test", "build"]
+
 [tasks.install]
 description = "Install the opq binary via go install (override location with GOBIN)"
 run = "go install ."
+
+[tasks.smoke]
+description = "End-to-end smoke test (REQUIRES an unlocked Secret Service / keyring session)"
+depends = ["build"]
+dir = "{{config_root}}"
+run = '''
+set -eu
+printf 'sk-smoke-test' | dist/opq set smoke_key
+dist/opq exec --env API=smoke_key -- sh -c 'echo leaked: $API'
+dist/opq audit --tail 5
+dist/opq delete smoke_key
+echo "smoke OK"
+'''

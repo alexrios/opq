@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Provisions the exact toolchain pinned in mise.toml ([tools] go),
+      # so CI runs the same Go as `mise install` does locally.
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      # Same gate developers run locally: vet + test + build.
+      - run: mise run check
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      - run: mise run vulncheck
