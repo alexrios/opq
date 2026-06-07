@@ -45,14 +45,10 @@ selection is not a runtime option either; the allowed-backends list is compiled 
 `OpenDefaultBackend`, and adding one means editing `AllowedBackends` (see
 [Adding a Backend](../appendix/backends.md)).
 
-## Build, test, run
+## Building from source
 
-```sh
-go build -o opq .      # or: mise run build  → dist/opq
-go test ./...          # all unit tests (no network, no keyring required)
-go vet ./...
-```
-
-The repo uses [`mise`](https://mise.jdx.dev/) for tasks: `mise run check` is the
-pre-commit gate (vet + test + build), and `mise run docs` builds this book. End-to-end
-smoke testing requires an unlocked Secret Service session.
+Build-from-source steps are in
+[Installation](../getting-started/installation.md#build-from-source). The contributor
+workflow (tests, `go vet`, the [`mise`](https://mise.jdx.dev/) task runner, and building
+this book) lives in the repo's `CLAUDE.md` and the
+[Version History](../appendix/version-history.md#re-verifying) appendix.

@@ -1,5 +1,8 @@
 # TTL & Revocation Internals
 
+> Implementation internals. For day-to-day usage start with the
+> [TTL & Revocation tutorial](../tutorials/ttl-and-revocation.md).
+
 The operator-facing behavior is in the
 [TTL & Revocation tutorial](../tutorials/ttl-and-revocation.md). This page covers how it
 works underneath: the single read path, the storage layout, and the invariants that keep

@@ -5,8 +5,16 @@ trying, and failing, to read a secret it is allowed to use.
 
 ## 1. Register the MCP server
 
-Add `opq` to the client's MCP server configuration. For Claude Code that is the
-`mcpServers` block:
+Add `opq` to your MCP client's server configuration. In Claude Code the quickest way is
+the CLI:
+
+```sh
+claude mcp add opq -- opq mcp
+```
+
+That writes an entry equivalent to this `mcpServers` block, which is the format other
+MCP clients accept directly (Claude Code stores it in `~/.claude.json`; a project can
+also commit it to `.mcp.json`):
 
 ```jsonc
 {
@@ -21,8 +29,9 @@ Add `opq` to the client's MCP server configuration. For Claude Code that is the
 
 `opq mcp` speaks the Model Context Protocol over stdio. At startup it runs a bubblewrap
 namespace probe (see
-[Installation](../getting-started/installation.md#the-bubblewrap-startup-probe)) and
-stops if the sandbox cannot be built.
+[Installation](../getting-started/installation.md#troubleshooting-the-bubblewrap-startup-probe)) and
+stops if the sandbox cannot be built. Confirm the server registered with `claude mcp
+list` (or `/mcp` inside Claude Code); `opq` should show as connected.
 
 ## 2. The three tools
 
@@ -44,19 +53,31 @@ From your own shell, not the agent:
 printf 'sk-prod-XXXX' | opq set api_token
 ```
 
-An agent call like this then works without the agent touching the value:
+The agent can now use `api_token` without ever touching the value. The subprocess is
+network-blocked by default, so start with a local command that works under the default
+sandbox:
+
+```jsonc
+run_with_secrets({
+  command: "sh",
+  args: ["-c", "echo \"token length: $(printf %s \"$TOK\" | wc -c)\""],
+  env: { TOK: "api_token" }
+})
+```
+
+To reach an external service, the agent opts into the network explicitly with
+`allow_network: true` (recorded in the audit log as `network_allowed`):
 
 ```jsonc
 run_with_secrets({
   command: "sh",
   args: ["-c", "curl -s -H \"Authorization: Bearer $TOK\" https://api.example.com/me"],
-  env: { TOK: "api_token" }
+  env: { TOK: "api_token" },
+  allow_network: true
 })
 ```
 
-The subprocess runs network-blocked by default, so a `curl` to an external host fails
-unless the agent passes `allow_network: true` (recorded in the audit log as
-`network_allowed`). See [Sandbox & Hardening](./sandbox-and-hardening.md).
+See [Sandbox & Hardening](./sandbox-and-hardening.md).
 
 ## Trying to extract the secret
 

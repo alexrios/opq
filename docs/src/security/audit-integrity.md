@@ -1,5 +1,9 @@
 # Audit Log Integrity
 
+> Implementation internals. For the user-facing log format see the
+> [Audit Log reference](../reference/audit-log.md); for the concepts, the
+> [Threat Model](./threat-model.md).
+
 The audit log serves two readers with opposite trust levels: the operator (full detail)
 and the AI (a filtered view via the `audit_tail` MCP tool). This page covers how the log
 stays consistent under concurrency and how the AI's view is narrowed so the log itself is

@@ -1,5 +1,10 @@
 # The Sandbox
 
+> Implementation internals. New to opq? Start with the
+> [Threat Model](./threat-model.md) for the concepts, or
+> [Sandbox & Hardening](../tutorials/sandbox-and-hardening.md) for operator-facing
+> controls.
+
 Every subprocess launched through `run_with_secrets` (and `opq exec --sandbox`) runs
 inside a [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) sandbox. The
 argv builder is in `sandbox_linux.go`; the profile enum is in `sandbox.go`.

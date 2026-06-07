@@ -42,7 +42,17 @@ stale_token         EXPIRED
 ## 3. Use a secret in a command
 
 `opq exec` injects one or more named secrets as environment variables and redacts the
-child's output.
+child's output. Everything after `--` is the command and its arguments; the values
+exist only in the child's environment and never reach your shell's argv.
+
+Start local, with no network, to see redaction directly:
+
+```sh
+opq exec --env API=stripe_secret_key -- sh -c 'echo "value is $API"'
+# → value is [REDACTED:API]
+```
+
+The same shape works against a real service:
 
 ```sh
 opq exec --env STRIPE_KEY=stripe_secret_key -- \
@@ -56,16 +66,6 @@ opq exec \
   --env STRIPE_KEY=stripe_secret_key \
   --env OPENAI_KEY=openai_key \
   -- ./my-script.sh
-```
-
-Everything after `--` is the command and its arguments. The values exist only in the
-child's environment; they never reach your shell's argv.
-
-To see redaction directly:
-
-```sh
-opq exec --env API=stripe_secret_key -- sh -c 'echo "value is $API"'
-# → value is [REDACTED:API]
 ```
 
 The redactor also catches base64 and hex forms, so a subprocess that pipes the secret

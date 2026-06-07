@@ -1,5 +1,8 @@
 # The Redactor
 
+> Implementation internals. New to opq? Start with the
+> [Threat Model](./threat-model.md) for the concepts.
+
 When a subprocess receives a secret and prints it, `opq` scans the output and replaces
 the value with `[REDACTED:VAR]` before returning it. This catches a subprocess that
 echoes a secret by accident. It does not stop a subprocess that deliberately encodes

@@ -1,44 +1,50 @@
 # Quick Start
 
-Four commands, assuming `opq` is [installed](./installation.md) and your keyring
-session is unlocked.
+Five commands, assuming `opq` is [installed](./installation.md) and your keyring
+session is unlocked. This first run stays local, so it needs no API key and no network.
 
 ```sh
-# 1. Store a secret under the name "openai_key"
-printf 'sk-...' | opq set openai_key
+# 1. Store a secret under the name "demo_key"
+printf 'super-secret-value' | opq set demo_key
 
-# 2. List names
+# 2. List names (values are never printed)
 opq list
 
-# 3. Use it: inject the stored "openai_key" as the env var OPENAI_API_KEY
-opq exec --env OPENAI_API_KEY=openai_key -- \
-  sh -c 'curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"'
+# 3. Use it: inject "demo_key" as $API, then watch the redactor catch it
+opq exec --env API=demo_key -- sh -c 'echo "leaked: $API"'
+# → leaked: [REDACTED:API]
 
 # 4. Review what happened
 opq audit --tail 10
-```
 
-`--env OPENAI_API_KEY=openai_key` maps the environment variable `OPENAI_API_KEY` (what
-the subprocess reads) to the secret stored as `openai_key` (the left side is the env var,
-the right side is the opq name). `set` reads the value from stdin (never argv, so it
-stays out of shell history and `ps` output). `list` prints names only. `exec` resolves
-`openai_key`, injects its value as `OPENAI_API_KEY`, and scans the output; if the value
-(or its base64/hex form) had appeared, it would come back as `[REDACTED:OPENAI_API_KEY]`
-(the token uses the env var name). `audit` shows the `set` and `exec_inject` entries.
-
-## Try the redaction
-
-Ask a subprocess to print the secret and watch it come back redacted:
-
-```sh
-printf 'super-secret-value' | opq set demo_key
-opq exec --env API=demo_key -- sh -c 'echo "leaked: $API"'
-# → leaked: [REDACTED:API]
+# 5. Clean up
 opq delete demo_key
 ```
 
-The subprocess received `super-secret-value` in `$API`; it cannot print it back in the
-clear.
+The subprocess received `super-secret-value` in `$API` and tried to print it; `opq`
+scanned the output and replaced the value with `[REDACTED:API]` before it came back.
+That redaction is the core promise, and it just worked offline.
+
+`set` reads the value from stdin (never argv, so it stays out of shell history and `ps`
+output). `list` prints names only. `exec` resolves `demo_key`, injects its value as
+`API`, and scans the output; the base64 and hex forms of the value are caught too, and
+the `[REDACTED:API]` token uses the env var name. `audit` shows the `set`,
+`exec_inject`, and `delete` entries.
+
+## Use it for real
+
+Swap the demo for a real credential and command. `--env OPENAI_API_KEY=openai_key` maps
+the environment variable `OPENAI_API_KEY` (what the subprocess reads) to the secret
+stored as `openai_key` (left side is the env var, right side is the opq name):
+
+```sh
+printf 'sk-...' | opq set openai_key
+opq exec --env OPENAI_API_KEY=openai_key -- \
+  sh -c 'curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"'
+```
+
+The value exists only in the child's environment; it never reaches your shell's argv,
+and if the response echoed it back it would return as `[REDACTED:OPENAI_API_KEY]`.
 
 ## Next
 

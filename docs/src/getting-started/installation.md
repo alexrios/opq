@@ -19,6 +19,10 @@ go build -o opq .          # or: mise run build  → dist/opq
 
 ## Requirements
 
+On a standard desktop Linux session the requirements below are already met, and `opq`
+works out of the box. They matter mainly for headless servers, containers, WSL, and
+locked-down hosts.
+
 | Requirement | Why | Notes |
 | --- | --- | --- |
 | Linux | v1 ships only the Linux Secret Service backend. | macOS Keychain is planned for v1.2. |
@@ -26,7 +30,10 @@ go build -o opq .          # or: mise run build  → dist/opq
 | bubblewrap (`bwrap`) ≥ 0.5.0 | The MCP subprocess sandbox and `opq exec --sandbox`. | `apt install bubblewrap` / `dnf install bubblewrap` / `pacman -S bubblewrap`. `opq mcp` will not start without it. |
 | Unprivileged user namespaces | bubblewrap needs them to build the sandbox. | Enabled by default on most distros. |
 
-## The bubblewrap startup probe
+## Troubleshooting: the bubblewrap startup probe
+
+Most desktop users never see this section. It applies only when `opq mcp` refuses to
+start on a hardened or headless host.
 
 `opq mcp` runs a no-op namespace probe at startup (`bwrap --unshare-net --unshare-pid
 -- true`). If AppArmor (Ubuntu 23.10+ ships a profile on `bwrap`), seccomp, or a kernel
@@ -50,7 +57,11 @@ which opq          # confirm the right binary is on PATH
 ```
 
 If `opq list` reports a D-Bus or Secret Service error, your keyring session is not
-unlocked. Log into a desktop session or start `gnome-keyring-daemon` / `kwalletd`
-manually.
+unlocked. On a desktop, log into a graphical session so the keyring unlocks
+automatically. On a headless host, container, or WSL there is usually no session keyring
+yet: start one with `gnome-keyring-daemon --unlock` (or wrap the command in
+`dbus-run-session -- opq ...`), or install KeePassXC and enable its Secret Service
+integration. `opq` needs an unlocked libsecret provider and will not fall back to a
+plaintext file.
 
 Next: [Quick Start](./quick-start.md).
