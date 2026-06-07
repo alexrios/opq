@@ -1,5 +1,6 @@
 [tools]
 go = "1.26.3"
+mdbook = "0.5.2"
 
 [tasks.build]
 description = "Build the opq binary into dist/ (gitignored)"
@@ -47,3 +48,13 @@ dist/opq audit --tail 5
 dist/opq delete smoke_key
 echo "smoke OK"
 '''
+
+[tasks.docs]
+description = "Build the mdbook documentation into docs/book (gitignored)"
+dir = "{{config_root}}/docs"
+run = "mdbook build"
+
+[tasks."docs:serve"]
+description = "Serve the docs with live reload at http://localhost:3000"
+dir = "{{config_root}}/docs"
+run = "mdbook serve --open"

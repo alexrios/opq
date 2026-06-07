@@ -1,0 +1,29 @@
+[book]
+title = "opq — the AI-safe secrets CLI"
+authors = ["Alex Rios"]
+description = "Documentation for opq: store secrets in your OS keyring and let programs (and AI agents) use them without ever exposing plaintext."
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/alexrios/opq"
+edit-url-template = "https://github.com/alexrios/opq/edit/main/docs/{path}"
+# Project Pages live at https://alexrios.github.io/opq/ — base path for the 404 page
+# and generated absolute links. Change if the book moves to a custom domain or
+# user/org Pages (then "/").
+site-url = "/opq/"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+
+[output.html.playground]
+runnable = false

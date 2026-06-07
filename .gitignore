@@ -1,6 +1,7 @@
 /opq
 /opaque
 /dist
+/docs/book
 *.test
 *.out
 coverage.txt

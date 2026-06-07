@@ -1,0 +1,48 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mise.toml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# One Pages deployment at a time; never cancel an in-progress deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Provisions the mdbook version pinned in mise.toml ([tools] mdbook),
+      # so CI builds the book with the same mdbook as `mise run docs` locally.
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      - run: mise run docs
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
