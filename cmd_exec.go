@@ -287,32 +287,6 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 	return out, nil
 }
 
-// maxEnvNameBytes caps the length of an injected env-var name. Real POSIX
-// names are short (PATH, HOME, OPENAI_API_KEY, ...); the cap exists to bound
-// the env-table size a single --env / Env-map entry can produce, not to
-// enforce a strict POSIX rule.
-const maxEnvNameBytes = 256
-
-func validEnvName(s string) bool {
-	if s == "" {
-		return false
-	}
-	if len(s) > maxEnvNameBytes {
-		return false
-	}
-	for i, r := range s {
-		switch {
-		case r == '_':
-		case r >= 'A' && r <= 'Z':
-		case r >= 'a' && r <= 'z':
-		case r >= '0' && r <= '9' && i > 0:
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // filterParentEnv drops internal OPQ_* vars from the inherited env so
 // they cannot leak into the subprocess.
 func filterParentEnv(env []string) []string {

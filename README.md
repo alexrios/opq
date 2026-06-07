@@ -247,6 +247,29 @@ Each MCP `audit_tail` invocation also records its own `audit_tail` event (with `
 
 Secret bytes flow through `memguard.LockedBuffer`s — mlocked pages, guard canaries, zeroed on destroy. Both the CLI and MCP execution paths preflight command resolution and sandbox wrapping before creating plaintext `VAR=value` strings for `exec.Cmd.Env`, then clear the env slice references immediately after `exec.Start` copies them into the child. Go strings are immutable, so this cannot erase their backing bytes in place; it narrows the lifetime of the unavoidable environment-string copies. The default build is enough for the threat model above.
 
+## Layout
+
+Every `.go` file lives in the repository root under a single `package main` — there is no `internal/` tree and no sub-packages. That is a deliberate choice, not a thing left undone:
+
+- **The codebase is small** (~4k non-test lines). Package boundaries earn their keep at a scale an order of magnitude larger, or when a second binary or an externally-imported library forces a seam. Neither applies here.
+- **The security guarantees are enforced by tests against unexported internals.** The redactor, the env deny-list, the TTL/revocation resolver, and the AI-visible audit filter are all validated through their package-private functions (`filterAuditMessageForAI`, `resolveSecret`, `encodedSecretForms`, …). Splitting these into packages would force exporting them — widening exactly the API surface this project works to keep closed (the whole point of, e.g., the *absent* `get_secret_value` MCP tool).
+- **A package boundary would not enforce any invariant that matters here.** The invariants are semantic ("no plaintext to a non-TTY", "every value read goes through `resolveSecret`"), not structural; the compiler can't check them across a package line. Keeping each concern in one file with its test beside it makes the contract auditable in one place — a feature for security code.
+
+Readability comes from file-name prefixes instead of directories:
+
+```
+main.go              kong CLI struct + dispatch
+cmd_<name>.go        one kong command per file, each with Run()
+mcp.go               MCP server wiring + the shared security-model header
+mcp_<concern>.go     one MCP tool / concern per file (run, list, audit_tail, output, errors, audit_filter)
+sandbox.go           SandboxProfile enum
+sandbox_<os>.go      per-OS bwrap argv builder (build-tagged)
+backend.go buffer.go redact.go audit.go policy.go env_policy.go gate.go exec_preflight.go
+                     core building blocks, one concept per file
+```
+
+The bar for introducing a package is a concrete forcing function — a second binary, a publishable library boundary, or a single file growing past ~2k lines — not a feeling that a flat directory looks unstructured.
+
 ## Development
 
 ```sh

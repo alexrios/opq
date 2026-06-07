@@ -1,20 +1,8 @@
 package main
 
 import (
-	"regexp"
 	"strings"
 )
-
-// secretNameRe constrains a secret name (CLI --env VAR=name or the MCP Env map)
-// to [A-Za-z0-9_.-]{1,128}. Tighter than the keyring allows, to keep
-// caller-controlled bytes out of the operator-visible audit log and bound line
-// size.
-var secretNameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
-
-// validSecretName reports whether name has the accepted shape (false if empty).
-func validSecretName(name string) bool {
-	return secretNameRe.MatchString(name)
-}
 
 // blockedEnv lists env var NAMES that change how the dynamic linker, libc, or
 // interpreters locate code/libs/config — setting any to a secret value would be
