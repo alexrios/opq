@@ -1,5 +1,5 @@
 [tools]
-go = "1.26.3"
+go = "1.26.4"
 mdbook = "0.5.2"
 
 [tasks.build]
@@ -25,7 +25,7 @@ run = "go mod tidy && go mod verify"
 [tasks.vulncheck]
 description = "Scan for known vulnerabilities (re-run after any dependency bump)"
 dir = "{{config_root}}"
-# Pinned for reproducible scans — bump deliberately, not implicitly via @latest.
+# Pinned for reproducible scans; bump deliberately, not implicitly via @latest.
 run = "go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./..."
 
 [tasks.check]

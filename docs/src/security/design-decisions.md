@@ -72,8 +72,8 @@ Considered and declined for v1; do not re-pitch without new information:
 
 ## Supply-chain posture
 
-`go.mod` pins `toolchain go1.26.3` for the patched stdlib (closes 9 reachable CVEs in
-`crypto/tls`, `crypto/x509`, `net`, `net/url`, `os`). `golang.org/x/crypto` is pinned at
+`go.mod` pins `toolchain go1.26.4` for the patched stdlib (closes 11 reachable CVEs in
+`crypto/tls`, `crypto/x509`, `net`, `net/textproto`, `net/url`, `os`). `golang.org/x/crypto` is pinned at
 `v0.52.0`. Two residual vulns in transitive `dvsekhvalnov/jose2go` (via `99designs/keyring`)
 are confirmed not reachable from opq by `govulncheck`; they wait on the upstream PR rather
 than a local vendor-and-patch. Re-run `mise run vulncheck` after any dependency bump.
