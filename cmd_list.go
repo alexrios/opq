@@ -50,7 +50,7 @@ func (c *ListCmd) Run() error {
 		switch {
 		case err != nil:
 			// Don't render an unreadable/corrupt policy item as a healthy live
-			// secret — that would hide a revoked/expired status from the
+			// secret, which would hide a revoked/expired status from the
 			// operator. resolveSecret still fails closed on the same error.
 			status = "meta-error"
 		case m.IsRevoked():

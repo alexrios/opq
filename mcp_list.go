@@ -1,4 +1,4 @@
-// Package main — the list_secrets MCP tool.
+// Package main: the list_secrets MCP tool.
 //
 // Returns secret NAMES only (never values), and audits before the backend call
 // so probing a degraded keyring still leaves a trace. Companion "meta/" keys

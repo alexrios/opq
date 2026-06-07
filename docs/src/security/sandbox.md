@@ -15,7 +15,7 @@ against earlier versions; the hardening history is in the
 | `SandboxNet` | `"net"` (default) | `--unshare-net` | `--ro-bind / /` + masks |
 | `SandboxNetAllowed` | `"net"` + `allow_network:true` | (no `--unshare-net`) | identical to `SandboxNet` |
 | `SandboxFull` | `"full"` | `--unshare-all` | tmpfs `/home` + `/tmp`; minimal ro-binds |
-| `SandboxNone` | — | none | none (CLI default when `--sandbox` is not given) |
+| `SandboxNone` | (n/a) | none | none (CLI default when `--sandbox` is not given) |
 
 `resolveMCPSandbox(allow_network=true)` routes to `SandboxNetAllowed`, not `SandboxNone`:
 lifting the network block must never also drop the filesystem masks. The shared posture

@@ -11,8 +11,8 @@ import (
 )
 
 // Backend abstracts a secrets store. v1 ships one implementation
-// (Secret Service via 99designs/keyring); future backends — macOS Keychain,
-// Proton Pass — implement this same interface.
+// (Secret Service via 99designs/keyring); future backends (macOS Keychain,
+// Proton Pass) implement this same interface.
 type Backend interface {
 	Name() string
 	Get(ctx context.Context, name string) (*Buffer, error)

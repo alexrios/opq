@@ -1,4 +1,4 @@
-// Package main — AI-visible audit-log filtering.
+// Package main: AI-visible audit-log filtering.
 //
 // audit_tail returns operator audit entries to the AI, so each line is passed
 // through filterAuditLineForAI (caller filter + message allowlist) before it
@@ -43,7 +43,7 @@ func filterAuditLineForAI(line string) (string, bool) {
 	// (expires_at). ActionSet is CLI-only today and dropped by the caller
 	// filter above, but is listed so a future MCP set path can't leak it.
 	// Bare-token actions (ActionDenied: env_blocked, ...) deliberately bypass
-	// the gate — the allowlist would drop their whole payload.
+	// the gate; the allowlist would drop their whole payload.
 	switch ev.Action {
 	case ActionMCPRun, ActionNetworkAllowed, ActionSet:
 		if ev.Message != "" {
@@ -62,23 +62,23 @@ func filterAuditLineForAI(line string) (string, bool) {
 // aiAuditMessageAllowlist is the closed set of `key=value` tokens that may
 // appear in an AI-visible audit-log Message. Every other token is dropped.
 // Bare (no '=') tokens are also dropped. Adding a key here is a deliberate
-// audit-channel widening — every entry below has been reviewed for AI-leak
+// audit-channel widening; every entry below has been reviewed for AI-leak
 // implications.
 //
-//	timed_out — 1-bit oracle, already exposed in the run_with_secrets
-//	            result (TimedOut), so allowlisting it in the audit stream
-//	            does not enlarge the AI's information surface.
+//	timed_out: 1-bit oracle, already exposed in the run_with_secrets
+//	           result (TimedOut), so allowlisting it in the audit stream
+//	           does not enlarge the AI's information surface.
 //
 // Explicitly NOT on the list (and therefore stripped):
 //
-//	raw_exit          — 8-bit exit-code oracle; normalizeExit withholds it.
-//	elapsed_ms        — wall-clock timing oracle; never exposed in the
-//	                    run_with_secrets result, must not leak via audit.
-//	stdout_truncated  — output-volume oracle; removed from the response
-//	                    struct (see gap #3 in the mcp.go header). The AI
-//	                    must not be able to recover the flag via audit_tail.
-//	stderr_truncated  — same.
-//	exec_*            — operator-facing diagnostic detail; not for AI.
+//	raw_exit          8-bit exit-code oracle; normalizeExit withholds it.
+//	elapsed_ms        wall-clock timing oracle; never exposed in the
+//	                  run_with_secrets result, must not leak via audit.
+//	stdout_truncated  output-volume oracle; removed from the response
+//	                  struct (see gap #3 in the mcp.go header). The AI
+//	                  must not be able to recover the flag via audit_tail.
+//	stderr_truncated  same.
+//	exec_*            operator-facing diagnostic detail; not for AI.
 //
 // Future contributors: do NOT add a key here without writing a one-line
 // justification of why the AI seeing it does not enable a side-channel.
@@ -88,7 +88,7 @@ var aiAuditMessageAllowlist = map[string]bool{
 
 // filterAuditMessageForAI rebuilds an audit Message containing only tokens
 // whose key is on the aiAuditMessageAllowlist. The empty string is returned
-// if no tokens survive — that is a valid audit-line state (the `msg` field
+// if no tokens survive; that is a valid audit-line state (the `msg` field
 // is `omitempty` JSON).
 //
 // Invariant: every allowlisted token's value MUST NOT contain a literal

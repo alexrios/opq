@@ -1,4 +1,4 @@
-// Package main — AI-facing error helpers for the MCP surface.
+// Package main: AI-facing error helpers for the MCP surface.
 //
 // Two return shapes guard the AI boundary: aiErr for anything that may carry
 // backend/system bytes (sanitized to a fixed taxonomy) and aiUserErr for text
@@ -21,12 +21,12 @@ import (
 // Call context: handleRunWithSecrets uses this only for process-start
 // failures. Backend and sandbox errors are mapped at their own call sites.
 //
-// Taxonomy keys (stable interface — do not change without a version bump):
+// Taxonomy keys (stable interface, do not change without a version bump):
 //
-//	not_found                 — named secret does not exist
-//	exec_not_found            — command binary not found on PATH
-//	exec_permission_denied    — binary exists but not executable
-//	exec_start_failed         — other process-start failure (fallback)
+//	not_found                 named secret does not exist
+//	exec_not_found            command binary not found on PATH
+//	exec_permission_denied    binary exists but not executable
+//	exec_start_failed         other process-start failure (fallback)
 func sanitizeErrForAI(err error) string {
 	if err == nil {
 		return ""
@@ -57,7 +57,7 @@ func aiErr(sanitized string) *mcp.CallToolResult {
 
 // aiUserErr returns an IsError CallToolResult with caller-controlled text
 // (e.g. input-validation messages). Use this ONLY for errors whose text is
-// composed entirely of literals or values the AI itself supplied — never for
+// composed entirely of literals or values the AI itself supplied; never for
 // errors that may carry backend or system bytes.
 func aiUserErr(msg string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{

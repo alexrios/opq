@@ -209,7 +209,7 @@ func TestResolveSecret_NotYetExpiredReturnsValue(t *testing.T) {
 func TestResolveSecret_RevokedRefused(t *testing.T) {
 	b := newMemBackend()
 	ctx := context.Background()
-	// Revoke wipes the value but leaves the tombstone — model that exactly.
+	// Revoke wipes the value but leaves the tombstone; model that exactly.
 	if err := storeMeta(ctx, b, "k", &SecretMeta{V: 1, RevokedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}

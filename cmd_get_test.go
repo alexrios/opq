@@ -163,7 +163,7 @@ func TestCheckInteractiveGate_AcceptsCRLF(t *testing.T) {
 func TestCheckInteractiveGate_RefusesOnEOFBeforeNewline(t *testing.T) {
 	// Empty TTY input (e.g. user hits Ctrl-D immediately) must not be
 	// silently treated as a matching empty string when c.Name is empty
-	// either — the gate should still refuse because an actual confirmed
+	// either; the gate should still refuse because an actual confirmed
 	// release requires the user to type something non-empty equal to the
 	// name. We test with a real secret name here.
 	open, _ := newFakeTTYOpener("")

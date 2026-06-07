@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// TestSandboxNet_TmpfsMasksContainerRuntimes (P0-1 / P1-2) — the SandboxNet
+// TestSandboxNet_TmpfsMasksContainerRuntimes (P0-1 / P1-2): the SandboxNet
 // argv must mask container-runtime socket directories (Docker, containerd,
 // podman, CRI-O, k3s, LXD, Incus, libvirt, BuildKit, Avahi) and the system
 // D-Bus directory with tmpfs so the AI subprocess cannot connect() to those
@@ -19,7 +19,7 @@ import (
 // these masks an operator-in-docker-group host is trivially exploitable.
 //
 // Existence-gated: the mask is only emitted for paths that exist on the test
-// host. We therefore assert the union — for every entry in runtimeSocketDirs
+// host. We therefore assert the union: for every entry in runtimeSocketDirs
 // that exists on the host, the argv MUST contain a --tmpfs <path> pair after
 // --ro-bind / /. If NONE exist on the host, the test still verifies the argv
 // builder did not regress for the audit-dir / static-tmpfs masks.
@@ -93,7 +93,7 @@ func TestSandboxNet_TmpfsMasksContainerRuntimes(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_BindNullMasksContainerSockets (P0-1) — top-level socket
+// TestSandboxNet_BindNullMasksContainerSockets (P0-1): top-level socket
 // FILES (where tmpfs cannot mount, "Not a directory") must be replaced with
 // /dev/null via --bind. Like the directory masks, only files present on
 // the host are emitted; bwrap's --bind-try does NOT skip on missing
@@ -178,7 +178,7 @@ func TestSandboxNet_BindNullMasksContainerSockets(t *testing.T) {
 // SandboxNetAllowed shares sandboxNetArgvCommon with SandboxNet, so the
 // container-runtime masks must appear there as well. Without this, an AI
 // calling run_with_secrets with allow_network=true could still
-// `curl --unix-socket /var/run/docker.sock` — AF_UNIX is FS-namespaced,
+// `curl --unix-socket /var/run/docker.sock`; AF_UNIX is FS-namespaced,
 // NOT net-namespaced, so omitting --unshare-net does not affect this vector.
 func TestSandboxNetAllowed_InheritsRuntimeSocketMasks(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -224,7 +224,7 @@ func withFakeHome(t *testing.T) string {
 	return dir
 }
 
-// TestSandboxNet_TmpfsMasksHomeDirSockets (gap #3 residual close) — the
+// TestSandboxNet_TmpfsMasksHomeDirSockets (gap #3 residual close): the
 // home-directory credential-agent socket directories listed in
 // homeDirSocketTmpfsRel must be tmpfs-masked when they exist on the
 // (fake) host. The mask is what prevents an AI under default SandboxNet
@@ -272,7 +272,7 @@ func TestSandboxNet_TmpfsMasksHomeDirSockets(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_HomeDirMasksAbsentWhenDirMissing — when the candidate
+// TestSandboxNet_HomeDirMasksAbsentWhenDirMissing: when the candidate
 // home-dir socket dir does NOT exist on the host, no --tmpfs entry for
 // it may appear in the argv. Without existence-gating, bwrap fails with
 // "Can't mkdir <path>" on every run_with_secrets call on hosts where
@@ -304,7 +304,7 @@ func TestSandboxNet_HomeDirMasksAbsentWhenDirMissing(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_BindNullMasksHomeDirSocketFiles — for each entry in
+// TestSandboxNet_BindNullMasksHomeDirSocketFiles: for each entry in
 // homeDirSocketFileRel that exists on the (fake) host AND is a socket,
 // the argv must contain '--bind /dev/null <path>'. The bind replaces
 // the socket with /dev/null which refuses connect(2). We create a real
@@ -372,7 +372,7 @@ func TestSandboxNet_BindNullMasksHomeDirSocketFiles(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_HomeDirRegularFileNotMasked — regression for the
+// TestSandboxNet_HomeDirRegularFileNotMasked: regression for the
 // ModeSocket gate: if the path exists but is a regular file (not a
 // socket), it must NOT be masked. Without this gate, an unusual host
 // state (file with the same name as the expected socket) would crash
@@ -407,12 +407,12 @@ func TestSandboxNet_HomeDirRegularFileNotMasked(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_HomeDirMaskHomeUnsetFallsOpen — when the operator's
+// TestSandboxNet_HomeDirMaskHomeUnsetFallsOpen: when the operator's
 // $HOME cannot be resolved (no $HOME set, /etc/passwd missing), the
 // home-dir masks are skipped silently (fail-open) rather than refusing
 // the whole sandbox. The broader masks (/run/user, /run/dbus, etc.)
 // still apply; the residual is that custom home-dir sockets remain
-// reachable — same posture opq has always had on hosts where $HOME
+// reachable; same posture opq has always had on hosts where $HOME
 // is unset. CLI calls would fail elsewhere (HOME=/tmp injected for
 // the child) so this case is only reachable in adversarial test envs,
 // but the fail-open behavior is the right invariant.

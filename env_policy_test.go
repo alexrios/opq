@@ -236,7 +236,7 @@ func TestIsBlockedEnvName_NewlyAddedRCEFamily(t *testing.T) {
 			// GOFLAGS supports -toolexec=program which replaces every
 			// toolchain binary (compile/link/asm) with an arbitrary exec.
 			// GOPROXY redirects module fetches to an attacker proxy.
-			// GOEXPERIMENT is NOT blocked — it's a closed-set feature toggle,
+			// GOEXPERIMENT is NOT blocked; it's a closed-set feature toggle,
 			// not a code-load or exec path.
 			reason: "GOFLAGS -toolexec= executes arbitrary program; GOPROXY supplies malicious modules",
 		},
@@ -360,7 +360,7 @@ func TestIsBlockedEnvName_NewlyAddedRCEFamily(t *testing.T) {
 			name: "openssl_engine",
 			vars: []string{"OPENSSL_CONF"},
 			// OPENSSL_CONF points to a config file that can load arbitrary
-			// engine .so modules — a well-known RCE vector in OpenSSL.
+			// engine .so modules (a well-known RCE vector in OpenSSL).
 			reason: "OPENSSL_CONF can load arbitrary engine .so modules",
 		},
 		{
@@ -377,7 +377,7 @@ func TestIsBlockedEnvName_NewlyAddedRCEFamily(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, v := range tc.vars {
 				if !isBlockedEnvName(v) {
-					t.Errorf("isBlockedEnvName(%q) = false, want true — reason: %s", v, tc.reason)
+					t.Errorf("isBlockedEnvName(%q) = false, want true; reason: %s", v, tc.reason)
 				}
 			}
 		})
@@ -545,7 +545,7 @@ func TestIsBlockedEnvName_JointReview2026_05_Additions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, v := range tc.vars {
 				if !isBlockedEnvName(v) {
-					t.Errorf("isBlockedEnvName(%q) = false, want true — reason: %s", v, tc.reason)
+					t.Errorf("isBlockedEnvName(%q) = false, want true; reason: %s", v, tc.reason)
 				}
 			}
 		})
@@ -641,7 +641,7 @@ func TestIsBlockedEnvName_GitConfigGlobalSystemViaPrefix(t *testing.T) {
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
 			if !isBlockedEnvName(name) {
-				t.Fatalf("isBlockedEnvName(%q) = false, want true — should be caught by GIT_CONFIG_ prefix in blockedPrefixes", name)
+				t.Fatalf("isBlockedEnvName(%q) = false, want true; should be caught by GIT_CONFIG_ prefix in blockedPrefixes", name)
 			}
 		})
 	}

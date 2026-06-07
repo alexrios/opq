@@ -17,8 +17,8 @@ so a value that straddles a write boundary is still matched.
 
 ## Overlapping secrets
 
-If two stored secrets overlap — `ABC` and `BCD` are both registered and the subprocess
-prints `ABCD` — both are redacted, producing `[REDACTED:S1][REDACTED:S2]`. `scan()`
+If two stored secrets overlap (`ABC` and `BCD` are both registered and the subprocess
+prints `ABCD`), both are redacted, producing `[REDACTED:S1][REDACTED:S2]`. `scan()`
 uses two cursors: `i` advances one byte per iteration so every position is tested as a
 possible secret start, and `emitUpTo` tracks how far the current match extends, so
 bytes inside a match that do not begin a new secret are suppressed rather than emitted.
@@ -47,8 +47,8 @@ limit, and the second produces false positives on hashes, UUIDs, and tokens.
 
 ## Short-circuit on truncation
 
-If the downstream sink reports that it has truncated — it implements
-`truncatedReporter { Truncated() bool }`, currently only the MCP `cappedWriter` —
+If the downstream sink reports that it has truncated (it implements
+`truncatedReporter { Truncated() bool }`, currently only the MCP `cappedWriter`),
 `RedactingWriter` switches to pass-through. Without this, an AI running a high-volume
 producer like `yes` would spend the whole MCP timeout in `scan()` over bytes the 256
 KiB cap discards anyway.

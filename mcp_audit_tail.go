@@ -1,10 +1,10 @@
-// Package main — the audit_tail MCP tool.
+// Package main: the audit_tail MCP tool.
 //
 // Returns recent operator audit entries to the AI, filtered through
 // filterAuditLineForAI. The read is itself audited (with a per-call random
 // nonce) BEFORE it runs, so an AI scraping operator activity is visible in the
 // log; the just-written self-entry is then stripped from the AI's window by
-// nonce match (position-independent — see stripSelfAuditTailEntry).
+// nonce match (position-independent; see stripSelfAuditTailEntry).
 package main
 
 import (
@@ -41,13 +41,13 @@ func clampAuditTailN(requested int) int {
 func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailInput) (*mcp.CallToolResult, auditTailOutput, error) {
 	// Over-fetch from the log so that after the MCP-caller filter is applied
 	// we still return up to n entries. In the worst case all entries are CLI
-	// entries and we return an empty list — that is correct behaviour.
+	// entries and we return an empty list; that is correct behaviour.
 	n := clampAuditTailN(input.N)
 	// Record every audit_tail call BEFORE the read, so an AI scraping operator
 	// activity is itself visible even if the read then fails. A per-call random
 	// nonce tags our self-entry so the strip below finds it regardless of
 	// position (a PID match broke under concurrent writers / PID reuse). If
-	// crypto/rand fails the nonce is empty and the strip no-ops — the AI sees
+	// crypto/rand fails the nonce is empty and the strip no-ops; the AI sees
 	// one bookkeeping row, not a security violation; better than crashing.
 	nonce := generateAuditNonce()
 	_ = AppendAudit(AuditEvent{
@@ -63,7 +63,7 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 
 	// Apply MCP-specific filters (M3 caller filter, C1 raw_exit strip).
 	// The self-log entry we just appended (J-5) is included in `lines` and
-	// passes the filter — strip it so the AI's requested-n window isn't
+	// passes the filter, so strip it so the AI's requested-n window isn't
 	// occupied by its own bookkeeping. The self-log entry's existence
 	// remains visible to the operator via `opq audit` and to subsequent
 	// AI calls (we strip OUR row only, identified by nonce; older
@@ -89,7 +89,7 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 // generateAuditNonce returns 32 hex chars (16 random bytes / 128 bits)
 // suitable for tagging a single audit entry so the writer can identify
 // it among later log lines. Returns the empty string on the (vanishingly
-// rare) event that crypto/rand fails — callers must treat the empty
+// rare) event that crypto/rand fails; callers must treat the empty
 // nonce as "no strip possible" rather than crashing. 128 bits is
 // overkill for the tiny collision domain (a few hundred entries in a
 // tail window) but cheap and removes any need to think about birthday
@@ -110,7 +110,7 @@ func generateAuditNonce() string {
 // Why scan instead of strip-last (joint-review 2026-05 P3):
 // handleAuditTail writes its self-entry BEFORE reading the log, but a
 // concurrent AppendAudit (CLI process, another MCP handler, etc.) can
-// land between our write and our read — our entry may then sit anywhere
+// land between our write and our read, so our entry may then sit anywhere
 // in the filtered window, not just at the end. A position-based strip
 // either misses our entry (leak) or strips the wrong line (incorrect
 // truncation of operator activity). Nonce-based matching is immune to
@@ -119,7 +119,7 @@ func generateAuditNonce() string {
 //
 // Duplicate nonces would indicate a catastrophic RNG failure (128 bits
 // of crypto/rand output colliding). We strip ALL matches rather than
-// stop at the first — a defensive choice that costs nothing in the
+// stop at the first: a defensive choice that costs nothing in the
 // success path (zero duplicates) and avoids surfacing a duplicate-row
 // puzzle to the AI in the failure path. Malformed JSON entries pass
 // through unchanged.

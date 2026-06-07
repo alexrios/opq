@@ -90,7 +90,7 @@ func TestSandboxNet_AllowsHostFS(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_BlocksHostFSWrite (P0-1) — SandboxNet must prevent the AI
+// TestSandboxNet_BlocksHostFSWrite (P0-1): SandboxNet must prevent the AI
 // subprocess from writing to any persistent host path (e.g. /var/tmp).
 // Without this, a two-call exfil chain works: call 1 writes the secret to
 // /var/tmp/.leak, call 2 reads it back with an empty env (no redaction).
@@ -172,13 +172,13 @@ func TestSandboxNone_AllowsNetwork(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_DBusUnreachable (J-1) — the SandboxNet tmpfs masks on
+// TestSandboxNet_DBusUnreachable (J-1): the SandboxNet tmpfs masks on
 // /run/user and /tmp must hide the D-Bus session bus socket and other
 // filesystem-path Unix sockets that --unshare-net does NOT block. On
 // systemd distros /var/run is a symlink to /run, so masking /run/user
 // also masks /var/run/user. We attempt to stat /run/user/$(id -u)/bus
 // from inside the sandbox; either the directory is missing (tmpfs is
-// empty) or the file is absent — either way, the child must not be able
+// empty) or the file is absent; either way, the child must not be able
 // to reach the host's keyring/D-Bus socket. Same check for /tmp.
 func TestSandboxNet_DBusUnreachable(t *testing.T) {
 	if _, err := exec.LookPath("bwrap"); err != nil {
@@ -191,7 +191,7 @@ func TestSandboxNet_DBusUnreachable(t *testing.T) {
 	// One sh invocation, two checks. We test for the .../bus socket and
 	// also for any contents in /tmp. The UID is resolved on the host (not
 	// inside the sandbox via $(id -u)) so the test still functions on
-	// stripped environments where /usr/bin/id is missing — otherwise the
+	// stripped environments where /usr/bin/id is missing; otherwise the
 	// substituted path becomes /run/user//bus and ls fails with ENOENT
 	// regardless of whether the mask is working. The script always exits
 	// 0; the test inspects the combined output.
@@ -206,9 +206,9 @@ func TestSandboxNet_DBusUnreachable(t *testing.T) {
 	// can't be mkdir'd after a tmpfs mask) prints "bwrap: ..." and never
 	// reaches our `---` divider. This is the exact failure mode of the
 	// /var/run/user regression J-1 originally shipped with, so failing
-	// loudly here is the regression guard — do NOT skip.
+	// loudly here is the regression guard; do NOT skip.
 	if strings.HasPrefix(strings.TrimSpace(out), "bwrap:") {
-		t.Fatalf("bwrap setup failed under SandboxNet (likely a J-1 regression — tmpfs mask broke the mount layout): %q", out)
+		t.Fatalf("bwrap setup failed under SandboxNet (likely a J-1 regression, tmpfs mask broke the mount layout): %q", out)
 	}
 	parts := strings.SplitN(out, "---", 2)
 	if len(parts) != 2 {
@@ -232,7 +232,7 @@ func TestSandboxNet_DBusUnreachable(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_AuditLogUnreachable (J-12 regression) — SandboxNet must
+// TestSandboxNet_AuditLogUnreachable (J-12 regression): SandboxNet must
 // tmpfs-mask the audit directory so an AI subprocess under
 // run_with_secrets cannot bypass filterAuditLineForAI /
 // filterAuditMessageForAI by `cat`ing audit.log directly. We set
@@ -274,7 +274,7 @@ func TestSandboxNet_AuditLogUnreachable(t *testing.T) {
 	// in the child. Using the literal path keeps the test focused on the
 	// tmpfs mask, not on env propagation.
 	//
-	// Kimi P0: also exercise /proc/self/root/<auditPath> — a broken PID
+	// Kimi P0: also exercise /proc/self/root/<auditPath>; a broken PID
 	// or mount namespace could leave /proc/self/root pointing to the
 	// pre-mask host view. With --unshare-pid + --proc /proc this should
 	// resolve to the sandboxed FS, so the cat must fail or return empty.
@@ -289,7 +289,7 @@ func TestSandboxNet_AuditLogUnreachable(t *testing.T) {
 	// "bwrap: ..." before the script runs; that is itself a regression of
 	// the audit-dir resolver, so fail loudly rather than skip.
 	if strings.HasPrefix(strings.TrimSpace(out), "bwrap:") {
-		t.Fatalf("bwrap setup failed under SandboxNet (J-12 regression — audit-dir tmpfs broke mount layout): %q", out)
+		t.Fatalf("bwrap setup failed under SandboxNet (J-12 regression, audit-dir tmpfs broke mount layout): %q", out)
 	}
 	if strings.Contains(out, canary) {
 		t.Fatalf("J-12 regression: canary %q reachable inside SandboxNet:\n%s", canary, out)
@@ -309,14 +309,14 @@ func TestSandboxNet_AuditLogUnreachable(t *testing.T) {
 		!strings.Contains(lower, "cannot access") {
 		t.Errorf("audit dir not masked under SandboxNet (expected empty tmpfs or ENOENT, got %q)", lsOut)
 	}
-	// /proc/self/root escape — must not surface the canary either.
+	// /proc/self/root escape: must not surface the canary either.
 	if strings.Contains(procRootOut, canary) {
 		t.Fatalf("J-12 /proc/self/root escape: canary reachable via /proc/self/root%s/audit.log:\n%s",
 			canonDir, procRootOut)
 	}
 }
 
-// TestSandboxNet_DockerSocketUnreachable (P0-1) — when the host has
+// TestSandboxNet_DockerSocketUnreachable (P0-1): when the host has
 // /run/docker.sock, the SandboxNet child must NOT be able to connect()
 // to it. --ro-bind / / blocks WRITE but not connect(); without the
 // --bind /dev/null /run/docker.sock mask, an AI under run_with_secrets
@@ -326,7 +326,7 @@ func TestSandboxNet_AuditLogUnreachable(t *testing.T) {
 //
 // The mask replaces the socket file with /dev/null, which is a character
 // device that refuses connect(2). Inside the sandbox the inode is a
-// character device, not a socket — the simplest check is `test -S` which
+// character device, not a socket; the simplest check is `test -S` which
 // must report "not a socket".
 func TestSandboxNet_DockerSocketUnreachable(t *testing.T) {
 	if _, err := os.Lstat("/run/docker.sock"); err != nil {
@@ -365,12 +365,12 @@ func TestSandboxNet_DockerSocketUnreachable(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_SystemDBusUnreachable (P1-2) — when the host has
+// TestSandboxNet_SystemDBusUnreachable (P1-2): when the host has
 // /run/dbus/system_bus_socket, the SandboxNet child must NOT be able
 // to connect() to it. Without the --tmpfs /run/dbus mask, an AI under
 // run_with_secrets can talk to Avahi (org.freedesktop.Avahi.EntryGroup.AddService
 // typically permits unauthenticated publishing) and broadcast the secret
-// as an mDNS TXT record on the local LAN — defeats --unshare-net entirely
+// as an mDNS TXT record on the local LAN; defeats --unshare-net entirely
 // because the broadcast happens via the host's network stack handling
 // the LOCAL-BUS request.
 //
@@ -390,7 +390,7 @@ func TestSandboxNet_SystemDBusUnreachable(t *testing.T) {
 	// sh's redirection opens the file with O_WRONLY on a read-only-mounted
 	// /dev, which the kernel rejects with EACCES ("cannot create /dev/null:
 	// Permission denied"). Use a tempfile in /tmp (tmpfs, writable) or do
-	// without — here we use the existence-only check to avoid the
+	// without; here we use the existence-only check to avoid the
 	// redirection entirely.
 	out, _, err := runUnderSandbox(t, SandboxNet, "sh", "-c",
 		"if [ -S /run/dbus/system_bus_socket ]; then echo SOCKET; "+
@@ -412,7 +412,7 @@ func TestSandboxNet_SystemDBusUnreachable(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_FakeSocketMaskTechnique (Kimi gate 1) — proves the
+// TestSandboxNet_FakeSocketMaskTechnique (Kimi gate 1): proves the
 // --bind /dev/null technique actually defeats connect() on a freshly
 // created Unix socket, independent of which container runtimes are
 // installed on the host. This is the technique-verification test:
@@ -476,7 +476,7 @@ func TestSandboxNet_FakeSocketMaskTechnique(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_FakeTmpfsMaskTechnique (Kimi gate 2 P2) — the
+// TestSandboxNet_FakeTmpfsMaskTechnique (Kimi gate 2 P2): the
 // FakeSocketMaskTechnique test above only proves the --bind /dev/null
 // technique works on socket files. The --tmpfs technique for
 // directory masking is the other half of appendRuntimeSocketMasks and
@@ -608,7 +608,7 @@ func TestSandboxNet_SiblingProcIsolation(t *testing.T) {
 	// /proc" would pass vacuously because A's environ has already
 	// disappeared.
 	if err := cmdA.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Fatalf("subprocess A is not alive (signal 0 failed: %v) — isolation not tested", err)
+		t.Fatalf("subprocess A is not alive (signal 0 failed: %v); isolation not tested", err)
 	}
 
 	// Run B and collect output.

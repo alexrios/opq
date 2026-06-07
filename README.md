@@ -1,12 +1,12 @@
 # opq
 
-> **Status:** v1.1.6 — Linux only for now; macOS Keychain backend planned for v1.2.
+> **Status:** v1.1.6. Linux only for now; macOS Keychain backend planned for v1.2.
 
-An **AI-safe secrets CLI** — stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
+An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
 
 ```sh
-opq exec --env OPENAI_API_KEY=openai_key -- curl ...   # ok — secret injected, output redacted
-opq get  openai_key | cat                              # blocked — never plaintext to a pipe
+opq exec --env OPENAI_API_KEY=openai_key -- curl ...   # ok: secret injected, output redacted
+opq get  openai_key | cat                              # blocked: never plaintext to a pipe
 opq mcp                                                # MCP server over stdio for AI agents
 ```
 
@@ -22,7 +22,7 @@ Requires Linux with an unlocked Secret Service session (gnome-keyring / KWallet 
 
 ## Documentation
 
-Full documentation — getting started, tutorials, the complete CLI/MCP reference, and the detailed security model — lives in the mdbook, published at **<https://alexrios.github.io/opq/>** (source under [`docs/`](docs/src/SUMMARY.md)). Build and read it locally:
+The full documentation lives in the mdbook, published at **<https://alexrios.github.io/opq/>** (source under [`docs/`](docs/src/SUMMARY.md)): getting started, tutorials, the complete CLI/MCP reference, and the detailed security model. Build and read it locally:
 
 ```sh
 mise run docs        # build to docs/book/

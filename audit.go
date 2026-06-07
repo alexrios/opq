@@ -1,4 +1,4 @@
-// Package main — audit log writer.
+// Package main: audit log writer.
 //
 // LOCKING (see TestAppendAudit_MultiprocessFlock). Writes are serialized by
 // auditMu (in-process) and flock LOCK_EX (cross-process). The flock is held on a
@@ -212,7 +212,7 @@ func ensureAuditFileLocked() (*os.File, error) {
 // rotation-immune lock file used by writers for cross-process
 // serialization. Caller MUST hold auditMu. The fd is intentionally
 // never closed during process lifetime; O_CLOEXEC ensures it does not
-// leak across exec. Readers use openAuditLockReaderLocked instead — see
+// leak across exec. Readers use openAuditLockReaderLocked instead; see
 // the note there about Linux flock semantics on the same
 // open-file-description.
 func ensureAuditLockFileLocked() (*os.File, error) {
@@ -321,7 +321,7 @@ const auditReadCap = 32 * 1024 * 1024
 
 // tailAudit returns the last n audit lines (active log, then prepending the
 // rotated .log.1 if needed). Holds auditMu + LOCK_SH on a fresh lock fd across
-// both reads — see the package header for the locking rationale.
+// both reads; see the package header for the locking rationale.
 func tailAudit(n int) ([]string, error) {
 	path, err := auditLogPath()
 	if err != nil {
@@ -375,7 +375,7 @@ func openAuditLockReaderLocked() (*os.File, error) {
 	lockPath := filepath.Join(dir, auditLockFileName)
 	// O_RDONLY is sufficient for flock(LOCK_SH); Linux open(2) accepts
 	// O_CREAT with O_RDONLY (the created file is empty and never written
-	// through this fd — the lock is the only purpose).
+	// through this fd; the lock is the only purpose).
 	flags := os.O_CREATE | os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
 	f, err := os.OpenFile(lockPath, flags, 0o600)
 	if err != nil {

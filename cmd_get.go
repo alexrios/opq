@@ -12,7 +12,7 @@ import (
 
 type GetCmd struct {
 	Name      string `arg:"" help:"Secret name."`
-	Plaintext bool   `name:"plaintext" help:"Print the secret value. REQUIRED — refuses to run unless stdout is a TTY AND OPQ_I_AM_HUMAN=1 is set in the environment AND the user confirms on the controlling terminal."`
+	Plaintext bool   `name:"plaintext" help:"Print the secret value. REQUIRED: refuses to run unless stdout is a TTY AND OPQ_I_AM_HUMAN=1 is set in the environment AND the user confirms on the controlling terminal."`
 }
 
 // envHumanConfirm is the env var a human must inline-set to prove they (not an

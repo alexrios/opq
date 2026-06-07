@@ -51,34 +51,34 @@ func TestParseEnvMappings(t *testing.T) {
 			want: want{errSub: "invalid secret name"},
 		},
 		{
-			name:   "missing equals is rejected",
-			in:     []string{"API_KEY"},
-			want:   want{errSub: "expected VAR=secret_name"},
+			name: "missing equals is rejected",
+			in:   []string{"API_KEY"},
+			want: want{errSub: "expected VAR=secret_name"},
 		},
 		{
-			name:   "leading equals is rejected (empty env name)",
-			in:     []string{"=openai_api_key"},
-			want:   want{errSub: "expected VAR=secret_name"},
+			name: "leading equals is rejected (empty env name)",
+			in:   []string{"=openai_api_key"},
+			want: want{errSub: "expected VAR=secret_name"},
 		},
 		{
-			name:   "trailing equals is rejected (empty secret name)",
-			in:     []string{"API_KEY="},
-			want:   want{errSub: "expected VAR=secret_name"},
+			name: "trailing equals is rejected (empty secret name)",
+			in:   []string{"API_KEY="},
+			want: want{errSub: "expected VAR=secret_name"},
 		},
 		{
-			name:   "env name starting with digit is rejected",
-			in:     []string{"1FOO=bar"},
-			want:   want{errSub: "invalid env var name"},
+			name: "env name starting with digit is rejected",
+			in:   []string{"1FOO=bar"},
+			want: want{errSub: "invalid env var name"},
 		},
 		{
-			name:   "env name with dash is rejected",
-			in:     []string{"FOO-BAR=baz"},
-			want:   want{errSub: "invalid env var name"},
+			name: "env name with dash is rejected",
+			in:   []string{"FOO-BAR=baz"},
+			want: want{errSub: "invalid env var name"},
 		},
 		{
-			name:   "duplicate env name is rejected",
-			in:     []string{"API=one", "API=two"},
-			want:   want{errSub: `env var "API" specified twice`},
+			name: "duplicate env name is rejected",
+			in:   []string{"API=one", "API=two"},
+			want: want{errSub: `env var "API" specified twice`},
 		},
 	}
 
@@ -196,7 +196,7 @@ func TestFilterParentEnv(t *testing.T) {
 		{
 			name: "OPQ_ prefix is case-sensitive (opq_ lowercase is kept)",
 			// HasPrefix is case-sensitive; only the all-uppercase internal
-			// prefix is filtered. This is intentional — user code may have
+			// prefix is filtered. This is intentional; user code may have
 			// its own opq_-named vars.
 			in:   []string{"opq_user_thing=1", "OPQ_REAL=2"},
 			want: []string{"opq_user_thing=1"},
@@ -376,7 +376,7 @@ func TestCheckNoRedactGate_Allows_HappyPath(t *testing.T) {
 		t.Errorf("TTY closer was not invoked")
 	}
 	// Kimi P0: a "happy path" that never actually consumed the confirmation
-	// line would also pass — verify the input buffer was drained.
+	// line would also pass; verify the input buffer was drained.
 	if tty.in.Len() != 0 {
 		t.Fatalf("confirmation line was not read from TTY (remaining=%q)", tty.in.String())
 	}
@@ -577,7 +577,7 @@ func TestCheckNoRedactGate_Allows_TrailingCR(t *testing.T) {
 	}
 }
 
-// TestExecCmdRun_GateInvokedBeforeKeyring (Kimi P0) — drives the REAL
+// TestExecCmdRun_GateInvokedBeforeKeyring (Kimi P0) drives the REAL
 // ExecCmd.Run() with NoRedact=true under conditions that must fail at the
 // gate (stdout-not-TTY in the test process). If a future refactor removes
 // the gate call from Run(), this test fails because the error wouldn't carry
@@ -624,7 +624,7 @@ func TestExecCmdRun_GateInvokedBeforeKeyring(t *testing.T) {
 	}
 }
 
-// TestNoRedactGate_AuditMessageFormat — drive ExecCmd.Run() far enough to
+// TestNoRedactGate_AuditMessageFormat: drive ExecCmd.Run() far enough to
 // fail at the gate, then read the audit log and assert the line has
 // Action=ActionDenied and Message="no_redact_refused:<reason>". We can't
 // invoke ExecCmd.Run() directly (its kong-style fields need a real TTY); we

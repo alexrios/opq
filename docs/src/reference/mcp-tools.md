@@ -38,7 +38,7 @@ to the AI), and a `timed_out` flag.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `command` | string | — | Resolved and sandbox-wrapped before secret values are built into the env. |
+| `command` | string | (required) | Resolved and sandbox-wrapped before secret values are built into the env. |
 | `args` | string[] | `[]` | Capped at 256 entries. |
 | `env` | object | `{}` | `VAR → secret_name`. Max 32 entries; names ≤ 256 bytes and checked against the [deny-list](./env-deny-list.md). |
 | `timeout_seconds` | number | 60 | Capped at 600. |

@@ -15,7 +15,7 @@ type RevokeCmd struct {
 // Run revokes a secret: it wipes the stored value from the keyring at once and
 // records a revoked tombstone so future reads report "revoked" (distinct from
 // "never existed") and `list` shows the name as burned. This is the "this
-// secret leaked, kill it now" tool — eager destruction, unlike a TTL (which is
+// secret leaked, kill it now" tool: eager destruction, unlike a TTL (which is
 // refused lazily on read) and unlike `delete` (which removes the record
 // silently with no trace beyond the audit log).
 func (c *RevokeCmd) Run() error {
@@ -33,7 +33,7 @@ func (c *RevokeCmd) Run() error {
 	// revoke and lets us carry CreatedAt/ExpiresAt onto the tombstone.
 	existing, _ := loadMeta(ctx, backend, c.Name)
 
-	// Wipe the value — the whole point of revoke. A missing value is tolerated
+	// Wipe the value (the whole point of revoke). A missing value is tolerated
 	// (the name may already be a tombstone, or its value removed out of band)
 	// as long as some record exists; otherwise there is nothing to revoke.
 	delErr := backend.Delete(ctx, c.Name)
@@ -61,6 +61,6 @@ func (c *RevokeCmd) Run() error {
 	}
 
 	_ = AppendAudit(AuditEvent{Action: ActionRevoke, SecretName: c.Name, Caller: callerTag()})
-	fmt.Fprintf(os.Stderr, "revoked %q (value wiped; tombstone retained — run `opq delete %s` to remove the record)\n", c.Name, c.Name)
+	fmt.Fprintf(os.Stderr, "revoked %q (value wiped; tombstone retained; run `opq delete %s` to remove the record)\n", c.Name, c.Name)
 	return nil
 }

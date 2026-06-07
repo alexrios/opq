@@ -87,11 +87,11 @@ func TestWrapCommand_SandboxNet_BwrapArgv(t *testing.T) {
 	}
 }
 
-// TestSandboxNet_TmpfsMasksDBus (J-1) — the SandboxNet argv must mask
+// TestSandboxNet_TmpfsMasksDBus (J-1): the SandboxNet argv must mask
 // the standard Unix-socket directories (/run/user, /tmp) with tmpfs so
 // the child cannot reach the D-Bus / Secret Service / KWallet /
 // gpg-agent sockets that the netns alone does NOT block. We deliberately
-// do NOT mask /var/run/user separately — on all systemd distros it is a
+// do NOT mask /var/run/user separately; on all systemd distros it is a
 // symlink to /run/user, and masking the symlink target after the parent
 // /var/run path becomes a stale symlink causes bwrap to fail with
 // "Can't mkdir /var/run/user". Each tmpfs sequence must appear AFTER
@@ -142,7 +142,6 @@ func TestSandboxNet_TmpfsMasksDBus(t *testing.T) {
 		t.Errorf("SandboxNet argv must NOT mask /var/run/user (the /var/run -> /run symlink covers it; explicit mask breaks bwrap): %v", gotArgs)
 	}
 }
-
 
 func TestWrapCommand_SandboxFull_BwrapArgv(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -221,7 +220,7 @@ func TestWrapCommand_SandboxNetAllowed_BwrapArgv(t *testing.T) {
 			t.Errorf("net-allowed argv missing %v: %v", seq, gotArgs)
 		}
 	}
-	// Netns must be ABSENT — that is the defining difference from
+	// Netns must be ABSENT; that is the defining difference from
 	// SandboxNet. If this assertion ever flips, the profile has
 	// collapsed back into SandboxNet and allow_network=true silently
 	// stops working for legitimate callers.
@@ -273,7 +272,7 @@ func TestVerifySandboxAvailable_BwrapMissing(t *testing.T) {
 	}
 }
 
-// TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken (J-9) — a host
+// TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken (J-9): a host
 // where bwrap reports a healthy version but cannot actually create
 // namespaces (e.g. AppArmor profile blocks unshare) must surface the
 // failure at startup rather than as obscure run_with_secrets failures
@@ -314,9 +313,9 @@ func TestVerifySandboxAvailable_ProbeFailsWhenBwrapBroken(t *testing.T) {
 // after a first call, subsequent calls must NOT re-run the bwrap probe.
 // We plant a counting fake bwrap that succeeds on --version and the
 // namespace probe, drive a first call, then nuke PATH so any real
-// re-probe would fail — a cached success must still be returned. The
+// re-probe would fail; a cached success must still be returned. The
 // converse case (cache the failure too) is asserted by inverting the
-// arrangement: plant a missing PATH, fail once, then add bwrap back —
+// arrangement: plant a missing PATH, fail once, then add bwrap back,
 // cached failure must persist.
 func TestVerifySandboxAvailable_CachesResult(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -561,7 +560,7 @@ func TestSandboxNet_FailsClosedOnUnresolvableAuditDir(t *testing.T) {
 	}
 }
 
-// TestSandboxFull_DoesNotInvokeAuditDirResolver — the audit-dir resolution
+// TestSandboxFull_DoesNotInvokeAuditDirResolver: the audit-dir resolution
 // branch is intentionally scoped to SandboxNet. SandboxFull tmpfs-masks /home
 // wholesale, so it must not gain a transitive failure mode on a missing HOME.
 // We blank XDG_STATE_HOME and HOME and assert WrapCommand(SandboxFull, ...)

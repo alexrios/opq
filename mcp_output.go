@@ -1,4 +1,4 @@
-// Package main — run_with_secrets output pipeline.
+// Package main: run_with_secrets output pipeline.
 //
 // Two layers sit downstream of the redactor: cappedWriter bounds memory by
 // dropping bytes past a fixed cap (and recording a truncated flag for the
@@ -16,14 +16,14 @@ import (
 // outputBuckets is the closed set of stdout/stderr lengths the AI may
 // observe in a run_with_secrets response. Every non-empty stream is
 // padded up to the smallest bucket >= its real length. The cap value
-// (mcpMaxOutputBytes) MUST be present as the final entry — outputs at
+// (mcpMaxOutputBytes) MUST be present as the final entry; outputs at
 // the cap have already been truncated by cappedWriter and need no
 // padding. Earlier buckets follow the geometric power-of-two ladder
 // 1 KiB → 4 KiB → 16 KiB → 64 KiB so a small command's response is not
 // inflated more than ~4x while the channel remains coarse-grained.
 //
 // Bits leaked per call (worst case, adversary controls the volume
-// function): log2(len(outputBuckets)) bits per stream — today
+// function): log2(len(outputBuckets)) bits per stream, today
 // log2(5) ≈ 2.3 bits, down from ~17 bits (262144 distinct lengths).
 // Recovering one 8-bit secret byte under this regime requires ~4 calls
 // instead of 1; expanding the bucket set (more granularity) would
@@ -40,7 +40,7 @@ var outputBuckets = []int{1024, 4096, 16384, 65536, mcpMaxOutputBytes}
 // between real output and padding. Tooling consuming the response can
 // scan for this token and strip the trailing padding. The marker plus
 // padding are bytes inside the JSON string value, so a naive
-// byte-counter (`len(stdout)`) sees the bucket-quantized total — that
+// byte-counter (`len(stdout)`) sees the bucket-quantized total; that
 // is the whole point. The marker length is short enough that the
 // smallest pad gap (4 bytes when n is 1020 and bucket is 1024) can
 // fall below it; in that case we emit only space-padding without the
@@ -68,7 +68,7 @@ func nextOutputBucket(n int) int {
 //
 // Padding is byte-quantized to the bucket length: the returned string
 // length is exactly bucket if s was non-empty. Tests verify this
-// invariant — do not break it by adding "if pad <= 0 return s" style
+// invariant; do not break it by adding "if pad <= 0 return s" style
 // short-circuits past the initial empty check.
 func quantizeOutputForAI(s string) string {
 	if len(s) == 0 {
@@ -88,7 +88,7 @@ func quantizeOutputForAI(s string) string {
 // cappedWriter forwards bytes to an inner writer up to a fixed cap,
 // then silently drops further bytes and records a truncated flag. It
 // is the outermost layer of the run_with_secrets output pipeline and
-// exists solely to bound memory growth — bytes that reach this writer
+// exists solely to bound memory growth; bytes that reach this writer
 // have already been through the redactor.
 type cappedWriter struct {
 	mu        sync.Mutex

@@ -22,7 +22,7 @@ type CLI struct {
 }
 
 func main() {
-	// Indirect through run() so that os.Exit fires AFTER all defers — most
+	// Indirect through run() so that os.Exit fires AFTER all defers, most
 	// importantly memguard.Purge, which zeroes any locked pages still alive.
 	// Calling os.Exit directly anywhere deeper would skip those defers and
 	// leave secret pages reclaimed-but-not-zeroed.
@@ -36,7 +36,7 @@ func run() int {
 	cli := CLI{}
 	ctx := kong.Parse(&cli,
 		kong.Name("opq"),
-		kong.Description("opaque — AI-safe secrets gatekeeper. Stores secrets in your OS keyring and lets programs use them without ever exposing plaintext to the caller."),
+		kong.Description("opq: AI-safe secrets gatekeeper. Stores secrets in your OS keyring and lets programs use them without ever exposing plaintext to the caller."),
 		kong.UsageOnError(),
 	)
 	err := ctx.Run()

@@ -64,7 +64,7 @@ func TestBuffer_DestroyZeroes(t *testing.T) {
 }
 
 func TestBuffer_FromBytesEmpty(t *testing.T) {
-	// Stable error text is part of the contract — backend.go wraps this
+	// Stable error text is part of the contract; backend.go wraps this
 	// error via fmt.Errorf("keyring get: %w", err) and callers do not
 	// errors.Is against a sentinel today, so the text is what propagates
 	// to operator-facing logs and audit messages. If this changes, update

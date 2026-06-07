@@ -1,4 +1,4 @@
-// Package main — the run_with_secrets MCP tool.
+// Package main: the run_with_secrets MCP tool.
 //
 // The AI's only way to *use* a secret: run a subprocess with secrets injected
 // as env vars and get back redacted stdout/stderr. This is the low-trust
@@ -34,7 +34,7 @@ type runWithSecretsInput struct {
 }
 
 // resolveMCPSandbox maps (AllowNetwork, Isolation) to a profile. Default is
-// SandboxNet — the AI gets the secret but can't ship it off-box.
+// SandboxNet: the AI gets the secret but can't ship it off-box.
 //
 //	AllowNetwork=true  + Isolation=""|"net" -> SandboxNetAllowed (audit network_allowed)
 //	AllowNetwork=true  + Isolation="full"   -> error (incompatible until v1.2)
@@ -70,7 +70,7 @@ func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, err
 // normalized or omitted to deny oracles the AI could drive with a
 // secret-conditional command (the raw values go to the operator audit only):
 //   - ExitCode is collapsed to {0,1}; the raw 8-bit status is a 1-byte/call oracle.
-//   - no stdout_truncated/stderr_truncated flags — each is a 1-bit volume oracle.
+//   - no stdout_truncated/stderr_truncated flags; each is a 1-bit volume oracle.
 //   - Stdout/Stderr lengths are bucket-quantized by quantizeOutputForAI (gap #3);
 //     the pad tail is marked [opq-pad] so tooling can strip it.
 type runWithSecretsOutput struct {
@@ -81,7 +81,7 @@ type runWithSecretsOutput struct {
 	TimedOut  bool   `json:"timed_out"`
 }
 
-// normalizeExit collapses the raw exit code to {0,1} — the entire exit-code
+// normalizeExit collapses the raw exit code to {0,1}: the entire exit-code
 // oracle defense. The raw status reaches the operator audit only.
 func normalizeExit(raw int) (bool, int) {
 	if raw == 0 {
@@ -109,7 +109,7 @@ func clampTimeout(requestedSeconds int) time.Duration {
 // entry with a bare-token taxonomy Message and returns the response. Shared by
 // the two pre-resolution call sites so their taxonomy can't drift.
 //
-// CRITICAL: the AI-supplied basename is NOT placed in the audit Message — that
+// CRITICAL: the AI-supplied basename is NOT placed in the audit Message; that
 // would be an AI-controlled-bytes channel into the operator's log
 // (log-poisoning + grep-evasion). It IS echoed back to the AI in the
 // not_found/permission cases because the AI supplied input.Command itself; the
@@ -172,9 +172,9 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		}
 		if isBlockedEnvName(envName) {
 			// Refuse to inject into a loader/interpreter var (PATH, LD_*,
-			// BASH_ENV, ...) — that would be arbitrary code execution.
+			// BASH_ENV, ...); that would be arbitrary code execution.
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "env_blocked"})
-			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go)", envName)), runWithSecretsOutput{}, nil
+			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.; see env_policy.go)", envName)), runWithSecretsOutput{}, nil
 		}
 		if !validSecretName(secretName) {
 			// Use a stable taxonomy and audit the validation failure.

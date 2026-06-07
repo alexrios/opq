@@ -20,7 +20,7 @@ type retypeGateConfig struct {
 	envHumanFlag string // value of OPQ_I_AM_HUMAN as read by caller
 	// openConfirmTTY returns a reader/writer pair representing the controlling
 	// terminal (/dev/tty in production), plus a closer the caller must invoke.
-	// If the TTY cannot be opened, err is returned and the gate fails — humans
+	// If the TTY cannot be opened, err is returned and the gate fails; humans
 	// always have a /dev/tty even when stdin is redirected; AI runtimes that
 	// redirect both ends do not.
 	openConfirmTTY func() (io.Reader, io.Writer, io.Closer, error)
@@ -67,7 +67,7 @@ func checkRetypeGate(cfg retypeGateConfig, prompt, expected string, sentinel err
 
 // openControllingTTY opens /dev/tty for read/write. It returns an error if the
 // process has no controlling terminal (e.g. detached / daemonized / some CI
-// runners). On systems without /dev/tty (Windows) this will fail — acceptable
+// runners). On systems without /dev/tty (Windows) this will fail, acceptable
 // because opaque's production target is linux.
 func openControllingTTY() (io.Reader, io.Writer, io.Closer, error) {
 	f, err := os.OpenFile("/dev/tty", os.O_RDWR|syscall.O_NOCTTY, 0)

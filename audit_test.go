@@ -160,7 +160,7 @@ func TestAuditEvent_NonceFieldRoundTrip(t *testing.T) {
 	})
 	t.Run("legacy entries parse", func(t *testing.T) {
 		// A log line written by an older opq version (no nonce field at
-		// all) must unmarshal cleanly with empty Nonce — the strip
+		// all) must unmarshal cleanly with empty Nonce; the strip
 		// scanner relies on this to skip such entries without crashing.
 		const legacy = `{"ts":"2026-05-01T00:00:00Z","action":"audit_tail","caller":"mcp","pid":42,"ppid":1,"msg":"n=20"}`
 		var ev AuditEvent
@@ -525,7 +525,7 @@ func TestTailAudit_ReadsAcrossRotation(t *testing.T) {
 	})
 
 	t.Run("active_only_when_sufficient", func(t *testing.T) {
-		// Active log has 3 entries; ask for 2 — answer must come
+		// Active log has 3 entries; ask for 2, answer must come
 		// entirely from active and never need to touch .log.1.
 		lines, err := tailAudit(2)
 		if err != nil {
@@ -558,7 +558,7 @@ func TestTailAudit_RefusesSymlinkedRotation(t *testing.T) {
 	rotPath := logPath + ".1"
 
 	// Active log has fewer entries than requested, forcing tailAudit
-	// to descend into .log.1 — which is a symlink we must refuse.
+	// to descend into .log.1, which is a symlink we must refuse.
 	if err := os.WriteFile(logPath, []byte(`{"action":"a"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
@@ -581,8 +581,8 @@ func TestTailAudit_RefusesSymlinkedRotation(t *testing.T) {
 
 // filterEnvOut removes any KEY=... entries whose KEY matches one of keys.
 // Needed when re-exec'ing a test subprocess: appending an override to
-// os.Environ() does NOT supersede an earlier occurrence — libc's
-// getenv returns the first match — so the test's intended value is
+// os.Environ() does NOT supersede an earlier occurrence; libc's
+// getenv returns the first match, so the test's intended value is
 // silently ignored if the parent already has the var set.
 func filterEnvOut(env []string, keys ...string) []string {
 	out := make([]string, 0, len(env))
@@ -892,7 +892,7 @@ func TestTailAudit_RefusesSymlinkedLockFile(t *testing.T) {
 // boundaries. The in-process variant of this test (above) cannot detect
 // removal of the cross-process flock because auditMu alone serializes
 // readers and writers within a single process. Here the writer runs in a
-// different process — only the lock-file flock can prevent its rotation
+// different process; only the lock-file flock can prevent its rotation
 // from interleaving with the parent's tailAudit reads.
 //
 // If the fresh-fd syscall.Flock(LOCK_SH) in tailAudit is removed, this
@@ -998,4 +998,3 @@ func TestTailAudit_NoDuplicatesUnderConcurrentRotation_MultiProcess(t *testing.T
 		t.Fatalf("expected audit.log.1 to exist (proving rotation occurred); stat: %v", err)
 	}
 }
-

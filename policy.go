@@ -62,8 +62,8 @@ func (m *SecretMeta) IsExpiredAt(now time.Time) bool {
 	return m.HasExpiry() && !now.Before(m.ExpiresAt)
 }
 
-// loadMeta returns (nil, nil) when a secret has no companion item — legacy and
-// policy-free secrets alike — so callers treat nil as "no policy" (the nil-safe
+// loadMeta returns (nil, nil) when a secret has no companion item (legacy and
+// policy-free secrets alike), so callers treat nil as "no policy" (the nil-safe
 // methods above make that ergonomic).
 func loadMeta(ctx context.Context, backend Backend, name string) (*SecretMeta, error) {
 	buf, err := backend.Get(ctx, metaKey(name))
@@ -109,7 +109,7 @@ func deleteMeta(ctx context.Context, backend Backend, name string) error {
 
 // resolveSecret is the single read path for plaintext secret values, so TTL and
 // revocation are enforced everywhere a value could escape. It never mutates the
-// keyring — expiry only refuses; wiping is left to revoke/prune. Revoked is
+// keyring: expiry only refuses; wiping is left to revoke/prune. Revoked is
 // checked before expired so a deliberately-killed secret reports the precise
 // ErrSecretRevoked.
 func resolveSecret(ctx context.Context, backend Backend, name string, now time.Time) (*Buffer, error) {

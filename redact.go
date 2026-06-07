@@ -24,7 +24,7 @@ type RedactingWriter struct {
 	maxLen   int
 	holdover []byte
 	// downTrunc, if set, lets Write short-circuit to pass-through once the
-	// downstream starts dropping bytes — otherwise a high-volume producer
+	// downstream starts dropping bytes; otherwise a high-volume producer
 	// (`yes`) burns the whole timeout scanning bytes the cap will discard.
 	downTrunc   truncatedReporter
 	passThrough bool
@@ -32,7 +32,7 @@ type RedactingWriter struct {
 
 // truncatedReporter is the optional contract a downstream writer implements to
 // signal it has begun discarding bytes. Wired by a one-shot assertion in
-// NewRedactingWriter — any interposer between RedactingWriter and the truncating
+// NewRedactingWriter. Any interposer between RedactingWriter and the truncating
 // sink MUST proxy Truncated() or the short-circuit silently disappears. Today
 // only mcp.cappedWriter implements it.
 type truncatedReporter interface {
@@ -87,7 +87,7 @@ const encodingMinRawLen = 4
 
 // encodedSecretForms returns the byte sequences to match for a secret: the raw
 // bytes, plus (for secrets >= encodingMinRawLen) base64 std/URL ±padding and hex
-// lower/upper — the encodings a tool is likely to emit by accident.
+// lower/upper, the encodings a tool is likely to emit by accident.
 //
 // Deliberately NOT covered: URL percent-encoding and JSON escaping (both equal
 // the raw for typical alphanumeric keys), arbitrary ciphers (unbounded), and
@@ -96,21 +96,21 @@ func encodedSecretForms(raw []byte) [][]byte {
 	if len(raw) == 0 {
 		return nil
 	}
-	// Always include the raw form, even for tiny secrets — the raw match
+	// Always include the raw form, even for tiny secrets; the raw match
 	// is the load-bearing one. We only suppress the ENCODED expansions
 	// below the length floor.
 	forms := [][]byte{append([]byte(nil), raw...)}
 	if len(raw) < encodingMinRawLen {
 		return forms
 	}
-	// base64 — both alphabets, padded and unpadded. EncodeToString gives
+	// base64: both alphabets, padded and unpadded. EncodeToString gives
 	// the padded form; trimming trailing '=' yields the raw form, which
 	// is also what RawStdEncoding / RawURLEncoding emit directly.
 	stdPadded := base64.StdEncoding.EncodeToString(raw)
 	urlPadded := base64.URLEncoding.EncodeToString(raw)
 	stdRaw := base64.RawStdEncoding.EncodeToString(raw)
 	urlRaw := base64.RawURLEncoding.EncodeToString(raw)
-	// hex — lower (Go default) and upper (Java/some hexdumps).
+	// hex: lower (Go default) and upper (Java/some hexdumps).
 	hexLower := hex.EncodeToString(raw)
 	hexUpper := strings.ToUpper(hexLower)
 	for _, s := range []string{stdPadded, stdRaw, urlPadded, urlRaw, hexLower, hexUpper} {
@@ -138,7 +138,7 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 		return r.w.Write(p)
 	}
 
-	// Once the downstream starts dropping bytes, scanning is wasted CPU — flip
+	// Once the downstream starts dropping bytes, scanning is wasted CPU; flip
 	// to pass-through and drop the holdover (those bytes are past the cap too).
 	if !r.passThrough && r.downTrunc != nil && r.downTrunc.Truncated() {
 		r.passThrough = true

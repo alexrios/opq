@@ -133,7 +133,7 @@ func (c *SetCmd) Run() error {
 
 	// Reconcile policy metadata. A plain secret carries NO companion item; a
 	// TTL'd secret gets one. Either way the prior policy for this name is
-	// cleared — in particular a revoked tombstone — so re-storing a revoked
+	// cleared (in particular a revoked tombstone) so re-storing a revoked
 	// secret makes it usable again.
 	now := time.Now().UTC()
 	var expiresAt time.Time
@@ -142,13 +142,13 @@ func (c *SetCmd) Run() error {
 		meta := &SecretMeta{V: secretMetaVersion, CreatedAt: now, ExpiresAt: expiresAt}
 		if err := storeMeta(ctx, backend, c.Name, meta); err != nil {
 			// Fail closed: never leave a secret whose requested TTL was not
-			// recorded (it would be usable forever). Roll back the value — and
+			// recorded (it would be usable forever). Roll back the value, and
 			// if the rollback ALSO fails, say so loudly, because a no-TTL value
 			// is now live in the keyring and the operator must remove it.
 			rbErr := backend.Delete(ctx, c.Name)
 			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: "ttl_write_failed"})
 			if rbErr != nil && !errors.Is(rbErr, ErrSecretNotFound) {
-				return fmt.Errorf("set %q: failed to record TTL AND failed to roll back the stored value (%v); the secret is present WITHOUT a TTL — run `opq delete %s`: %w", c.Name, rbErr, c.Name, err)
+				return fmt.Errorf("set %q: failed to record TTL AND failed to roll back the stored value (%v); the secret is present WITHOUT a TTL; run `opq delete %s`: %w", c.Name, rbErr, c.Name, err)
 			}
 			return fmt.Errorf("set %q: failed to record TTL; secret rolled back: %w", c.Name, err)
 		}

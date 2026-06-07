@@ -276,7 +276,7 @@ func (t *truncatingWriter) Write(p []byte) (int, error) {
 
 func (t *truncatingWriter) Truncated() bool { return t.truncated }
 
-// plainWriter has no Truncated() method — used to confirm RedactingWriter
+// plainWriter has no Truncated() method; used to confirm RedactingWriter
 // still redacts normally when the downstream does not implement the
 // optional truncatedReporter interface.
 type plainWriter struct{ bytes.Buffer }
@@ -363,7 +363,7 @@ func TestRedact_HoldoverDiscardedOnTruncation(t *testing.T) {
 		t.Fatalf("expected non-empty holdover, got none")
 	}
 
-	// Flip and write — the holdover must be dropped, not flushed.
+	// Flip and write; the holdover must be dropped, not flushed.
 	tw.truncated = true
 	preLen := tw.inner.Len()
 	if _, err := rw.Write([]byte(" tail")); err != nil {
@@ -403,7 +403,7 @@ func TestRedact_Destroy(t *testing.T) {
 // that emits the secret base64-encoded (standard alphabet, with padding)
 // gets the same `[REDACTED:NAME]` treatment as the raw form. Closing this
 // matters because base64 is the single most common accidental encoding for
-// secrets — many CLI tools (curl --data-binary @-, openssl enc, jq -r) round
+// secrets: many CLI tools (curl --data-binary @-, openssl enc, jq -r) round
 // trip through it.
 func TestRedact_EncodingBypass_Base64Std(t *testing.T) {
 	raw := []byte("sk-1234567890")
@@ -421,7 +421,7 @@ func TestRedact_EncodingBypass_Base64Std(t *testing.T) {
 	}
 }
 
-// TestRedact_EncodingBypass_Base64URL covers URL-safe base64 — used by JWT/JWS
+// TestRedact_EncodingBypass_Base64URL covers URL-safe base64, used by JWT/JWS
 // (`-_` alphabet, no `=` padding). A subprocess piping the secret through a
 // JWT signer or through `base64 --url` must not leak.
 func TestRedact_EncodingBypass_Base64URL(t *testing.T) {
@@ -437,7 +437,7 @@ func TestRedact_EncodingBypass_Base64URL(t *testing.T) {
 	}
 }
 
-// TestRedact_EncodingBypass_HexLower covers lower-case hex — the Go default
+// TestRedact_EncodingBypass_HexLower covers lower-case hex, the Go default
 // (`hex.EncodeToString`) and what `openssl rand -hex` / `xxd -p` emit.
 func TestRedact_EncodingBypass_HexLower(t *testing.T) {
 	raw := []byte("sekret")
@@ -452,7 +452,7 @@ func TestRedact_EncodingBypass_HexLower(t *testing.T) {
 	}
 }
 
-// TestRedact_EncodingBypass_HexUpper covers upper-case hex — used by some
+// TestRedact_EncodingBypass_HexUpper covers upper-case hex, used by some
 // hex dumpers and Java's HexFormat.of().formatHex.
 func TestRedact_EncodingBypass_HexUpper(t *testing.T) {
 	raw := []byte("sekret")
@@ -495,7 +495,7 @@ func TestRedact_EncodingBypass_AllFormsAtOnce(t *testing.T) {
 
 // TestRedact_EncodingBypass_ShortSecretSkipsEncodedForms verifies the
 // encodingMinRawLen floor: a 3-byte secret has its raw form registered
-// but no encoded forms — otherwise the 6-char hex "616263" of "abc" would
+// but no encoded forms; otherwise the 6-char hex "616263" of "abc" would
 // false-positive on innocuous logs.
 func TestRedact_EncodingBypass_ShortSecretSkipsEncodedForms(t *testing.T) {
 	raw := []byte("abc")
@@ -531,7 +531,7 @@ func TestEncodedSecretForms_NoDuplicates(t *testing.T) {
 	}
 	for v, n := range seen {
 		if n > 1 {
-			t.Errorf("duplicate registered form %q (count=%d) — de-dup missing", v, n)
+			t.Errorf("duplicate registered form %q (count=%d); de-dup missing", v, n)
 		}
 	}
 }

@@ -4,7 +4,7 @@ package main
 //
 // The MCP run_with_secrets tool lets an AI run an arbitrary command, which could
 // move a resolved secret off-box via any network binary on $PATH (curl, DNS,
-// TCP). Output redaction doesn't cover those paths — only accidental echo. This
+// TCP). Output redaction doesn't cover those paths, only accidental echo. This
 // file is the platform-agnostic surface; sandbox_linux.go wraps commands in
 // bwrap (network namespace + optional minimal FS view), and non-Linux
 // (sandbox_other.go) accepts only SandboxNone.
@@ -18,7 +18,7 @@ package main
 type SandboxProfile int
 
 const (
-	// SandboxNone runs the child with no isolation. CLI/operator only — no
+	// SandboxNone runs the child with no isolation. CLI/operator only; no
 	// MCP-reachable path routes here.
 	SandboxNone SandboxProfile = iota
 	// SandboxNet drops the network (unshare-net) while leaving the

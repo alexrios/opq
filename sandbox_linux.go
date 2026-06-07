@@ -33,7 +33,7 @@ var (
 // bwrap on PATH at a sufficient version, and unprivileged user namespaces
 // available (the kernel feature bwrap needs without setuid).
 //
-// The result — success or failure — is cached for the process lifetime. The
+// The result (success or failure) is cached for the process lifetime. The
 // probe is fork-exec-heavy (~10-50ms) and the host's bwrap/userns/AppArmor
 // state is stable, so re-probing can't recover, only burn cycles. Operators who
 // install bwrap mid-session must restart.
@@ -68,7 +68,7 @@ func verifySandboxAvailableUncached() error {
 		return err
 	}
 	// Functional probe: the version + sysctl checks are necessary but not
-	// sufficient — an AppArmor profile on bwrap (Ubuntu 23.10+), seccomp, or a
+	// sufficient: an AppArmor profile on bwrap (Ubuntu 23.10+), seccomp, or a
 	// missing CONFIG_USER_NS can still block namespace creation. Run a no-op
 	// `true` under flags mirroring SandboxNet so a broken host fails here, at
 	// startup, the same way a real call would.
@@ -168,7 +168,7 @@ func resolveAuditDirForMask() (string, error) {
 // as the operator. Scope is intentionally narrow (canonical paths only); custom
 // sockets elsewhere in $HOME need isolation="full".
 //
-// Masking $HOME/.gnupg breaks gpg running inside the sandbox — the correct
+// Masking $HOME/.gnupg breaks gpg running inside the sandbox; the correct
 // trade: the sandbox is for arbitrary AI commands, not the operator's gpg keys.
 var homeDirSocketTmpfsRel = []string{
 	".gnupg", // gpg-agent socket family (S.gpg-agent, .ssh, .extra, .browser, .scdaemon)
@@ -182,7 +182,7 @@ var homeDirSocketFileRel = []string{
 }
 
 // appendHomeDirSocketMasks masks the $HOME credential-agent sockets. $HOME is
-// the operator's (os.UserHomeDir, parent env) — the AI can't influence it.
+// the operator's (os.UserHomeDir, parent env); the AI can't influence it.
 // Appended after the runtime-socket masks to preserve left-to-right shadowing.
 // If $HOME is unset we fail OPEN (the broader /run masks still apply) rather
 // than block every call on an environment opq already runs in.
@@ -235,7 +235,7 @@ var homeDirForMask = func() (string, error) {
 //
 // Entries must be directories (tmpfs can't cover a file) and are stat()'d at
 // wrap time (bwrap 0.11.0 --tmpfs fails on a missing target). /run/X only,
-// never /var/run/X — on systemd /var/run symlinks to /run and double-masking
+// never /var/run/X: on systemd /var/run symlinks to /run and double-masking
 // crashes bwrap.
 var runtimeSocketDirs = []string{
 	"/run/dbus",         // system D-Bus: Avahi mDNS exfil + other system services
@@ -300,7 +300,7 @@ func appendRuntimeSocketMasks(args []string) []string {
 // survive it and would be exposed by --ro-bind / /. The masks here (plus
 // appendRuntimeSocketMasks and appendHomeDirSocketMasks) close that; the
 // audit-dir mask also stops the child reading caller="cli" entries the MCP
-// filters hide. Don't add --tmpfs /var/run/user — /var/run symlinks to /run, so
+// filters hide. Don't add --tmpfs /var/run/user; /var/run symlinks to /run, so
 // masking /run/user covers it and double-masking crashes bwrap.
 func sandboxNetArgvCommon(auditDir string) []string {
 	args := []string{
@@ -323,7 +323,7 @@ func sandboxNetArgvCommon(auditDir string) []string {
 
 // insertAfterRoBind inserts a flag right after the leading `--ro-bind / /` pair,
 // preserving the mount order sandboxNetArgvCommon depends on. Panics if that
-// pair isn't at the head — a structural invariant, loud here so a future
+// pair isn't at the head; a structural invariant, loud here so a future
 // refactor breaks at build/test time, not at sandbox-exec time.
 func insertAfterRoBind(args []string, flag string) []string {
 	if len(args) < 3 || args[0] != "--ro-bind" || args[1] != "/" || args[2] != "/" {
@@ -338,7 +338,7 @@ func insertAfterRoBind(args []string, flag string) []string {
 
 // WrapCommand returns the argv to run `cmd args...` under the given profile.
 // SandboxNone is a passthrough. Otherwise cmd is resolved to an absolute path on
-// the HOST first — the PATH lookup must precede the sandbox's FS view change.
+// the HOST first: the PATH lookup must precede the sandbox's FS view change.
 func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []string, error) {
 	if cmd == "" {
 		return "", nil, fmt.Errorf("empty command")

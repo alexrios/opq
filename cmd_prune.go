@@ -18,7 +18,7 @@ type PruneCmd struct {
 // the plaintext lingers in the keyring until `prune` (or `delete`) removes it.
 //
 // Prune targets EXPIRED secrets only. Revoked tombstones are deliberately left
-// alone — they are an intentional forensic record and are cleared with
+// alone: they are an intentional forensic record and are cleared with
 // `opq delete`. (A revoked secret's value is already gone, so it never appears
 // as a live key here anyway.)
 func (c *PruneCmd) Run() error {
@@ -50,7 +50,7 @@ func (c *PruneCmd) Run() error {
 	for _, n := range names {
 		m, err := loadMeta(ctx, backend, n)
 		if err != nil {
-			// Don't silently skip a secret whose policy we couldn't read — the
+			// Don't silently skip a secret whose policy we couldn't read; the
 			// operator relies on prune to clear lapsed values, so make the gap
 			// visible rather than reporting a clean sweep that missed one.
 			fmt.Fprintf(os.Stderr, "prune %s: cannot read policy, skipped: %v\n", n, err)

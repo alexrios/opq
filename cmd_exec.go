@@ -58,7 +58,7 @@ const noRedactConfirmInputPrompt = "Type 'no-redact' to confirm release without 
 
 // noRedactConfirmInputLiteral is the literal string the operator must type
 // on the controlling terminal. A fixed literal (rather than the secret name)
-// is used because --no-redact is not scoped to a single secret — the flag
+// is used because --no-redact is not scoped to a single secret; the flag
 // disables the redactor for every secret injected via --env in this run.
 const noRedactConfirmInputLiteral = "no-redact"
 
@@ -67,7 +67,7 @@ const noRedactConfirmInputLiteral = "no-redact"
 var errNoRedactGate = errors.New("no-redact release gate")
 
 // The --no-redact gate (which disables the RedactingWriter) reuses
-// checkRetypeGate — it is gated identically to `get --plaintext`. The bypass it
+// checkRetypeGate; it is gated identically to `get --plaintext`. The bypass it
 // closes: an AI runs `opq exec --no-redact ...` via run_with_secrets; the outer
 // MCP redactor has no secrets registered for the inner argv, so plaintext would
 // flow straight back.
@@ -186,7 +186,7 @@ func (c *ExecCmd) Run() error {
 		stderrRW = NewRedactingWriter(os.Stderr, named)
 		cmd.Stdout = stdoutRW
 		cmd.Stderr = stderrRW
-		// Destroy after subprocess exits — done below.
+		// Destroy after subprocess exits (done below).
 		defer stdoutRW.Destroy()
 		defer stderrRW.Destroy()
 	} else {
@@ -273,7 +273,7 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 			return nil, fmt.Errorf("invalid env var name %q", envName)
 		}
 		if isBlockedEnvName(envName) {
-			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc. — see env_policy.go); cannot be injected via --env", envName)
+			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.; see env_policy.go); cannot be injected via --env", envName)
 		}
 		if !validSecretName(secretName) {
 			return nil, fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", secretName)

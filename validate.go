@@ -1,8 +1,8 @@
-// Package main — input-name validation shared across the CLI and MCP surfaces.
+// Package main: input-name validation shared across the CLI and MCP surfaces.
 //
 // Both checks bound caller-controlled bytes (secret names, env-var names) before
 // they reach the keyring, a subprocess env table, or the operator audit log.
-// They are name-shape guards only — the env-NAME *deny-list* (PATH, LD_*, ...)
+// They are name-shape guards only; the env-NAME *deny-list* (PATH, LD_*, ...)
 // lives in env_policy.go.
 package main
 
