@@ -17,11 +17,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Provisions the exact toolchain pinned in mise.toml ([tools] go),
       # so CI runs the same Go as `mise install` does locally.
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           cache: true
 
@@ -31,9 +31,9 @@ jobs:
   vulncheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           cache: true
 
