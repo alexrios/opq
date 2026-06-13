@@ -29,10 +29,14 @@ All `opq`-specific variables use the `OPQ_*` prefix.
 
 ### Honored by the keyring layer
 
-The Secret Service backend talks to your session keyring over D-Bus, so the usual
-freedesktop variables apply (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`). If
+On Linux, the Secret Service backend talks to your session keyring over D-Bus, so the
+usual freedesktop variables apply (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`). If
 `opq list` fails with a D-Bus error, your keyring session is not unlocked; see
 [Installation](../getting-started/installation.md#verifying-the-install).
+
+On macOS, the Keychain backend uses the login keychain directly and honors no such
+environment variables; access requires only that the keychain be unlocked (it is, while
+you are logged in).
 
 ## Not configurable in v1
 

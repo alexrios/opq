@@ -1,6 +1,6 @@
 # opq
 
-> **Status:** v1.1.6. Linux only for now; macOS Keychain backend planned for v1.2.
+> **Status:** v1.1.6. Linux (Secret Service) and macOS (Keychain) supported.
 
 An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
 
@@ -18,7 +18,12 @@ The agent calls `opq exec` (or the `run_with_secrets` MCP tool); `opq` injects t
 go install github.com/alexrios/opq@latest
 ```
 
-Requires Linux with an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC) for the keyring backend. The MCP sandbox is implemented on both Linux (via **bubblewrap**, `bwrap`) and macOS (via `sandbox-exec` / Seatbelt, built in); other platforms accept only `-sandbox=none`.
+Keyring backend by platform:
+
+- **Linux** — an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC).
+- **macOS** — the login Keychain (no extra install). The binary must be built with CGO enabled (the default for `go install` on macOS; needs the Xcode Command Line Tools) so it can link the Security framework.
+
+The MCP sandbox is implemented on both Linux (via **bubblewrap**, `bwrap`) and macOS (via `sandbox-exec` / Seatbelt, built in); other platforms accept only `-sandbox=none`.
 
 ## Documentation
 

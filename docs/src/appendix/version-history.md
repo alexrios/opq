@@ -6,14 +6,22 @@ behind each control is preserved.
 
 ## Unreleased
 
+- macOS Keychain backend. Secrets storage, previously Linux-only (Secret Service), now
+  has a native macOS implementation (`backend_darwin.go`) using the login Keychain via
+  `99designs/keyring`, with items namespaced under the `opq` service. `OpenDefaultBackend`
+  is split per-OS (`backend_linux.go` / `backend_darwin.go` / `backend_other.go`), each
+  restricted to a single allowed backend so opq never falls back to an unencrypted file
+  store. `KeychainTrustApplication` lets the opq binary read back its own secrets without a
+  per-call prompt; `KeychainSynchronizable` is off so secrets never reach iCloud. The
+  Keychain backend requires a CGO-enabled build (it links the Security framework). With
+  this and the macOS sandbox below, opq is now supported on macOS as well as Linux.
 - macOS sandbox backend. The subprocess sandbox, previously Linux-only (`bwrap`), now
   has a native macOS implementation using `sandbox-exec` (Seatbelt / SBPL) in
   `sandbox_darwin.go`. It maps the same `SandboxNet` / `SandboxNetAllowed` /
   `SandboxFull` profiles via `(allow default)` + targeted denies, with two documented
   divergences: writes are denied wholesale under `SandboxNet` (Seatbelt cannot overlay
   an empty tmpfs, which is strictly stronger against the two-call exfil chain), and
-  `SandboxFull` is allow-default-with-denies rather than deny-default. The keyring
-  backend remains Linux-only (Secret Service); macOS Keychain is still planned for v1.2.
+  `SandboxFull` is allow-default-with-denies rather than deny-default.
   See [The Sandbox](../security/sandbox.md#macos-seatbelt).
 
 ## v1.1.6 (current)

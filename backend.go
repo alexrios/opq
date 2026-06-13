@@ -10,9 +10,11 @@ import (
 	"github.com/awnumar/memguard"
 )
 
-// Backend abstracts a secrets store. v1 ships one implementation
-// (Secret Service via 99designs/keyring); future backends (macOS Keychain,
-// Proton Pass) implement this same interface.
+// Backend abstracts a secrets store. It is implemented over 99designs/keyring
+// against the platform's native store: Secret Service on Linux (backend_linux.go)
+// and the macOS Keychain on darwin (backend_darwin.go); other OSes have no
+// backend (backend_other.go). Future backends (e.g. Proton Pass) implement this
+// same interface.
 type Backend interface {
 	Name() string
 	Get(ctx context.Context, name string) (*Buffer, error)
@@ -31,24 +33,11 @@ const (
 	collectionName = "opq"
 )
 
-// OpenDefaultBackend opens the platform-default backend. On Linux this is
-// Secret Service (libsecret / gnome-keyring / KWallet via D-Bus). The list
-// is intentionally restricted so we don't silently fall back to, e.g., an
-// unencrypted file backend.
-func OpenDefaultBackend() (Backend, error) {
-	kr, err := keyring.Open(keyring.Config{
-		ServiceName:             serviceName,
-		LibSecretCollectionName: collectionName,
-		AllowedBackends: []keyring.BackendType{
-			keyring.SecretServiceBackend,
-			keyring.KeychainBackend, // for the future macOS build
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("open keyring: %w", err)
-	}
-	return &keyringBackend{kr: kr, name: "secret-service"}, nil
-}
+// OpenDefaultBackend opens the platform-default secrets store. The
+// implementation is per-OS (backend_linux.go / backend_darwin.go /
+// backend_other.go): each opens 99designs/keyring restricted to a single
+// allowed backend so opq never silently falls back to an unencrypted file
+// store, and wraps it in keyringBackend.
 
 type keyringBackend struct {
 	kr   keyring.Keyring
