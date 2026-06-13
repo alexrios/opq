@@ -18,7 +18,7 @@ The agent calls `opq exec` (or the `run_with_secrets` MCP tool); `opq` injects t
 go install github.com/alexrios/opq@latest
 ```
 
-Requires Linux with an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC) and **bubblewrap** (`bwrap`) for the MCP sandbox.
+Requires Linux with an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC) for the keyring backend. The MCP sandbox is implemented on both Linux (via **bubblewrap**, `bwrap`) and macOS (via `sandbox-exec` / Seatbelt, built in); other platforms accept only `-sandbox=none`.
 
 ## Documentation
 

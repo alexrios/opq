@@ -6,8 +6,12 @@
 > controls.
 
 Every subprocess launched through `run_with_secrets` (and `opq exec --sandbox`) runs
-inside a [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) sandbox. The
-argv builder is in `sandbox_linux.go`; the profile enum is in `sandbox.go`.
+inside an OS-native sandbox: [bubblewrap](https://github.com/containers/bubblewrap)
+(`bwrap`) on Linux and `sandbox-exec` (Seatbelt) on macOS. The profile enum is in
+`sandbox.go`; the Linux argv builder is in `sandbox_linux.go` and the macOS profile
+builder in `sandbox_darwin.go`. Most of this page describes the Linux backend; the
+[macOS section](#macos-seatbelt) covers how the Seatbelt port maps the same profiles and
+where it deliberately diverges.
 
 This page covers each mount and the exploit it closes. Several were confirmed attacks
 against earlier versions; the hardening history is in the
@@ -125,8 +129,46 @@ side-channels, kernel-keyring inheritance, and pre-compromise of host binaries u
 `/usr`. `isolation="full"` is the way out for those, not piecemeal additions to the mask
 list.
 
+## macOS (Seatbelt)
+
+On macOS the backend is `sandbox-exec` driving a generated [SBPL](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf)
+(Sandbox Profile Language) profile. `sandbox-exec` is formally deprecated by Apple but
+ships on every release and is the same primitive Chromium, nix, and Homebrew use; there
+is no supported CLI replacement. `WrapCommand` resolves the command to an absolute host
+path, then runs `sandbox-exec -p <profile> <abs-cmd> <args...>`.
+
+The profiles are `(allow default)` with targeted denies:
+
+| Profile | Network | Filesystem | Credential masks |
+| --- | --- | --- | --- |
+| `SandboxNet` | `(deny network*)` | `(deny file-write*)` (read-only host) | deny-read `$HOME/.gnupg`, `.ssh`, `.docker/run/docker.sock`, `$SSH_AUTH_SOCK`, and the audit dir |
+| `SandboxNetAllowed` | (allowed) | identical to `SandboxNet` | identical to `SandboxNet` |
+| `SandboxFull` | `(deny network*)` | `(deny file-write*)` + deny-read `/Users`, `/private/var/root`, `/tmp`, `/private/tmp`, `/private/var/tmp`, `/private/var/folders` | (covered by the `/Users` deny) |
+
+`(deny network*)` also blocks AF_UNIX `connect(2)`, so credential agents reachable by
+socket are closed under `SandboxNet` without a per-socket bind mask. The audit-dir path is
+resolved with `filepath.EvalSymlinks` (the kernel canonicalizes `/tmp -> /private/tmp`
+before the Seatbelt check), and `WrapCommand` fails closed if neither `HOME` nor
+`XDG_STATE_HOME` resolves, matching the Linux contract.
+
+Two deliberate divergences from the Linux backend:
+
+- **No empty `/tmp`.** Seatbelt can allow or deny a path but cannot overlay an empty
+  tmpfs, so where Linux `SandboxNet` gives a fresh writable `/tmp`, macOS denies all
+  writes. This is *stronger* against the two-call exfil chain (nothing can be staged for a
+  later call to read) but means a subprocess that needs scratch space fails under the
+  sandbox; run such commands via the CLI with `-sandbox=none` after review.
+- **`SandboxFull` is allow-default with denies**, not Linux's deny-default
+  `--unshare-all` + minimal binds. It delivers the documented guarantee (no network, no
+  `$HOME`/`/tmp` reads, read-only FS) but is less hermetic; a deny-default SBPL profile
+  that still lets arbitrary binaries dyld-load reliably is far more fragile.
+
+The startup probe is `sandbox-exec -p '(version 1)(allow default)' /usr/bin/true`; a host
+where Seatbelt is wedged by MDM policy fails at startup rather than at the first tool call.
+
 ## Startup probe
 
 `opq mcp` runs a no-op `bwrap --unshare-net --unshare-pid -- true` probe at startup. If
 AppArmor, seccomp, or a missing `CONFIG_USER_NS` blocks unprivileged namespace creation,
-the server stops with a clear error instead of failing at the first tool call.
+the server stops with a clear error instead of failing at the first tool call. The macOS
+equivalent is described in the [macOS section](#macos-seatbelt) above.

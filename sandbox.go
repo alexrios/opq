@@ -6,8 +6,9 @@ package main
 // move a resolved secret off-box via any network binary on $PATH (curl, DNS,
 // TCP). Output redaction doesn't cover those paths, only accidental echo. This
 // file is the platform-agnostic surface; sandbox_linux.go wraps commands in
-// bwrap (network namespace + optional minimal FS view), and non-Linux
-// (sandbox_other.go) accepts only SandboxNone.
+// bwrap (network namespace + optional minimal FS view), sandbox_darwin.go wraps
+// them in sandbox-exec (Seatbelt SBPL), and other OSes (sandbox_other.go)
+// accept only SandboxNone.
 //
 // Blocks: external network egress, and (SandboxFull) reads of $HOME and /tmp.
 // Does NOT block: loopback to co-resident services, timing side-channels,
