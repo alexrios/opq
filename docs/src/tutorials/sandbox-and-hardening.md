@@ -1,10 +1,15 @@
 # Sandbox & Hardening
 
-Every subprocess launched through the MCP `run_with_secrets` tool runs inside a
-bubblewrap sandbox. This page covers the controls an operator and an AI client can set:
-the isolation profiles and the network opt-in, plus the policy-proxy pattern for
-high-risk deployments. The full bwrap argv and the exploit each mask closes are in
-[The Sandbox](../security/sandbox.md).
+Every subprocess launched through the MCP `run_with_secrets` tool runs inside the
+OS-native sandbox: `bwrap` (bubblewrap) on Linux, `sandbox-exec` (Seatbelt) on macOS.
+This page covers the controls an operator and an AI client can set: the isolation
+profiles and the network opt-in, plus the policy-proxy pattern for high-risk
+deployments. The full bwrap argv, the macOS Seatbelt profiles, and the exploit each mask
+closes are in [The Sandbox](../security/sandbox.md).
+
+The isolation profiles below are described with their Linux (bwrap) primitives; macOS
+enforces the same profiles via Seatbelt, with the two divergences (no empty `/tmp`;
+allow-default `SandboxFull`) noted in [The Sandbox](../security/sandbox.md#macos-seatbelt).
 
 ## Isolation profiles
 

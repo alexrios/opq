@@ -27,8 +27,8 @@ also commit it to `.mcp.json`):
 }
 ```
 
-`opq mcp` speaks the Model Context Protocol over stdio. At startup it runs a bubblewrap
-namespace probe (see
+`opq mcp` speaks the Model Context Protocol over stdio. At startup it runs an OS sandbox
+probe (on Linux, a bubblewrap namespace probe; see
 [Installation](../getting-started/installation.md#troubleshooting-the-bubblewrap-startup-probe)) and
 stops if the sandbox cannot be built. Confirm the server registered with `claude mcp
 list` (or `/mcp` inside Claude Code); `opq` should show as connected.
@@ -139,8 +139,8 @@ stderr: bash: connect: Network is unreachable
 stdout: EGRESS_BLOCKED (exit 1)
 ```
 
-The subprocess runs in a network namespace with no route out, so an outbound TCP
-`connect()` fails with `ENETUNREACH`.
+The subprocess has no route out, so an outbound TCP `connect()` fails: `ENETUNREACH`
+under Linux's network namespace, or a sandbox denial under macOS Seatbelt.
 
 ### Every use is logged
 

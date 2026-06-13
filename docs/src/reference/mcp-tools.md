@@ -28,8 +28,9 @@ run_with_secrets({
 })
 ```
 
-Runs `command` with the named secrets injected as environment variables, inside a
-bubblewrap sandbox. It returns redacted stdout and stderr (every occurrence of every
+Runs `command` with the named secrets injected as environment variables, inside the
+OS-native sandbox (`bwrap` on Linux, `sandbox-exec`/Seatbelt on macOS). It returns
+redacted stdout and stderr (every occurrence of every
 injected secret, plus its base64/hex forms, replaced with `[REDACTED:VAR]`), a
 normalized exit of `success` or `failure` (the raw status goes to the audit log, never
 to the AI), and a `timed_out` flag.

@@ -71,9 +71,9 @@ base64/hex forms, is replaced with `[REDACTED:VAR]`.
 
 `--env VAR=name` maps an env var name to a stored secret name. Env-var names are capped
 at 256 bytes and checked against the [deny-list](./env-deny-list.md) (`LD_PRELOAD`,
-`PATH`, `BASH_ENV`, and so on). `--sandbox net|full` wraps the child in a bubblewrap
-sandbox using the same profiles as the
-[MCP tool](../tutorials/sandbox-and-hardening.md#isolation-profiles). `--no-redact`
+`PATH`, `BASH_ENV`, and so on). `--sandbox net|full` wraps the child in the OS-native
+sandbox (`bwrap` on Linux, `sandbox-exec`/Seatbelt on macOS) using the same profiles as
+the [MCP tool](../tutorials/sandbox-and-hardening.md#isolation-profiles). `--no-redact`
 disables redaction and is gated identically to `get --plaintext` (TTY +
 `OPQ_I_AM_HUMAN=1` + retype `no-redact` on the controlling terminal); the gate runs
 before any keyring access, and refusal writes a `denied` audit entry with
@@ -124,5 +124,6 @@ last `N` and spans the active log and one historical rotation. See the
 opq mcp
 ```
 
-Runs the MCP server over stdio. Stops if bubblewrap is missing or the namespace probe
-fails. See [MCP Tools](./mcp-tools.md).
+Runs the MCP server over stdio. Stops if the OS sandbox is unavailable (on Linux,
+`bwrap` missing or the namespace probe fails; on macOS, `sandbox-exec` unavailable). See
+[MCP Tools](./mcp-tools.md).

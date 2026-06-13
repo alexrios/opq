@@ -42,8 +42,8 @@ These rules hold even when the calling agent is trying to extract the secret:
   `run_with_secrets` returns redacted output.
 - Subprocess output is redacted by default, including base64 and hex forms of the
   value.
-- MCP subprocesses run with no network route and a private PID namespace, so a leaked
-  value still cannot leave the machine.
+- MCP subprocesses run in an OS-native sandbox with no network route (and, on Linux, a
+  private PID namespace), so a leaked value still cannot leave the machine.
 - Every use is written to an audit log the agent cannot read in full.
 
 The [MCP tutorial](./tutorials/mcp-claude-code.md) includes a session where the agent

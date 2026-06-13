@@ -4,6 +4,18 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
+## Unreleased
+
+- macOS sandbox backend. The subprocess sandbox, previously Linux-only (`bwrap`), now
+  has a native macOS implementation using `sandbox-exec` (Seatbelt / SBPL) in
+  `sandbox_darwin.go`. It maps the same `SandboxNet` / `SandboxNetAllowed` /
+  `SandboxFull` profiles via `(allow default)` + targeted denies, with two documented
+  divergences: writes are denied wholesale under `SandboxNet` (Seatbelt cannot overlay
+  an empty tmpfs, which is strictly stronger against the two-call exfil chain), and
+  `SandboxFull` is allow-default-with-denies rather than deny-default. The keyring
+  backend remains Linux-only (Secret Service); macOS Keychain is still planned for v1.2.
+  See [The Sandbox](../security/sandbox.md#macos-seatbelt).
+
 ## v1.1.6 (current)
 
 Tooling and naming. The project was renamed from `opaque` to `opq` so that
