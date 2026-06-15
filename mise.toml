@@ -5,7 +5,7 @@ mdbook = "0.5.2"
 [tasks.build]
 description = "Build the opq binary into dist/ (gitignored)"
 dir = "{{config_root}}"
-run = "go build -o dist/opq ."
+run = "go build -ldflags \"-X main.version=$(git describe --tags --always --dirty)\" -o dist/opq ."
 
 [tasks.test]
 description = "Run all unit tests (no network or keyring required)"
@@ -34,7 +34,8 @@ depends = ["vet", "test", "build"]
 
 [tasks.install]
 description = "Install the opq binary via go install (override location with GOBIN)"
-run = "go install ."
+dir = "{{config_root}}"
+run = "go install -ldflags \"-X main.version=$(git describe --tags --always --dirty)\" ."
 
 [tasks.smoke]
 description = "End-to-end smoke test (REQUIRES an unlocked Secret Service / keyring session)"

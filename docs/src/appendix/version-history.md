@@ -4,7 +4,10 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
-## Unreleased
+## v1.2.0 (macOS support) (current)
+
+First release supported on macOS as well as Linux. Adds a native macOS Keychain secrets
+backend and a `sandbox-exec` (Seatbelt) subprocess sandbox, and wires up `opq --version`.
 
 - macOS Keychain backend. Secrets storage, previously Linux-only (Secret Service), now
   has a native macOS implementation (`backend_darwin.go`) using the login Keychain via
@@ -24,7 +27,7 @@ behind each control is preserved.
   `SandboxFull` is allow-default-with-denies rather than deny-default.
   See [The Sandbox](../security/sandbox.md#macos-seatbelt).
 
-## v1.1.6 (current)
+## v1.1.6
 
 Tooling and naming. The project was renamed from `opaque` to `opq` so that
 `go install github.com/alexrios/opq@latest` produces the `opq` binary directly (Go names
