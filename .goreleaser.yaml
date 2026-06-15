@@ -1,0 +1,84 @@
+# GoReleaser config for opq. Runs on tag push (see .github/workflows/release.yml)
+# on a macOS runner so the darwin builds can link the Security framework via CGO,
+# while the linux builds are pure Go (CGO off) and cross-compile from the same host.
+version: 2
+
+project_name: opq
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  # darwin needs CGO=1 to link the Security framework (Keychain backend).
+  - id: darwin
+    binary: opq
+    main: .
+    env:
+      - CGO_ENABLED=1
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+  # linux uses the pure-Go Secret Service (D-Bus) backend; CGO off cross-compiles.
+  - id: linux
+    binary: opq
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+
+archives:
+  - id: default
+    ids: [darwin, linux]
+    # Matches the existing tap convention: opq_<version>_<os>_<arch>.tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+# Pushes a generated cask to alexrios/homebrew-tap, replacing Casks/opq.rb.
+# Requires the HOMEBREW_TAP_GITHUB_TOKEN env var (a PAT with write to the tap).
+homebrew_casks:
+  - name: opq
+    repository:
+      owner: alexrios
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/alexrios/opq"
+    description: "AI-safe secrets CLI that keeps plaintext from callers and AI agents"
+    commit_author:
+      name: Alex Rios
+      email: alex.rios1337@gmail.com
+    # Strip the macOS quarantine flag from the unsigned binary on install so
+    # Gatekeeper does not block first run.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/opq"]
+          end

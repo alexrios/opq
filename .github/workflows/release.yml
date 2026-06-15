@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the GitHub release and upload assets
+
+jobs:
+  goreleaser:
+    # macOS so the darwin builds can link the Security framework via CGO; the
+    # linux builds are pure Go (CGO off) and cross-compile from the same host.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history + tags for the changelog
+
+      # Provisions the toolchain pinned in mise.toml ([tools] go + goreleaser),
+      # so releases use the same Go and GoReleaser as `mise run release` locally.
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+
+      - run: mise run release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with write access to alexrios/homebrew-tap (cross-repo cask push).
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

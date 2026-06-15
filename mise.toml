@@ -1,6 +1,7 @@
 [tools]
 go = "1.26.4"
 mdbook = "0.5.2"
+goreleaser = "2.16.0"
 
 [tasks.build]
 description = "Build the opq binary into dist/ (gitignored)"
@@ -49,6 +50,21 @@ dist/opq audit --tail 5
 dist/opq delete smoke_key
 echo "smoke OK"
 '''
+
+[tasks."release:check"]
+description = "Validate .goreleaser.yaml"
+dir = "{{config_root}}"
+run = "goreleaser check"
+
+[tasks."release:snapshot"]
+description = "Build a local snapshot release (all targets, no publish) to verify the pipeline"
+dir = "{{config_root}}"
+run = "goreleaser release --snapshot --clean"
+
+[tasks.release]
+description = "Cut a release with GoReleaser (CI-only, on tag push; needs GITHUB_TOKEN + HOMEBREW_TAP_GITHUB_TOKEN)"
+dir = "{{config_root}}"
+run = "goreleaser release --clean"
 
 [tasks.docs]
 description = "Build the mdbook documentation into docs/book (gitignored)"
