@@ -27,4 +27,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PAT with write access to alexrios/homebrew-tap (cross-repo cask push).
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          # Reuses the same GH_PAT secret as the other taps (e.g. goenv).
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.GH_PAT }}
