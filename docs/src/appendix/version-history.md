@@ -4,7 +4,15 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
-## v1.2.0 (macOS support) (current)
+## v1.2.1 (current)
+
+Release tooling and documentation. Releases are now cut by GoReleaser on tag push
+(cross-platform builds, the GitHub release, and the Homebrew cask in
+[`alexrios/homebrew-tap`](https://github.com/alexrios/homebrew-tap)), so
+`brew install alexrios/tap/opq` tracks each release. Documentation adds the Homebrew
+install path and a round of accuracy fixes from a content review.
+
+## v1.2.0 (macOS support)
 
 First release supported on macOS as well as Linux. Adds a native macOS Keychain secrets
 backend and a `sandbox-exec` (Seatbelt) subprocess sandbox, and wires up `opq --version`.
