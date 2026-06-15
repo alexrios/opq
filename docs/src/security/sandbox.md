@@ -157,7 +157,7 @@ Two deliberate divergences from the Linux backend:
   tmpfs, so where Linux `SandboxNet` gives a fresh writable `/tmp`, macOS denies all
   writes. This is *stronger* against the two-call exfil chain (nothing can be staged for a
   later call to read) but means a subprocess that needs scratch space fails under the
-  sandbox; run such commands via the CLI with `-sandbox=none` after review.
+  sandbox; run such commands via the CLI with `--sandbox=none` after review.
 - **`SandboxFull` is allow-default with denies**, not Linux's deny-default
   `--unshare-all` + minimal binds. It delivers the documented guarantee (no network, no
   `$HOME`/`/tmp` reads, read-only FS) but is less hermetic; a deny-default SBPL profile

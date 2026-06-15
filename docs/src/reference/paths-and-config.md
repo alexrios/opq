@@ -11,9 +11,10 @@ well-known paths, tuned through a small set of environment variables.
 | `…/opq/audit.log.1` | One historical rotation, kept when the active log passes 10 MiB. |
 | `…/opq/audit.lock` | The cross-process flock file (never rotated). |
 
-Secrets are not stored on disk by `opq`; they live in the OS keyring (Secret Service /
-libsecret on Linux) under the `opq` service name and collection. Policy metadata is a
-companion keyring item keyed `meta/<name>`.
+Secrets are not stored on disk by `opq`; they live in the OS keyring under the `opq`
+service name (the Secret Service / libsecret collection `opq` on Linux; generic-password
+items under Keychain service `opq` on macOS). Policy metadata is a companion keyring item
+keyed `meta/<name>`.
 
 ## Environment variables
 
@@ -54,5 +55,5 @@ selection is not a runtime option either; the allowed-backends list is compiled 
 Build-from-source steps are in
 [Installation](../getting-started/installation.md#build-from-source). The contributor
 workflow (tests, `go vet`, the [`mise`](https://mise.jdx.dev/) task runner, and building
-this book) lives in the repo's `CLAUDE.md` and the
+this book) lives in the repo's `README.md` and the
 [Version History](../appendix/version-history.md#re-verifying) appendix.

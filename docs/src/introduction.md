@@ -9,8 +9,9 @@ It pays off without an AI agent, too: secrets stay out of your shell history and
 output and live in the OS keyring instead of a `.env` file. The AI-safety properties
 build on that base.
 
-Status: v1.2.0. Supported on Linux (Secret Service) and macOS (Keychain). The project
-was formerly named `opaque`; the binary and command are now `opq`.
+Status: v1.2.0. Supported on Linux (Secret Service) and macOS (Keychain), licensed under
+the GNU AGPL-3.0. The project was formerly named `opaque`; the binary and command are now
+`opq`.
 
 ## The problem
 

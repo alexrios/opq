@@ -1,5 +1,15 @@
 # Installation
 
+## Install with Homebrew
+
+```sh
+brew install alexrios/tap/opq
+```
+
+Installs a prebuilt binary from the
+[`alexrios/homebrew-tap`](https://github.com/alexrios/homebrew-tap) tap, on macOS (Apple
+Silicon or Intel) and Linux. No Go toolchain or CGO setup required.
+
 ## Install with `go install`
 
 ```sh

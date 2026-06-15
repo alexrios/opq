@@ -46,6 +46,9 @@ to the AI), and a `timed_out` flag.
 | `allow_network` | bool | false | `true` lifts the network block (audited as `network_allowed`); filesystem sandbox still applies. |
 | `isolation` | string | `"net"` | `"net"` or `"full"`; see [Sandbox profiles](../tutorials/sandbox-and-hardening.md#isolation-profiles). |
 
+`allow_network: true` requires the default `"net"` isolation; combining it with
+`isolation: "full"` is rejected as a validation error.
+
 ### Limits and quantization
 
 Each output stream is capped at 256 KiB. Truncation happens silently: no truncation flag
@@ -56,8 +59,8 @@ marker so tooling can strip it.
 
 ### Error taxonomy
 
-Errors returned to the AI are fixed-taxonomy strings, never wrapped backend or library
-text:
+Backend, sandbox, and process errors returned to the AI are fixed-taxonomy strings,
+never wrapped backend or library text:
 
 `backend_error` · `not_found: <name>` · `exec_not_found` · `exec_permission_denied` ·
 `exec_start_failed` · `sandbox_unavailable` · `wrap_command_failed` · `invalid_input`
@@ -65,6 +68,10 @@ text:
 
 Revoked, expired, and missing secrets all collapse to `not_found`, so the error channel
 cannot be used as a policy-state oracle. The precise reason goes to the audit log only.
+
+Input-validation errors (a missing `command`, an invalid env-var name, an incompatible
+`isolation`) are returned as opq's own literal messages rather than taxonomy codes; they
+carry no backend or library text.
 
 ## `audit_tail`
 

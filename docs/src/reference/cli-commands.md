@@ -1,7 +1,8 @@
 # CLI Commands
 
-The complete `opq` command surface. Each command records an entry in the
-[audit log](./audit-log.md).
+The complete `opq` command surface. Secret operations are recorded in the
+[audit log](./audit-log.md); `opq audit` is a read-only view of that log and does not
+log itself.
 
 | Command | Behavior |
 | --- | --- |

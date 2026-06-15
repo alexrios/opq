@@ -18,10 +18,11 @@ risks.
   interpolation.
 - Memory swap-out of secret pages; values live in `memguard` mlocked buffers.
 - Intentional network exfiltration via the MCP `run_with_secrets` tool, blocked by
-  default. Every MCP subprocess runs in a network namespace (`--unshare-net`), a private
-  PID namespace (`--unshare-pid`), and a private `/proc`, so `curl`, DNS-label smuggling,
-  and raw TCP/UDP all fail, and concurrent calls cannot read each other's
-  `/proc/<pid>/environ`.
+  default. On Linux, every MCP subprocess runs in a network namespace (`--unshare-net`), a
+  private PID namespace (`--unshare-pid`), and a private `/proc`, so `curl`, DNS-label
+  smuggling, and raw TCP/UDP all fail, and concurrent calls cannot read each other's
+  `/proc/<pid>/environ`. On macOS, Seatbelt (`sandbox-exec`) denies the subprocess all
+  network access; it does not create PID namespaces or a private `/proc`.
 
 ### Sandbox-specific vectors
 

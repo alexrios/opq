@@ -96,7 +96,7 @@ list_secrets()  →  { "names": ["api_token"] }
 run_with_secrets({
   command: "sh",
   args: ["-c", "echo \"len=$(printf %s \"$TOK\" | wc -c)\"; \
-                echo \"sha256=$(printf %s \"$TOK\" | sha256sum | cut -d' ' -f1)\"; \
+                echo \"sha256=$(printf %s \"$TOK\" | shasum -a 256 | cut -d' ' -f1)\"; \
                 echo \"raw_value=$TOK\""],
   env: { TOK: "api_token" }
 })
@@ -115,7 +115,7 @@ AI boundary.
 
 ```jsonc
 run_with_secrets({ command: "sh", args: ["-c",
-  "echo \"b64=$(printf %s \"$TOK\" | base64 -w0)\"; \
+  "echo \"b64=$(printf %s \"$TOK\" | base64 | tr -d '\\n')\"; \
    echo \"hex=$(printf %s \"$TOK\" | od -An -tx1 | tr -d ' \\n')\""],
   env: { TOK: "api_token" } })
 ```

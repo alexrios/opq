@@ -21,6 +21,8 @@ kept at `audit.log.1`. `opq audit --tail N` spans both files.
 | `set` | A secret was stored (with `expires_at=` if a TTL was set). |
 | `get` | A plaintext read via `opq get --plaintext`. |
 | `delete` | A secret was removed. |
+| `revoke` | A secret was revoked: its value wiped, a tombstone left. |
+| `prune` | Expired secrets were deleted (`opq prune`). |
 | `list` | Names were listed. |
 | `exec_inject` | A secret was injected into a CLI `opq exec` child. |
 | `mcp_run` | The MCP `run_with_secrets` tool ran a subprocess. |
