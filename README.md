@@ -40,3 +40,7 @@ mise run docs:serve  # live-reload preview at http://localhost:3000
 mise run check       # vet + test + build
 mise run vulncheck   # govulncheck ./...
 ```
+
+## License
+
+[GNU AGPL-3.0](LICENSE).
