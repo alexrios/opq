@@ -17,6 +17,17 @@ jobs:
         with:
           fetch-depth: 0 # full history + tags for the changelog
 
+      # Fail in seconds (not after a full macOS build) if the tap PAT is missing
+      # or empty, since the Homebrew cask push would 401 at the very end.
+      - name: Verify tap token is present
+        env:
+          TAP_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::GH_PAT secret is empty or unset. Set it with: gh secret set GH_PAT --repo alexrios/opq"
+            exit 1
+          fi
+
       # Provisions the toolchain pinned in mise.toml ([tools] go + goreleaser),
       # so releases use the same Go and GoReleaser as `mise run release` locally.
       - uses: jdx/mise-action@v4

@@ -10,8 +10,7 @@ output and live in the OS keyring instead of a `.env` file. The AI-safety proper
 build on that base.
 
 Status: v1.2.1. Supported on Linux (Secret Service) and macOS (Keychain), licensed under
-the GNU AGPL-3.0. The project was formerly named `opaque`; the binary and command are now
-`opq`.
+the GNU AGPL-3.0.
 
 ## The problem
 
