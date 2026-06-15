@@ -20,8 +20,8 @@ go install github.com/alexrios/opq@latest
 
 Keyring backend by platform:
 
-- **Linux** — an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC).
-- **macOS** — the login Keychain (no extra install). The binary must be built with CGO enabled (the default for `go install` on macOS; needs the Xcode Command Line Tools) so it can link the Security framework.
+- **Linux:** an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC).
+- **macOS:** the login Keychain (no extra install). The binary must be built with CGO enabled (the default for `go install` on macOS; needs the Xcode Command Line Tools) so it can link the Security framework.
 
 The MCP sandbox is implemented on both Linux (via **bubblewrap**, `bwrap`) and macOS (via `sandbox-exec` / Seatbelt, built in); other platforms accept only `-sandbox=none`.
 
