@@ -1,5 +1,7 @@
 # opq
 
+[![Install with Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20alexrios%2Ftap%2Fopq-FBB040?logo=homebrew&logoColor=white)](https://github.com/alexrios/homebrew-tap)
+
 > **Status:** v1.2.1. Linux (Secret Service) and macOS (Keychain) supported.
 
 An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
