@@ -27,6 +27,25 @@ cd opq
 go build -o opq .          # or: mise run build  → dist/opq
 ```
 
+## Install the Claude Code skill
+
+For agent-driven workflows, this repo ships a
+[Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that teaches an
+agent to install `opq`, register the MCP server, and use secrets safely — without ever
+seeing plaintext. The skill is bundled as
+[`opq.skill`](https://github.com/alexrios/opq/blob/main/opq.skill) (a ZIP); install it
+into any harness by unpacking it under your skills directory:
+
+```sh
+unzip opq.skill -d ~/.claude/skills/   # → ~/.claude/skills/opq/SKILL.md
+```
+
+The skill activates automatically whenever a task needs a credential (for example,
+calling an authenticated API) and walks the agent through the no-plaintext workflow:
+`run_with_secrets` over MCP and `opq exec` on the CLI. It complements the binary install
+above — the agent still needs the `opq` binary on `PATH` (the skill covers installing
+it).
+
 ## Requirements
 
 `opq` runs on Linux and macOS. On a standard desktop session of either the requirements

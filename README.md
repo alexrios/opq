@@ -29,6 +29,16 @@ Keyring backend by platform:
 
 The MCP sandbox is implemented on both Linux (via **bubblewrap**, `bwrap`) and macOS (via `sandbox-exec` / Seatbelt, built in); other platforms accept only `--sandbox=none`.
 
+## Claude Code skill
+
+This repo ships a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) ([`opq.skill`](opq.skill)) that teaches an agent to install `opq`, register the MCP server, and use secrets safely. Drop it into any agent harness:
+
+```sh
+unzip opq.skill -d ~/.claude/skills/   # → ~/.claude/skills/opq/SKILL.md
+```
+
+It activates whenever a task needs a credential (e.g. calling an authenticated API) and guides the agent through the no-plaintext workflow.
+
 ## Documentation
 
 The full documentation lives in the mdbook, published at **<https://alexrios.github.io/opq/>** (source under [`docs/`](docs/src/SUMMARY.md)): getting started, tutorials, the complete CLI/MCP reference, and the detailed security model. Build and read it locally:
