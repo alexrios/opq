@@ -297,7 +297,7 @@ func filterParentEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, e := range env {
 		name, _, _ := strings.Cut(e, "=")
-		if strings.HasPrefix(name, "OPQ_") || backendCredentialEnv[name] {
+		if strings.HasPrefix(name, "OPQ_") || strings.HasPrefix(name, "PROTON_PASS_") || backendCredentialEnv[name] {
 			continue
 		}
 		out = append(out, e)
@@ -305,15 +305,18 @@ func filterParentEnv(env []string) []string {
 	return out
 }
 
-// backendCredentialEnv names the SECRET credentials opq reads to authenticate
-// to a non-keyring backend (Vault token, Proton PAT, Proton env-key). Only the
-// secrets are scrubbed here: the non-OPQ vendor config a child may legitimately
-// reuse (VAULT_ADDR, VAULT_NAMESPACE, ...) is left inherited. opq's own
-// OPQ_-prefixed config (OPQ_VAULT_*, OPQ_PROTON_*, OPQ_BACKEND) is dropped
-// separately by the OPQ_ prefix rule above, so a child never inherits the
-// parent's backend selection.
+// backendCredentialEnv, together with the PROTON_PASS_ prefix scrubbed above,
+// names what opq must keep out of any child it spawns. pass-cli reads many
+// credential env vars under the PROTON_PASS_ namespace (PROTON_PASS_PASSWORD,
+// _TOTP, _SSH_KEY_PASSWORD, _EXTRA_PASSWORD, _PERSONAL_ACCESS_TOKEN, their _FILE
+// variants, ...), so the whole namespace is scrubbed by prefix rather than an
+// exact list that would silently miss new ones; dropping the few non-secret
+// PROTON_PASS_ config vars from a child is harmless. Vault's only secret is
+// VAULT_TOKEN (exact match) — VAULT_ADDR / VAULT_NAMESPACE are non-secret config
+// a child may legitimately reuse, so VAULT_ is NOT blanket-scrubbed. None of
+// these are registered with the redactor, so a child must never inherit them.
+// (The MCP run path builds an empty-parent env; this guards the CLI exec path,
+// which inherits os.Environ().)
 var backendCredentialEnv = map[string]bool{
-	"VAULT_TOKEN":                       true,
-	"PROTON_PASS_PERSONAL_ACCESS_TOKEN": true,
-	"PROTON_PASS_ENCRYPTION_KEY":        true,
+	"VAULT_TOKEN": true,
 }

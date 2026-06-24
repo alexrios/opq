@@ -43,7 +43,9 @@ and `delete` destroy **all** versions (`DELETE …/metadata/…`), not a recover
 The mount must be KV v2; v1 is unsupported. `VAULT_ADDR` must be `https://` (over plaintext
 the token and values would cross the network in the clear); set
 `OPQ_VAULT_ALLOW_INSECURE_HTTP=1` to permit an `http://` endpoint such as a localhost dev
-server.
+server. The opq token's policy needs `read`, `create`, `update` on `<mount>/data/<prefix>/*`
+and `read`, `delete`, `list` on `<mount>/metadata/<prefix>/*` — note `delete`'s existence
+probe reads metadata, so a delete-only metadata policy fails closed.
 
 ## Proton Pass (read-only)
 
@@ -64,11 +66,13 @@ in the keyring or Vault instead.
 
 ## Credential hygiene
 
-The secret credentials `opq` reads to reach a backend — `VAULT_TOKEN`,
-`PROTON_PASS_PERSONAL_ACCESS_TOKEN`, `PROTON_PASS_ENCRYPTION_KEY` — are scrubbed from the
-environment of any child `opq exec` spawns, so a subprocess can't read them from `$VAULT_TOKEN`
-and exfiltrate the master key to the whole store. Non-secret config (`VAULT_ADDR`, …) is left
-in place. The MCP `run_with_secrets` child already starts from an empty parent environment.
+`VAULT_TOKEN` and the entire `PROTON_PASS_*` namespace (the vault password, TOTP, SSH-key
+password, extra password, PAT, encryption key, and their `_FILE` variants — every credential
+`pass-cli` reads) are scrubbed from the environment of any child `opq exec` spawns, so a
+subprocess can't read them and gain access to the store. The whole `PROTON_PASS_` prefix is
+dropped (rather than a fixed name list) so new pass-cli credential vars stay covered.
+Non-secret Vault config (`VAULT_ADDR`, `VAULT_NAMESPACE`) is left in place. The MCP
+`run_with_secrets` child already starts from an empty parent environment.
 
 ## Wiring in a new backend
 

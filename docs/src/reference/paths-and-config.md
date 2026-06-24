@@ -43,8 +43,8 @@ see [Backends](../appendix/backends.md).
 | `OPQ_PROTON_FIELD` | Proton item field to read (default `password`). |
 | `OPQ_PROTON_PASS_CLI` | Path to the `pass-cli` binary (default: found on `PATH`). |
 
-`VAULT_TOKEN`, `PROTON_PASS_PERSONAL_ACCESS_TOKEN`, and `PROTON_PASS_ENCRYPTION_KEY` are
-scrubbed from `opq exec` child environments so a subprocess cannot read them.
+`VAULT_TOKEN` and every `PROTON_PASS_*` variable are scrubbed from `opq exec` child
+environments so a subprocess cannot read them.
 
 ### Honored by the keyring layer
 

@@ -201,6 +201,35 @@ func TestOpenVaultBackend_RequiresHTTPS(t *testing.T) {
 	}
 }
 
+func TestOpenVaultBackend_DisablesRedirects(t *testing.T) {
+	t.Setenv("VAULT_ADDR", "https://vault.example:8200")
+	t.Setenv("VAULT_TOKEN", "tok")
+	b, err := openVaultBackend()
+	if err != nil {
+		t.Fatalf("openVaultBackend: %v", err)
+	}
+	vb := b.(*vaultBackend)
+	if vb.hc.CheckRedirect == nil {
+		t.Fatal("vault client must disable redirect-following so X-Vault-Token is never forwarded on a 3xx")
+	}
+	if err := vb.hc.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("CheckRedirect should return http.ErrUseLastResponse, got %v", err)
+	}
+}
+
+func TestVaultBackend_GetMalformedValue(t *testing.T) {
+	// A foreign / non-base64 "value" at our path must fail closed (error, no
+	// leak), never decode to garbage or panic.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{"data": map[string]any{"data": map[string]any{vaultValueField: "!!not-base64!!"}}})
+	}))
+	defer srv.Close()
+	b := &vaultBackend{addr: srv.URL, token: "t", mount: "secret", prefix: "opq", hc: srv.Client()}
+	if _, err := b.Get(context.Background(), "x"); err == nil || errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("malformed value should error (not leak, not not-found), got %v", err)
+	}
+}
+
 func TestVaultBackend_RoundTrip(t *testing.T) {
 	b, _ := newFakeVaultBackend(t)
 	mustSet(t, b, "github_token", "ghp_abc123")

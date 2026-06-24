@@ -212,6 +212,19 @@ func TestProtonBackend_DuplicateTitle(t *testing.T) {
 	}
 }
 
+func TestProtonBackend_GetRejectsInvalidName(t *testing.T) {
+	// A non-meta name that fails validSecretName must short-circuit (defense in
+	// depth) before any pass-cli call.
+	f := &fakeProton{t: t, responses: map[string]fakeResp{}}
+	b := &protonBackend{bin: "pass-cli", vault: "v", field: "password", run: f.run}
+	if _, err := b.Get(context.Background(), "has space"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("Get(invalid name): want ErrSecretNotFound, got %v", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("invalid name must not spawn pass-cli, got calls: %v", f.calls)
+	}
+}
+
 func TestProtonBackend_SetDeleteReadOnly(t *testing.T) {
 	b := newFakeProton(t, map[string]fakeResp{})
 	buf, _ := NewBufferFromBytes([]byte("x"))

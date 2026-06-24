@@ -94,22 +94,34 @@ func TestFilterParentEnv_ScrubsBackendCredentials(t *testing.T) {
 		"VAULT_TOKEN=s.secret",
 		"PROTON_PASS_PERSONAL_ACCESS_TOKEN=pst_x",
 		"PROTON_PASS_ENCRYPTION_KEY=k",
+		"PROTON_PASS_PASSWORD=hunter2",
+		"PROTON_PASS_EXTRA_PASSWORD=second",
+		"PROTON_PASS_TOTP=123456",
+		"PROTON_PASS_SSH_KEY_PASSWORD=sshpw",
+		"PROTON_PASS_PASSWORD_FILE=/run/secrets/pw",
 		"PROTON_PASS_SESSION_DIR=/run/x",
 		"OPQ_BACKEND=vault",
 		"MY_APP_TOKEN=keep",
 	}
+	// The entire PROTON_PASS_ namespace is scrubbed (pass-cli reads many
+	// credential vars there); VAULT_TOKEN is scrubbed by exact match.
 	dropped := map[string]bool{
 		"VAULT_TOKEN":                       true,
 		"PROTON_PASS_PERSONAL_ACCESS_TOKEN": true,
 		"PROTON_PASS_ENCRYPTION_KEY":        true,
+		"PROTON_PASS_PASSWORD":              true,
+		"PROTON_PASS_EXTRA_PASSWORD":        true,
+		"PROTON_PASS_TOTP":                  true,
+		"PROTON_PASS_SSH_KEY_PASSWORD":      true,
+		"PROTON_PASS_PASSWORD_FILE":         true,
+		"PROTON_PASS_SESSION_DIR":           true, // non-secret config, but in the scrubbed namespace
 		"OPQ_BACKEND":                       true,
 	}
 	kept := map[string]bool{
-		"PATH":                    true,
-		"HOME":                    true,
-		"VAULT_ADDR":              true, // non-secret config stays
-		"PROTON_PASS_SESSION_DIR": true, // non-secret config stays
-		"MY_APP_TOKEN":            true,
+		"PATH":         true,
+		"HOME":         true,
+		"VAULT_ADDR":   true, // non-secret Vault config stays
+		"MY_APP_TOKEN": true,
 	}
 
 	seen := map[string]bool{}
