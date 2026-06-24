@@ -15,6 +15,12 @@ The complete `opq` command surface. Each command records an entry in the
 | `opq audit [--tail N]` | Show audit-log entries. |
 | `opq mcp` | Run as a Model Context Protocol server over stdio. |
 
+## Global flags
+
+`--backend keyring|vault|proton-pass` (or `$OPQ_BACKEND`; the flag wins) selects the secret
+store for any command. It defaults to `keyring`. An unknown value is rejected. See
+[Backends](../appendix/backends.md).
+
 ## `opq set`
 
 ```sh

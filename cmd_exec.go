@@ -287,15 +287,33 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 	return out, nil
 }
 
-// filterParentEnv drops internal OPQ_* vars from the inherited env so
-// they cannot leak into the subprocess.
+// filterParentEnv drops, from the inherited env, both internal OPQ_* vars and
+// the secret credentials opq itself reads to reach a non-keyring backend. The
+// latter must never ride into a child: they are not registered with the
+// redactor, so a child could echo e.g. $VAULT_TOKEN (the master key to the
+// whole store) in the clear. The MCP run path builds its own empty-parent env;
+// this guards the CLI exec path, which inherits os.Environ().
 func filterParentEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, e := range env {
-		if strings.HasPrefix(e, "OPQ_") {
+		name, _, _ := strings.Cut(e, "=")
+		if strings.HasPrefix(name, "OPQ_") || backendCredentialEnv[name] {
 			continue
 		}
 		out = append(out, e)
 	}
 	return out
+}
+
+// backendCredentialEnv names the SECRET credentials opq reads to authenticate
+// to a non-keyring backend (Vault token, Proton PAT, Proton env-key). Only the
+// secrets are scrubbed here: the non-OPQ vendor config a child may legitimately
+// reuse (VAULT_ADDR, VAULT_NAMESPACE, ...) is left inherited. opq's own
+// OPQ_-prefixed config (OPQ_VAULT_*, OPQ_PROTON_*, OPQ_BACKEND) is dropped
+// separately by the OPQ_ prefix rule above, so a child never inherits the
+// parent's backend selection.
+var backendCredentialEnv = map[string]bool{
+	"VAULT_TOKEN":                       true,
+	"PROTON_PASS_PERSONAL_ACCESS_TOKEN": true,
+	"PROTON_PASS_ENCRYPTION_KEY":        true,
 }

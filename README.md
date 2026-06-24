@@ -1,6 +1,6 @@
 # opq
 
-> **Status:** v1.1.6. Linux only for now; macOS Keychain backend planned for v1.2.
+> **Status:** v1.1.6. Linux only for now. Backends: OS keyring (default), HashiCorp Vault, and Proton Pass (read-only); macOS Keychain planned for v1.2.
 
 An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
 

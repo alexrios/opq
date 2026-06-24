@@ -26,16 +26,29 @@ type Backend interface {
 // sentinel so callers can match on it.
 var ErrSecretNotFound = errors.New("secret not found")
 
+// ErrBackendReadOnly is returned by Backend.Set / Backend.Delete on a read-only
+// backend (e.g. Proton Pass, which opq reads via pass-cli but never mutates).
+// Callers may match it with errors.Is; sanitizeBackendErr maps it to the bare
+// "read_only" audit token.
+var ErrBackendReadOnly = errors.New("backend is read-only")
+
 const (
 	serviceName    = "opq"
 	collectionName = "opq"
 )
 
-// OpenDefaultBackend opens the platform-default backend. On Linux this is
-// Secret Service (libsecret / gnome-keyring / KWallet via D-Bus). The list
-// is intentionally restricted so we don't silently fall back to, e.g., an
-// unencrypted file backend.
+// OpenDefaultBackend opens the backend selected by --backend / OPQ_BACKEND
+// (default: keyring). Every command and MCP tool calls this no-arg form; the
+// selection logic and tight allowlist live in openBackend (backend_select.go).
 func OpenDefaultBackend() (Backend, error) {
+	return openBackend(backendName)
+}
+
+// openKeyringBackend opens the platform-default OS keyring. On Linux this is
+// Secret Service (libsecret / gnome-keyring / KWallet via D-Bus); on macOS the
+// Keychain. The AllowedBackends list is intentionally restricted so we never
+// silently fall back to, e.g., an unencrypted file backend.
+func openKeyringBackend() (Backend, error) {
 	kr, err := keyring.Open(keyring.Config{
 		ServiceName:             serviceName,
 		LibSecretCollectionName: collectionName,
@@ -122,8 +135,12 @@ func (b *keyringBackend) List(_ context.Context) ([]string, error) {
 // embed secret bytes there, and audit Messages are AI-readable via audit_tail.
 // The wrapped error returned to the caller still carries the full detail.
 func sanitizeBackendErr(err error) string {
-	if errors.Is(err, ErrSecretNotFound) {
+	switch {
+	case errors.Is(err, ErrSecretNotFound):
 		return "not_found"
+	case errors.Is(err, ErrBackendReadOnly):
+		return "read_only"
+	default:
+		return "backend_error"
 	}
-	return "backend_error"
 }

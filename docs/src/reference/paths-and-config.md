@@ -11,9 +11,10 @@ well-known paths, tuned through a small set of environment variables.
 | `…/opq/audit.log.1` | One historical rotation, kept when the active log passes 10 MiB. |
 | `…/opq/audit.lock` | The cross-process flock file (never rotated). |
 
-Secrets are not stored on disk by `opq`; they live in the OS keyring (Secret Service /
-libsecret on Linux) under the `opq` service name and collection. Policy metadata is a
-companion keyring item keyed `meta/<name>`.
+With the default keyring backend, secrets are not stored on disk by `opq`; they live in the
+OS keyring (Secret Service / libsecret on Linux) under the `opq` service name and collection.
+Policy metadata is a companion item keyed `meta/<name>`. Other [backends](../appendix/backends.md)
+(Vault, Proton Pass) keep secrets in their own systems.
 
 ## Environment variables
 
@@ -26,6 +27,24 @@ companion keyring item keyed `meta/<name>`.
 | `HOME` | Resolves `~/.local/state` and the home-directory socket masks under SandboxNet. |
 
 All `opq`-specific variables use the `OPQ_*` prefix.
+
+### Backend selection
+
+`opq` reads the OS keyring by default. `--backend` or `OPQ_BACKEND` chooses another store;
+see [Backends](../appendix/backends.md).
+
+| Variable | Effect |
+| --- | --- |
+| `OPQ_BACKEND` | Backend when `--backend` is omitted: `keyring` (default), `vault`, or `proton-pass`. |
+| `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_NAMESPACE` | Vault address, token, and optional namespace (standard Vault vars). |
+| `OPQ_VAULT_MOUNT`, `OPQ_VAULT_PREFIX` | Vault KV v2 mount (default `secret`) and path prefix (default `opq`). |
+| `OPQ_VAULT_ALLOW_INSECURE_HTTP` | Set to `1` to allow a plaintext `http://` `VAULT_ADDR` (default: https is required). |
+| `OPQ_PROTON_VAULT` | Proton Pass vault name to read (required for `proton-pass`). |
+| `OPQ_PROTON_FIELD` | Proton item field to read (default `password`). |
+| `OPQ_PROTON_PASS_CLI` | Path to the `pass-cli` binary (default: found on `PATH`). |
+
+`VAULT_TOKEN`, `PROTON_PASS_PERSONAL_ACCESS_TOKEN`, and `PROTON_PASS_ENCRYPTION_KEY` are
+scrubbed from `opq exec` child environments so a subprocess cannot read them.
 
 ### Honored by the keyring layer
 
@@ -40,10 +59,10 @@ By design (see [Design Decisions](../security/design-decisions.md)), there is no
 file: no `opq.toml` or dotfile. The deny-list, sandbox masks, and limits are compiled in
 so a writable config cannot weaken them. There is no per-project allowlist; that policy
 belongs in a deployment-side
-[policy proxy](../tutorials/sandbox-and-hardening.md#the-policy-proxy-pattern). Backend
-selection is not a runtime option either; the allowed-backends list is compiled into
-`OpenDefaultBackend`, and adding one means editing `AllowedBackends` (see
-[Adding a Backend](../appendix/backends.md)).
+[policy proxy](../tutorials/sandbox-and-hardening.md#the-policy-proxy-pattern). Backends are
+selectable at runtime via `--backend`/`OPQ_BACKEND`, but only from a compiled-in allowlist
+(`openBackend`); an unknown name is rejected rather than falling back to a file store (see
+[Backends](../appendix/backends.md)).
 
 ## Building from source
 

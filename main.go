@@ -10,6 +10,8 @@ import (
 )
 
 type CLI struct {
+	Backend string `name:"backend" default:"keyring" enum:"keyring,vault,proton-pass" env:"OPQ_BACKEND" help:"Secret backend: keyring (default), vault, or proton-pass. Also set by $OPQ_BACKEND."`
+
 	Set    SetCmd    `cmd:"" help:"Store a secret. Reads value from stdin (or TTY prompt if interactive). The value never appears in argv."`
 	Get    GetCmd    `cmd:"" help:"Print a secret to stdout. Refuses to run unless stdout is a TTY (blocks AI piping)."`
 	List   ListCmd   `cmd:"" help:"List secret names and their TTL/revocation status. Never prints values."`
@@ -39,6 +41,10 @@ func run() int {
 		kong.Description("opq: AI-safe secrets gatekeeper. Stores secrets in your OS keyring and lets programs use them without ever exposing plaintext to the caller."),
 		kong.UsageOnError(),
 	)
+	// Record the selected backend before any command (or MCP handler goroutine)
+	// runs; OpenDefaultBackend reads it. kong has already folded in --backend
+	// and $OPQ_BACKEND with flag > env > default("keyring") precedence.
+	backendName = cli.Backend
 	err := ctx.Run()
 	if err == nil {
 		return 0
