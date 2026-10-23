@@ -29,8 +29,8 @@ type runWithSecretsInput struct {
 	Args           []string          `json:"args,omitempty" jsonschema:"arguments to pass to the command"`
 	Env            map[string]string `json:"env" jsonschema:"mapping of ENV_VAR_NAME -> secret_name; the named secret's value will be set in the subprocess environment. Max 32 entries."`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"per-call wall-clock timeout in seconds. Defaults to 60. Capped at 600."`
-	AllowNetwork   bool              `json:"allow_network,omitempty" jsonschema:"if true, the subprocess runs WITHOUT a network sandbox and can reach external hosts; default false (network blocked)"`
-	Isolation      string            `json:"isolation,omitempty" jsonschema:"filesystem isolation: 'net' (default; host FS passthrough) or 'full' (tmpfs /home, /tmp; minimal ro-binds)"`
+	AllowNetwork   bool              `json:"allow_network,omitempty" jsonschema:"if true, permits external networking while retaining filesystem and protected-socket restrictions; default false (network blocked)"`
+	Isolation      string            `json:"isolation,omitempty" jsonschema:"filesystem isolation: 'net' (default; host filesystem read-only) or 'full' (restricted host-file reads; platform-specific details in the sandbox reference)"`
 }
 
 // resolveMCPSandbox maps (AllowNetwork, Isolation) to a profile. Default is

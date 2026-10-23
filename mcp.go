@@ -94,8 +94,8 @@ func newMCPServer(lifetime context.Context) (*mcp.Server, error) {
 		Description: strings.Join([]string{
 			"Run a subprocess with named secrets injected as environment variables.",
 			"Subprocess stdout/stderr is byte-redacted for the injected secrets and common base64/hex forms. Arbitrary output encodings and side channels remain visible; this is protection against accidental disclosure.",
-			"NETWORK SANDBOX (DEFAULT): the subprocess runs inside a network namespace with NO external connectivity (DNS lookups, TCP/UDP/IP egress, and outbound HTTP all fail). Set `allow_network=true` ONLY when the command's purpose is to reach the network (e.g. an API call). When you opt in, the call is recorded in the operator's audit log as `network_allowed`.",
-			"FILESYSTEM ISOLATION (opt-in): set `isolation=\"full\"` to additionally replace /home and /tmp with empty tmpfs mounts (only minimal /usr, /etc, /lib, /lib64, /bin, /sbin are exposed read-only). Use this when you want defense in depth against the subprocess reading other files on the host.",
+			"NETWORK SANDBOX (DEFAULT): the subprocess uses the platform sandbox with NO external connectivity (Linux namespaces or macOS Seatbelt; DNS, TCP/UDP/IP egress, and outbound HTTP fail). Set `allow_network=true` ONLY when the command's purpose is to reach the network (e.g. an API call). When you opt in, the call is recorded in the operator's audit log as `network_allowed`.",
+			"FILESYSTEM ISOLATION (opt-in): isolation=full gives Linux minimal read-only system mounts and empty /home and /tmp. macOS denies home/temp reads with a less hermetic Seatbelt profile. See the public sandbox reference for platform limits.",
 			"SECURITY CAVEATS (read before relying on this tool):",
 			"(1) Even with the network sandbox, the subprocess shares the kernel with the host. Loopback channels, kernel-keyring inheritance, and timing side-channels are NOT blocked.",
 			"(2) The redactor is byte-exact. Raw, common base64, and common hex forms are redacted; URL percent-encoding, base32, and arbitrary custom encodings are NOT covered.",
