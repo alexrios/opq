@@ -667,7 +667,7 @@ func TestSandboxNet_DeadlineClosesDescendantPipes(t *testing.T) {
 	if err := VerifySandboxAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	wrapped, args, err := WrapCommand(SandboxNet, "/bin/sh", []string{"-c", "/bin/sleep 10 <&0 & wait"})
+	wrapped, args, err := WrapCommand(SandboxNet, "/bin/sh", []string{"-c", "/bin/sleep 10 | /bin/cat"})
 	if err != nil {
 		t.Fatal(err)
 	}

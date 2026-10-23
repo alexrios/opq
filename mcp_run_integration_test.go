@@ -34,11 +34,11 @@ func TestSandboxMCP_DeadlineKillsDescendantsAndAudits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	// Keep fd 0 explicitly: the Linux profile prevents dash from opening
-	// /dev/null as the implicit stdin of a background job.
+	// A foreground pipeline creates descendants without requiring the shell
+	// to reopen protected /dev/null during asynchronous-job setup.
 	result, out, err := handleRunWithSecrets(ctx, nil, runWithSecretsInput{
 		Command: "/bin/sh",
-		Args:    []string{"-c", "/bin/sleep 10 <&0 & wait"},
+		Args:    []string{"-c", "/bin/sleep 10 | /bin/cat"},
 	})
 	if err != nil || result == nil || result.IsError || !out.TimedOut || out.Succeeded || out.ExitCode != 1 {
 		t.Fatalf("deadline result incorrect: %v %v %+v", err, result, out)
