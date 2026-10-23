@@ -12,7 +12,9 @@ Mode `0600`, one JSON object per line. A sibling `audit.lock` file (also `0600`)
 serializes appends and tail reads across concurrent `opq` processes with `flock(2)`
 (`LOCK_EX` for writes, `LOCK_SH` for reads); rotation is atomic across processes and
 never drops the lock. The active log is capped at 10 MiB, with one historical rotation
-kept at `audit.log.1`. `opq audit --tail N` spans both files.
+kept at `audit.log.1`. Writers follow rotations performed by other processes before
+appending. `opq audit --tail N` spans both files and reads only the trailing blocks needed
+for a positive `N`. Each append is synced to disk before releasing the write lock.
 
 ## Actions
 

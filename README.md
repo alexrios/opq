@@ -3,9 +3,9 @@
 [![Install with Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20alexrios%2Ftap%2Fopq-FBB040?logo=homebrew&logoColor=white)](https://github.com/alexrios/homebrew-tap)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-> **Status:** v1.2.1. Linux (Secret Service) and macOS (Keychain) supported.
+> **Status:** v1.3.0. Linux (Secret Service) and macOS (Keychain) supported.
 
-An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them without ever exposing plaintext. Invoked as `opq`.
+An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them with output redaction against accidental disclosure. Invoked as `opq`.
 
 ```sh
 opq exec --env OPENAI_API_KEY=openai_key -- curl ...   # ok: secret injected, output redacted
@@ -13,7 +13,13 @@ opq get  openai_key | cat                              # blocked: never plaintex
 opq mcp                                                # MCP server over stdio for AI agents
 ```
 
-The agent calls `opq exec` (or the `run_with_secrets` MCP tool); `opq` injects the secret as an env var into the child, scans the child's output, and replaces the value with `[REDACTED:VAR]` before it reaches the agent. The agent never sees the plaintext. There is deliberately **no** `get_secret_value` MCP tool.
+The agent calls `opq exec` (or the `run_with_secrets` MCP tool); `opq` injects the secret as an env var into the child, scans the child's output, and replaces the value with `[REDACTED:VAR]` before it reaches the agent. Raw and common base64/hex forms are redacted. A malicious consuming program can still encode secrets in output or exfiltrate them when network access is granted. For untrusted agents, use the [operator-owned policy proxy example](examples/policy-proxy/README.md) to expose fixed operations instead of arbitrary commands. There is deliberately **no** `get_secret_value` MCP tool.
+
+## Upgrade to v1.3.0
+
+Stop existing opq MCP, proxy, and exec processes before upgrading, then restart them
+with the new binary. Older binaries do not understand interrupted policy updates and
+must not access the same keyring concurrently. See the [release and upgrade notes](https://alexrios.github.io/opq/appendix/version-history.html#v130-current).
 
 ## Install
 
@@ -37,7 +43,7 @@ This repo ships a [Claude Code skill](https://docs.claude.com/en/docs/claude-cod
 unzip opq.skill -d ~/.claude/skills/   # → ~/.claude/skills/opq/SKILL.md
 ```
 
-It activates whenever a task needs a credential (e.g. calling an authenticated API) and guides the agent through the no-plaintext workflow.
+It activates whenever a task needs a credential (e.g. calling an authenticated API) and guides the agent through name-based credential use with output redaction.
 
 ## Documentation
 

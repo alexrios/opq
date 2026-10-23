@@ -4,7 +4,58 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
-## v1.2.1 (current)
+## v1.3.0 (current)
+
+Security and performance fixes for command execution, policy updates, and auditing.
+The CLI command surface is unchanged. An optional fixed-operation MCP proxy example
+is available in the repository.
+
+### Upgrade notes
+
+1. Stop all existing `opq mcp`, policy-proxy, and secret-backed `opq exec` processes.
+   Upgrade the binary, then restart those processes. Do not run older and newer clients
+   against the same keyring concurrently: older clients do not understand version 2
+   pending-update metadata. Existing values and version 1 metadata remain readable.
+2. MCP consumers should handle `server_busy` when four runs are already preparing or
+   executing, and `request_canceled` for a canceled request. Command and argument strings
+   together are limited to 1 MiB. Per-stream output remains capped at 256 KiB.
+3. Output no longer has artificial padding or an `[opq-pad]` marker. Clients should
+   consume the redacted stdout/stderr directly. Padding did not hide the original length
+   or close arbitrary output-content channels.
+4. `opq list` can show `UPDATE-PENDING` after an interrupted update. Retry `opq set`
+   with the intended value and policy, or explicitly delete the interrupted item. Stop
+   old clients before recovery. Recovery does not happen automatically and no stored
+   values are migrated merely by installing this release.
+
+### Changes
+
+- macOS network-enabled runs now deny Unix-socket connections to protected Docker,
+  GPG, SSH, audit, and policy-state paths. Read restrictions alone did not stop
+  `connect(2)`. Canonical paths and symlink aliases are covered; HTTP and unprotected
+  custom Unix sockets remain available. The system Docker socket is also protected.
+- Secret value and policy reads/mutations share an OS-account-based cross-process
+  lock. A pending record blocks reads across incomplete updates; unknown metadata
+  versions fail closed. Emergency revocation still wipes a value when its metadata is
+  unreadable, and prune rechecks the current generation before deleting.
+- Subprocess deadlines, original CLI signals, and MCP/proxy disconnects trigger child
+  cleanup. Inherited pipe waits and audit-lock waits are bounded. Redirected stdin
+  retains access to a controlling terminal, and confirmation reads can be canceled.
+  Native keyring and filesystem syscalls remain non-preemptible while in flight.
+- Audit writers reopen the active file after another process rotates it. Positive
+  tails read backward instead of loading the whole log; lock serialization and `fsync`
+  durability are retained.
+- Redaction indexes candidate forms by first byte, reuses and wipes scratch buffers,
+  and shares prepared forms across stdout/stderr. Ordinary-memory copies required by
+  native keyring APIs and `os/exec` remain an explicit limitation.
+- The optional operator-owned policy proxy exposes only fixed approved operations
+  and returns status only. It does not constrain an agent with unrestricted shell
+  access as the same OS principal. The public security model and bundled agent skill
+  now distinguish accidental disclosure from adversarial command exfiltration.
+- Release builds use Go 1.26.10. CI covers Linux/macOS races, real sandbox behavior,
+  and bounded fuzz checks. See [verification details](./performance-security-verification.md)
+  for measured performance, regressions, and verification limits.
+
+## v1.2.1
 
 Release tooling and documentation. Releases are now cut by GoReleaser on tag push
 (cross-platform builds, the GitHub release, and the Homebrew cask in
@@ -48,7 +99,9 @@ directory date from this rename.
 - The redactor registers base64 (std/URL, padded/raw) and hex (lower/upper) forms of each
   secret, closing the "just base64 it" evasion (see [The Redactor](../security/redactor.md)).
 - AI-visible stdout/stderr lengths are padded to fixed buckets (1/4/16/64/256 KiB),
-  collapsing the length side channel from ~17 bits to ~2.3 bits per call.
+  originally intended to reduce the length side channel. That claim was incorrect:
+  the marker and caller-chosen content expose the original length. Padding is removed
+  in v1.3.0.
 - Container-runtime and system-D-Bus masks (P0-1, P1-2). `--ro-bind / /` left Docker,
   containerd, and similar sockets and `/run/dbus` `connect(2)`-reachable. An AI could spawn
   a privileged container (`-v /:/host`) or broadcast the secret as an Avahi mDNS TXT record.

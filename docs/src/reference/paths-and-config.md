@@ -9,7 +9,8 @@ well-known paths, tuned through a small set of environment variables.
 | --- | --- |
 | `${XDG_STATE_HOME:-$HOME/.local/state}/opq/audit.log` | The audit log (mode `0600`). |
 | `…/opq/audit.log.1` | One historical rotation, kept when the active log passes 10 MiB. |
-| `…/opq/audit.lock` | The cross-process flock file (never rotated). |
+| `…/opq/audit.lock` | The cross-process audit flock file (never rotated). |
+| `<OS-account-home>/.local/state/opq-policy/policy.lock` | Policy/value transaction lock. Its location comes from the OS account database, independently of `HOME` and `XDG_STATE_HOME`. |
 
 Secrets are not stored on disk by `opq`; they live in the OS keyring under the `opq`
 service name (the Secret Service / libsecret collection `opq` on Linux; generic-password

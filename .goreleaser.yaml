@@ -49,6 +49,10 @@ checksum:
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 
+release:
+  header: |
+    Read the [release and upgrade notes](https://github.com/alexrios/opq/blob/{{ .Tag }}/docs/src/appendix/version-history.md) before updating running MCP servers.
+
 changelog:
   use: github
   sort: asc
@@ -70,7 +74,7 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     directory: Casks
     homepage: "https://github.com/alexrios/opq"
-    description: "AI-safe secrets CLI that keeps plaintext from callers and AI agents"
+    description: "Secrets CLI with OS keyring storage and redacted command output"
     commit_author:
       name: Alex Rios
       email: alex.rios1337@gmail.com

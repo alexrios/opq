@@ -1,7 +1,9 @@
 # opq + Claude Code (MCP)
 
-This wires `opq` into an MCP-aware client (Claude Code here) and shows the agent
-trying, and failing, to read a secret it is allowed to use.
+This registers `opq` with an MCP-aware client (Claude Code here), then explains
+name-based credential use and accidental-output redaction. Arbitrary consuming
+commands can still encode secrets or exfiltrate them when networking is allowed.
+For adversarial agents, use the [fixed-operation proxy](./sandbox-and-hardening.md#the-policy-proxy-pattern).
 
 ## 1. Register the MCP server
 
@@ -41,7 +43,8 @@ list` (or `/mcp` inside Claude Code); `opq` should show as connected.
 | `run_with_secrets({ command, args, env, ... })` | Runs a command with named secrets injected as env vars; returns redacted stdout/stderr. |
 | `audit_tail({ n })` | Returns recent audit entries (the AI-filtered view). |
 
-There is no `get_secret_value` tool. An AI can use secrets, not read them. The
+There is no `get_secret_value` tool. This blocks direct retrieval; consuming programs
+still receive plaintext, and their output can carry information. The
 [MCP Tools reference](../reference/mcp-tools.md) has every parameter and the error
 taxonomy.
 
@@ -50,10 +53,11 @@ taxonomy.
 From your own shell, not the agent:
 
 ```sh
-printf 'sk-prod-XXXX' | opq set api_token
+opq set api_token --ttl 24h
 ```
 
-The agent can now use `api_token` without ever touching the value. The subprocess is
+The agent references `api_token` by name; the consuming subprocess receives its value.
+The subprocess is
 network-blocked by default, so start with a local command that works under the default
 sandbox:
 
@@ -81,8 +85,9 @@ See [Sandbox & Hardening](./sandbox-and-hardening.md).
 
 ## Trying to extract the secret
 
-The session below runs against a stored secret `api_token`, injected as `$TOK`, with
-the agent acting as the adversary. Every output is what the model received back.
+The following illustrative examples show which raw/base64/hex forms the redactor
+recognizes. They are not recommended agent workflows and do not establish protection
+against arbitrary encoding or output-content channels.
 
 ### The AI can see names, not values
 
@@ -108,10 +113,11 @@ raw_value=[REDACTED:TOK]
 ```
 
 The subprocess computed the secret's real length and SHA-256, so it received and used
-the plaintext. The value read back is `[REDACTED:TOK]`; the plaintext did not cross the
-AI boundary.
+the plaintext. The value read back is `[REDACTED:TOK]`; the raw value was redacted. Length and hash remain visible, so this demonstration is
+not a secrecy guarantee. Agent workflows should not request lengths, hashes, or
+encoded credential output.
 
-### Encoding to dodge a byte-exact match also fails
+### Common base64 and hex forms are redacted
 
 ```jsonc
 run_with_secrets({ command: "sh", args: ["-c",
@@ -127,7 +133,7 @@ hex=[REDACTED:TOK]
 The redactor registers the base64 (std/URL, padded/unpadded) and hex (lower/upper)
 forms of each secret, so the "just base64 it" route is caught.
 
-### A leaked value still cannot leave the box
+### Default networking blocks outbound TCP
 
 ```jsonc
 run_with_secrets({ command: "bash", args: ["-c",
@@ -142,7 +148,7 @@ stdout: EGRESS_BLOCKED (exit 1)
 The subprocess has no route out, so an outbound TCP `connect()` fails: `ENETUNREACH`
 under Linux's network namespace, or a sandbox denial under macOS Seatbelt.
 
-### Every use is logged
+### Audit visibility
 
 ```jsonc
 audit_tail({ n: 3 })
@@ -155,8 +161,8 @@ audit_tail({ n: 3 })
 
 The operator sees which secrets were used and when (full detail via `opq audit`). The
 agent's own `audit_tail` view is allowlist-filtered to remove the exit-code, timing,
-and output-volume oracles, and each `audit_tail` call leaves its own entry, so the
-scraping is visible too.
+and output-volume oracles, and each `audit_tail` call attempts to record its own entry. Audit storage failures
+are reported to the operator; execution currently continues.
 
 ## Hardening for adversarial deployments
 
