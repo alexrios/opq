@@ -19,10 +19,12 @@ type listSecretsOutput struct {
 }
 
 func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecretsInput) (*mcp.CallToolResult, listSecretsOutput, error) {
+	ctx, cancel := context.WithTimeout(ctx, mcpDefaultTimeout)
+	defer cancel()
 	// Audit BEFORE the backend call so an AI probing a degraded backend (D-Bus
 	// down, keyring locked) by hammering list_secrets still leaves a trace even
 	// when every call errors.
-	_ = AppendAudit(AuditEvent{Action: ActionList, Caller: callerTag()})
+	_ = AppendAuditContext(ctx, AuditEvent{Action: ActionList, Caller: callerTag()})
 	backend, err := OpenDefaultBackend()
 	if err != nil {
 		// Sanitize: backend errors may carry keyring/D-Bus text.

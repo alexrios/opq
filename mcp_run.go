@@ -5,8 +5,8 @@
 // building block whose three irreducible leak channels are documented in the
 // mcp.go header. The handler resolves the sandbox profile, validates and
 // resolves the requested secrets (TTL/revocation enforced via resolveSecret),
-// wires the redactor→cap output pipeline, runs the child, and returns an
-// oracle-minimized result (collapsed exit code, bucketed output lengths).
+// wires the redactor→cap output pipeline, runs the child, and returns a
+// bounded result with a collapsed exit code. Output remains an information channel.
 package main
 
 import (
@@ -71,8 +71,8 @@ func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, err
 // secret-conditional command (the raw values go to the operator audit only):
 //   - ExitCode is collapsed to {0,1}; the raw 8-bit status is a 1-byte/call oracle.
 //   - no stdout_truncated/stderr_truncated flags; each is a 1-bit volume oracle.
-//   - Stdout/Stderr lengths are bucket-quantized by quantizeOutputForAI (gap #3);
-//     the pad tail is marked [opq-pad] so tooling can strip it.
+//   - Stdout/Stderr are redacted and capped, but their content and length remain
+//     visible. Padding cannot conceal the length of attacker-chosen output.
 type runWithSecretsOutput struct {
 	Succeeded bool   `json:"succeeded"`
 	ExitCode  int    `json:"exit_code"`
@@ -96,11 +96,10 @@ func clampTimeout(requestedSeconds int) time.Duration {
 	if requestedSeconds <= 0 {
 		return mcpDefaultTimeout
 	}
-	d := time.Duration(requestedSeconds) * time.Second
-	if d > mcpMaxTimeout {
+	if requestedSeconds > int(mcpMaxTimeout/time.Second) {
 		return mcpMaxTimeout
 	}
-	return d
+	return time.Duration(requestedSeconds) * time.Second
 }
 
 // auditExecResolutionErr maps an exec-resolution failure (from
@@ -117,35 +116,57 @@ func clampTimeout(requestedSeconds int) time.Duration {
 // wrap_command_failed (not sandbox_unavailable) because its most common trigger
 // is LookPath on a non-existent absolute path, which does not satisfy
 // errors.Is(err, exec.ErrNotFound). See the matching invariant in CLAUDE.md.
-func auditExecResolutionErr(err error, command string) *mcp.CallToolResult {
+func auditExecResolutionErr(ctx context.Context, err error, command string) *mcp.CallToolResult {
 	switch {
 	case errors.Is(err, exec.ErrNotFound):
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "exec_not_found"})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "exec_not_found"})
 		return aiUserErr("exec_not_found: " + filepath.Base(command))
 	case errors.Is(err, fs.ErrPermission):
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "exec_permission_denied"})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "exec_permission_denied"})
 		return aiUserErr("exec_permission_denied: " + filepath.Base(command))
 	default:
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "wrap_command_failed"})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "wrap_command_failed"})
 		return aiErr("wrap_command_failed")
 	}
 }
 
 func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input runWithSecretsInput) (*mcp.CallToolResult, runWithSecretsOutput, error) {
+	ctx, cancel := context.WithTimeout(ctx, clampTimeout(input.TimeoutSeconds))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return aiErr("request_canceled"), runWithSecretsOutput{}, nil
+	}
+	select {
+	case mcpRunSlots <- struct{}{}:
+		defer func() { <-mcpRunSlots }()
+	default:
+		return aiErr("server_busy"), runWithSecretsOutput{}, nil
+	}
 	if input.Command == "" {
 		// Our own validation message; safe to return verbatim.
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr("command is required"), runWithSecretsOutput{}, nil
 	}
 	if len(input.Env) > mcpMaxEnvCount {
 		// Our own validation message; safe to return verbatim.
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr(fmt.Sprintf("too many env vars in one call (%d > %d)", len(input.Env), mcpMaxEnvCount)), runWithSecretsOutput{}, nil
 	}
 	if len(input.Args) > mcpMaxArgCount {
 		// Our own validation message; safe to return verbatim.
-		_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_input"})
 		return aiUserErr(fmt.Sprintf("too many args in one call (%d > %d)", len(input.Args), mcpMaxArgCount)), runWithSecretsOutput{}, nil
+	}
+
+	argBytes := len(input.Command)
+	for _, arg := range input.Args {
+		if len(arg) > mcpMaxArgBytes-argBytes {
+			return aiUserErr("command and arguments exceed 1 MiB"), runWithSecretsOutput{}, nil
+		}
+		argBytes += len(arg)
+	}
+	if argBytes > mcpMaxArgBytes {
+		return aiUserErr("command and arguments exceed 1 MiB"), runWithSecretsOutput{}, nil
 	}
 
 	profile, err := resolveMCPSandbox(input.AllowNetwork, input.Isolation)
@@ -167,25 +188,25 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	for _, envName := range envNames {
 		secretName := input.Env[envName]
 		if !validEnvName(envName) {
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_env_name"})
+			_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_env_name"})
 			return aiUserErr(fmt.Sprintf("invalid env var name %q", envName)), runWithSecretsOutput{}, nil
 		}
 		if isBlockedEnvName(envName) {
 			// Refuse to inject into a loader/interpreter var (PATH, LD_*,
 			// BASH_ENV, ...); that would be arbitrary code execution.
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "env_blocked"})
+			_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "env_blocked"})
 			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.; see env_policy.go)", envName)), runWithSecretsOutput{}, nil
 		}
 		if !validSecretName(secretName) {
 			// Use a stable taxonomy and audit the validation failure.
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_secret_name"})
+			_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "invalid_secret_name"})
 			return aiUserErr("invalid_secret_name"), runWithSecretsOutput{}, nil
 		}
 		envMappings = append(envMappings, envMapping{envName: envName, secretName: secretName})
 	}
 
 	if err := preflightExecutable(input.Command); err != nil {
-		return auditExecResolutionErr(err, input.Command), runWithSecretsOutput{}, nil
+		return auditExecResolutionErr(ctx, err, input.Command), runWithSecretsOutput{}, nil
 	}
 	if profile != SandboxNone {
 		if err := VerifySandboxAvailable(); err != nil {
@@ -196,13 +217,16 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	execCmd, execArgs, err := WrapCommand(profile, input.Command, input.Args)
 	if err != nil {
 		// Sanitize wrapper errors while preserving caller-fixable taxonomy.
-		return auditExecResolutionErr(err, input.Command), runWithSecretsOutput{}, nil
+		return auditExecResolutionErr(ctx, err, input.Command), runWithSecretsOutput{}, nil
 	}
 
-	backend, err := OpenDefaultBackend()
-	if err != nil {
-		// Sanitize: may carry keyring/D-Bus text.
-		return aiErr("backend_error"), runWithSecretsOutput{}, nil
+	var backend Backend
+	if len(envMappings) > 0 {
+		backend, err = OpenDefaultBackend()
+		if err != nil {
+			// Sanitize: may carry keyring/D-Bus text.
+			return aiErr("backend_error"), runWithSecretsOutput{}, nil
+		}
 	}
 
 	type resolved struct {
@@ -226,7 +250,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			// Operator audit keeps the precise reason; the AI gets one
 			// state-free token. Distinguishing revoked/expired/not_found would
 			// re-leak the tombstone existence filterVisibleSecretNames hides.
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
+			_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, SecretName: secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
 			switch {
 			case errors.Is(err, ErrSecretRevoked), errors.Is(err, ErrSecretExpired), errors.Is(err, ErrSecretNotFound):
 				return aiErr("not_found: " + secretName), runWithSecretsOutput{}, nil
@@ -235,6 +259,10 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		}
 		bufs = append(bufs, resolved{envName: m.envName, buf: buf})
 		resolvedSecretNames = append(resolvedSecretNames, secretName)
+	}
+
+	if ctx.Err() != nil {
+		return aiErr("request_canceled"), runWithSecretsOutput{}, nil
 	}
 
 	childEnv := filterParentEnv(envFromMap()) // empty parent inheritance under MCP
@@ -255,18 +283,15 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	for _, r := range bufs {
 		named = append(named, NamedSecret{Name: r.envName, Value: r.buf.Bytes()})
 	}
-	stdoutRW := NewRedactingWriter(stdoutCap, named)
-	stderrRW := NewRedactingWriter(stderrCap, named)
+	stdoutRW, stderrRW := NewRedactingWriterPair(stdoutCap, stderrCap, named)
 	defer stdoutRW.Destroy()
 	defer stderrRW.Destroy()
 
-	timeout := clampTimeout(input.TimeoutSeconds)
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	runCtx := ctx
 
 	if input.AllowNetwork {
 		// Include SecretNames so operators can review network-approved use.
-		_ = AppendAudit(AuditEvent{
+		_ = AppendAuditContext(ctx, AuditEvent{
 			Action:      ActionNetworkAllowed,
 			Caller:      callerTag(),
 			SecretNames: resolvedSecretNames,
@@ -276,6 +301,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, execCmd, execArgs...)
+	configureChildProcess(cmd)
 	cmd.Env = childEnv
 	cmd.Stdout = stdoutRW
 	cmd.Stderr = stderrRW
@@ -286,8 +312,12 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 	cmd.Env = nil
 	if runErr == nil {
 		runErr = cmd.Wait()
+		stopChildProcesses(cmd)
 	}
 	elapsed := time.Since(start)
+	// Allow a short, bounded completion audit even when the run was canceled.
+	auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), 250*time.Millisecond)
+	defer cancelAudit()
 	_ = stdoutRW.Flush()
 	_ = stderrRW.Flush()
 
@@ -306,7 +336,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			// Process never started (bad path, permission denied, ...).
 			// Still emit the audit entry below, then return a sanitized MCP
 			// error so the AI sees a clean failure without OS error text.
-			_ = AppendAudit(AuditEvent{
+			_ = AppendAuditContext(auditCtx, AuditEvent{
 				Action:      ActionMCPRun,
 				Caller:      callerTag(),
 				SecretNames: resolvedSecretNames,
@@ -326,18 +356,17 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 		normalizedExit = 1
 	}
 
-	// Truncation flags stay in the operator audit (below) but are not exposed
-	// to the AI; quantizeOutputForAI buckets the stream lengths. See the
-	// runWithSecretsOutput godoc for the side-channel reasoning.
+	// Truncation flags stay in the operator audit. Output is returned verbatim
+	// after redaction and capping; padding does not close information channels.
 	out := runWithSecretsOutput{
 		Succeeded: succeeded,
 		ExitCode:  normalizedExit,
-		Stdout:    quantizeOutputForAI(stdoutBuf.String()),
-		Stderr:    quantizeOutputForAI(stderrBuf.String()),
+		Stdout:    stdoutBuf.String(),
+		Stderr:    stderrBuf.String(),
 		TimedOut:  timedOut,
 	}
 
-	_ = AppendAudit(AuditEvent{
+	_ = AppendAuditContext(auditCtx, AuditEvent{
 		Action:      ActionMCPRun,
 		Caller:      callerTag(),
 		SecretNames: resolvedSecretNames,

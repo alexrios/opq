@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strings"
 
 	"github.com/alecthomas/kong"
 	"github.com/awnumar/memguard"
@@ -38,16 +39,23 @@ func main() {
 }
 
 func run() int {
-	memguard.CatchInterrupt()
 	defer memguard.Purge()
 
 	cli := CLI{}
 	ctx := kong.Parse(&cli,
 		kong.Name("opq"),
-		kong.Description("opq: AI-safe secrets gatekeeper. Stores secrets in your OS keyring and lets programs use them without ever exposing plaintext to the caller."),
+		kong.Description("opq: AI-safe secrets gatekeeper. Stores secrets in your OS keyring and lets programs use them with output redaction against accidental disclosure."),
 		kong.UsageOnError(),
 		kong.Vars{"version": resolveVersion()},
 	)
+	// Long-lived execution paths own cancellation and child cleanup. The global
+	// memguard handler exits immediately and would skip their deferred cleanup.
+	switch strings.SplitN(ctx.Command(), " ", 2)[0] {
+	case "exec", "mcp":
+	default:
+		memguard.CatchInterrupt()
+	}
+
 	err := ctx.Run()
 	if err == nil {
 		return 0

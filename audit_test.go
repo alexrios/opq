@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +27,14 @@ import (
 // process can race against rotation. The threshold is overridden through
 // OPQ_TEST_ROTATE_BYTES because subprocesses do not share package state.
 func TestMain(m *testing.M) {
+	if os.Getenv("OPQ_TEST_AUDIT_ROTATE_ONCE") == "1" {
+		auditRotateThreshold = 1
+		if err := AppendAudit(AuditEvent{Action: "test_rotation", Message: "other_process"}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv("OPQ_TEST_AUDIT_HAMMER") == "1" {
 		for i := 0; i < 200; i++ {
 			_ = AppendAudit(AuditEvent{Action: "test_hammer", Message: fmt.Sprintf("hammer-%d", i)})
@@ -48,7 +58,7 @@ func TestMain(m *testing.M) {
 		deadline := time.Now().Add(time.Duration(durMs) * time.Millisecond)
 		pad := strings.Repeat("p", 256)
 		pid := os.Getpid()
-		for seq := 0; time.Now().Before(deadline); seq++ {
+		for seq := 0; seq < 32 || time.Now().Before(deadline); seq++ {
 			_ = AppendAudit(AuditEvent{
 				Action:  "tail_hammer",
 				Message: fmt.Sprintf("p%d-seq-%d-%s", pid, seq, pad),
@@ -63,6 +73,7 @@ func withAuditTmpDir(t *testing.T) string {
 	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
+	setPolicyHomeForTest(t, tmp)
 	// Reset shared state between tests. The lock file is process-global
 	// in production but per-test here so different temp dirs don't share
 	// a stale fd pointing into an already-cleaned-up directory.
@@ -726,6 +737,9 @@ func TestTailAudit_NoDuplicatesUnderConcurrentRotation(t *testing.T) {
 	setAuditRotateThresholdForTest(t, 4096)
 
 	stop := make(chan struct{})
+	writerProgress := make(chan struct{})
+	readerProgress := make(chan struct{})
+	var writerErr error
 	var wg sync.WaitGroup
 
 	// Writer: each event carries a unique seq so duplicates are visible.
@@ -739,10 +753,19 @@ func TestTailAudit_NoDuplicatesUnderConcurrentRotation(t *testing.T) {
 				return
 			default:
 			}
-			_ = AppendAudit(AuditEvent{
+			if err := AppendAudit(AuditEvent{
 				Action:  ActionList,
 				Message: fmt.Sprintf("seq-%d-%s", seq, pad),
-			})
+			}); err != nil {
+				writerErr = err
+				if seq < 32 {
+					close(writerProgress)
+				}
+				return
+			}
+			if seq == 31 {
+				close(writerProgress)
+			}
 		}
 	}()
 
@@ -772,6 +795,9 @@ func TestTailAudit_NoDuplicatesUnderConcurrentRotation(t *testing.T) {
 				return
 			}
 			iterations++
+			if iterations == 10 {
+				close(readerProgress)
+			}
 			seen := make(map[string]int, len(lines))
 			for _, l := range lines {
 				seen[l]++
@@ -784,10 +810,29 @@ func TestTailAudit_NoDuplicatesUnderConcurrentRotation(t *testing.T) {
 		}
 	}()
 
-	// Bounded wall-clock budget: fast and deterministic.
-	<-time.After(200 * time.Millisecond)
+	// Require enough writes to rotate and actual reader progress. A fixed
+	// sleep can expire before any rotation on a busy build or CI host.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	timedOut := false
+	for _, progress := range []<-chan struct{}{writerProgress, readerProgress} {
+		select {
+		case <-progress:
+		case <-timer.C:
+			timedOut = true
+		}
+		if timedOut {
+			break
+		}
+	}
 	close(stop)
 	wg.Wait()
+	if writerErr != nil {
+		t.Fatalf("writer error: %v", writerErr)
+	}
+	if timedOut {
+		t.Fatal("writer or reader failed to make progress within 5 seconds")
+	}
 
 	if readerErr != nil {
 		t.Fatalf("reader error: %v", readerErr)
@@ -996,5 +1041,299 @@ func TestTailAudit_NoDuplicatesUnderConcurrentRotation_MultiProcess(t *testing.T
 	// not exercise the race window it claims to.
 	if _, err := os.Stat(filepath.Join(tmp, "opq", "audit.log.1")); err != nil {
 		t.Fatalf("expected audit.log.1 to exist (proving rotation occurred); stat: %v", err)
+	}
+}
+
+// A process that already cached audit.log must follow another process's rotation.
+func TestAppendAudit_ReopensAfterOtherProcessRotation(t *testing.T) {
+	tmp := withAuditTmpDir(t)
+	if err := AppendAudit(AuditEvent{Action: "test_rotation", Message: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(filterEnvOut(os.Environ(), "OPQ_TEST_AUDIT_ROTATE_ONCE"), "OPQ_TEST_AUDIT_ROTATE_ONCE=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("other-process rotation: %v: %s", err, out)
+	}
+	if err := AppendAudit(AuditEvent{Action: "test_rotation", Message: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tmp, "opq", "audit.log")
+	active, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := os.ReadFile(path + ".1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(active, []byte(`"msg":"after"`)) {
+		t.Fatal("new event missing from active audit log after another process rotated it")
+	}
+	if bytes.Contains(rotated, []byte(`"msg":"after"`)) {
+		t.Fatal("new event was written into the retired audit log")
+	}
+}
+
+func BenchmarkAuditTail(b *testing.B) {
+	root := b.TempDir()
+	b.Setenv("XDG_STATE_HOME", root)
+	dir := filepath.Join(root, "opq")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		b.Fatal(err)
+	}
+	line := []byte(`{"action":"bench","msg":"` + strings.Repeat("p", 180) + `"}` + "\n")
+	for _, size := range []int{1 << 20, 10 << 20} {
+		b.Run(fmt.Sprintf("MiB_%d", size>>20), func(b *testing.B) {
+			f, err := os.Create(filepath.Join(dir, "audit.log"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			for n := 0; n < size; n += len(line) {
+				if _, err := f.Write(line); err != nil {
+					f.Close()
+					b.Fatal(err)
+				}
+			}
+			if err := f.Close(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := tailAudit(20); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestTailAudit_BackwardReadRecordBoundaries(t *testing.T) {
+	long := strings.Repeat("x", 2*8*1024+13)
+	cases := []struct {
+		name, data string
+		n          int
+		want       []string
+	}{
+		{name: "empty", n: 2},
+		{name: "blank_only", data: "\n\n\n", n: 2},
+		{name: "unterminated", data: "older\nnewest", n: 1, want: []string{"newest"}},
+		{name: "trailing_blanks", data: "older\nnewest\n\n\n", n: 1, want: []string{"newest"}},
+		{name: "interior_blanks", data: "a\n\nb\n\nc\n", n: 2, want: []string{"b", "c"}},
+		{name: "more_than_available", data: "a\nb", n: 5, want: []string{"a", "b"}},
+		{name: "zero_returns_all", data: "a\n\nb\n", n: 0, want: []string{"a", "b"}},
+		{name: "negative_returns_all", data: "a\nb", n: -1, want: []string{"a", "b"}},
+		{name: "skip_long_old_record", data: long + "\na\nb\n", n: 2, want: []string{"a", "b"}},
+		{name: "selected_record_spans_blocks", data: "older\n" + long + "\nnewest", n: 2, want: []string{long, "newest"}},
+		{name: "boundary_at_block_start", data: "older\n" + strings.Repeat("x", 8*1024-1), n: 1, want: []string{strings.Repeat("x", 8*1024-1)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := withAuditTmpDir(t)
+			dir := filepath.Join(tmp, "opq")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "audit.log"), []byte(tc.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := tailAudit(tc.n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("records=%d want=%d", len(got), len(tc.want))
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("record[%d] differs (got %d bytes, want %d)", i, len(got[i]), len(tc.want[i]))
+				}
+			}
+		})
+	}
+}
+
+func TestTailAudit_RejectsOversizeFileBeforeTail(t *testing.T) {
+	for _, n := range []int{0, 1} {
+		t.Run(fmt.Sprintf("n_%d", n), func(t *testing.T) {
+			tmp := withAuditTmpDir(t)
+			dir := filepath.Join(tmp, "opq")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			f, err := os.Create(filepath.Join(dir, "audit.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Truncate(auditReadCap + 1); err != nil {
+				f.Close()
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tailAudit(n); err == nil || !strings.Contains(err.Error(), "too large") {
+				t.Fatalf("expected size refusal, got %v", err)
+			}
+		})
+	}
+}
+
+func TestAppendAudit_CachedFileRejectsReplacementSymlink(t *testing.T) {
+	tmp := withAuditTmpDir(t)
+	if err := AppendAudit(AuditEvent{Action: "test_rotation", Message: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tmp, "opq", "audit.log")
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tmp, "target")
+	if err := os.WriteFile(target, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendAudit(AuditEvent{Action: "test_rotation", Message: "after"}); err == nil {
+		t.Fatal("cached writer accepted a symlink replacement")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "untouched" {
+		t.Fatal("symlink target was changed")
+	}
+}
+
+func FuzzAuditTailMatchesFullRead(f *testing.F) {
+	f.Add([]byte("a\n\nb\nc\n"), uint8(2))
+	f.Add([]byte(strings.Repeat("x", 20*1024)+"\nnewest"), uint8(1))
+	f.Add([]byte("\n\n"), uint8(1))
+	f.Fuzz(func(t *testing.T, data []byte, requested uint8) {
+		if len(data) > 64*1024 {
+			t.Skip()
+		}
+		file, err := os.CreateTemp(t.TempDir(), "audit-tail-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := file.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		n := int(requested) + 1
+		got, err := readAuditTail(file, int64(len(data)), n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := splitAuditLines(data)
+		if len(want) > n {
+			want = want[len(want)-n:]
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("backward tail differs from full read: got %d records, want %d", len(got), len(want))
+		}
+	})
+}
+
+func TestAuditContext_ContendedLocksRespectDeadline(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{"append", func(ctx context.Context) error {
+			return AppendAuditContext(ctx, AuditEvent{Action: "context_test", Message: "must-not-be-written"})
+		}},
+		{"tail", func(ctx context.Context) error { _, err := tailAuditContext(ctx, 20); return err }},
+	}
+	for _, operation := range operations {
+		for _, kind := range []string{"mutex", "flock"} {
+			t.Run(operation.name+"/"+kind, func(t *testing.T) {
+				withAuditTmpDir(t)
+				if err := AppendAudit(AuditEvent{Action: "context_test", Message: "before"}); err != nil {
+					t.Fatal(err)
+				}
+				path, err := auditLogPath()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var unlock func()
+				if kind == "mutex" {
+					auditMu.Lock()
+					unlock = sync.OnceFunc(auditMu.Unlock)
+				} else {
+					holder, err := os.OpenFile(filepath.Join(filepath.Dir(path), auditLockFileName), os.O_RDWR, 0600)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer holder.Close()
+					if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
+						t.Fatal(err)
+					}
+					unlock = sync.OnceFunc(func() { syscall.Flock(int(holder.Fd()), syscall.LOCK_UN) })
+				}
+				// Release eventually even if a regression blocks, so this test reports a
+				// bounded failure rather than hanging the entire suite.
+				rescue := time.AfterFunc(time.Second, unlock)
+				defer func() { rescue.Stop(); unlock() }()
+				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+				defer cancel()
+				start := time.Now()
+				err = operation.run(ctx)
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("error=%v, want deadline", err)
+				}
+				if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+					t.Fatalf("audit lock wait exceeded deadline: %v", elapsed)
+				}
+				unlock()
+				if err := AppendAudit(AuditEvent{Action: "context_test", Message: "after"}); err != nil {
+					t.Fatalf("lock leaked after cancellation: %v", err)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Contains(data, []byte("must-not-be-written")) {
+					t.Fatal("canceled append wrote an event after its lock wait")
+				}
+			})
+		}
+	}
+}
+
+func TestAuditContext_AlreadyCanceled(t *testing.T) {
+	withAuditTmpDir(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := AppendAuditContext(ctx, AuditEvent{Action: "must-not-be-written"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("append error=%v", err)
+	}
+	if _, err := tailAuditContext(ctx, 20); !errors.Is(err, context.Canceled) {
+		t.Fatalf("tail error=%v", err)
+	}
+	path, err := auditLogPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("canceled audit created a log: %v", err)
+	}
+}
+
+func TestAuditContext_CancellationPreservesStorageWarning(t *testing.T) {
+	withAuditTmpDir(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := AppendAuditContext(ctx, AuditEvent{Action: "canceled"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	warningAvailable := false
+	auditWarnOnce.Do(func() { warningAvailable = true })
+	if !warningAvailable {
+		t.Fatal("expected cancellation consumed warning for real audit storage errors")
 	}
 }

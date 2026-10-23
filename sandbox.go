@@ -1,5 +1,10 @@
 package main
 
+import (
+	"fmt"
+	"path/filepath"
+)
+
 // Subprocess sandboxing for opq.
 //
 // The MCP run_with_secrets tool lets an AI run an arbitrary command, which could
@@ -50,4 +55,17 @@ func (p SandboxProfile) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// The policy lock has an OS-identity-based location, independent of the audit
+// directory. Hide it too so a consuming command cannot hold or replace the lock.
+func resolvePolicyDirForMask() (string, error) {
+	dir, err := policyLockDir()
+	if err != nil {
+		return "", err
+	}
+	if err := prepareAuditDir(dir); err != nil {
+		return "", fmt.Errorf("prepare policy dir for sandbox mask: %w", err)
+	}
+	return filepath.EvalSymlinks(dir)
 }

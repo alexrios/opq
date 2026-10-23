@@ -1,12 +1,15 @@
-//go:build integration
+//go:build linux && integration
 
 package main
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,8 +22,8 @@ import (
 
 func runUnderSandbox(t *testing.T, profile SandboxProfile, cmd string, args ...string) (string, int, error) {
 	t.Helper()
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	wrapCmd, wrapArgs, err := WrapCommand(profile, cmd, args)
 	if err != nil {
@@ -29,6 +32,8 @@ func runUnderSandbox(t *testing.T, profile SandboxProfile, cmd string, args ...s
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	c := exec.CommandContext(ctx, wrapCmd, wrapArgs...)
+	configureChildProcess(c)
+	defer stopChildProcesses(c)
 	c.Env = []string{"PATH=/usr/bin:/usr/sbin:/bin:/sbin", "HOME=/tmp"}
 	var buf bytes.Buffer
 	c.Stdout = &buf
@@ -45,35 +50,26 @@ func runUnderSandbox(t *testing.T, profile SandboxProfile, cmd string, args ...s
 	return buf.String(), code, nil
 }
 
-func hasInternet(t *testing.T) bool {
+func sandboxHTTPFixture(t *testing.T) (string, []string) {
 	t.Helper()
-	d := net.Dialer{Timeout: 2 * time.Second}
-	conn, err := d.Dial("tcp", "1.1.1.1:443")
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+	const marker = "opq-synthetic-local-http"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(marker)) }))
+	t.Cleanup(server.Close)
+	return marker, []string{"--noproxy", "*", "--connect-timeout", "1", "--max-time", "2", "--silent", "--show-error", server.URL}
 }
 
 func TestSandboxNet_BlocksNetwork(t *testing.T) {
-	if _, err := exec.LookPath("curl"); err != nil {
-		t.Skip("curl not available")
+	marker, args := sandboxHTTPFixture(t)
+	out, code, err := runUnderSandbox(t, SandboxNetAllowed, "curl", args...)
+	if err != nil || code != 0 || out != marker {
+		t.Fatalf("network positive control failed: %v code=%d out=%q", err, code, out)
 	}
-	out, code, err := runUnderSandbox(t, SandboxNet, "curl",
-		"-s", "-o", "/dev/null",
-		"-w", "%{http_code}",
-		"--connect-timeout", "3",
-		"https://1.1.1.1",
-	)
+	out, code, err = runUnderSandbox(t, SandboxNet, "curl", args...)
 	if err != nil {
-		t.Fatalf("wrap err: %v", err)
+		t.Fatal(err)
 	}
-	if code == 0 {
-		t.Fatalf("expected curl to fail under SandboxNet, code=0 out=%q", out)
-	}
-	if strings.Contains(out, "200") {
-		t.Fatalf("response 200 leaked through sandbox: %q", out)
+	if code == 0 || strings.Contains(out, marker) {
+		t.Fatalf("SandboxNet network restriction failed: code=%d out=%q", code, out)
 	}
 }
 
@@ -96,79 +92,72 @@ func TestSandboxNet_AllowsHostFS(t *testing.T) {
 // /var/tmp/.leak, call 2 reads it back with an empty env (no redaction).
 // The fix is --ro-bind / / instead of --dev-bind / /.
 func TestSandboxNet_BlocksHostFSWrite(t *testing.T) {
-	out, code, err := runUnderSandbox(t, SandboxNet, "sh", "-c", "touch /var/tmp/opq_p01_test 2>&1")
+	dir, err := os.MkdirTemp("/var/tmp", "opq-sandbox-write-")
 	if err != nil {
-		t.Fatalf("wrap err: %v", err)
+		t.Fatal(err)
 	}
-	// touch must fail because the host FS is read-only.
+	defer os.RemoveAll(dir)
+	target := filepath.Join(dir, "synthetic.txt")
+	out, code, err := runUnderSandbox(t, SandboxNet, "sh", "-c", `touch "$1" 2>&1`, "sh", target)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if code == 0 {
-		t.Fatalf("write to /var/tmp succeeded under SandboxNet (P0-1 regression): %q", out)
+		t.Fatalf("persistent host write allowed: %q", out)
 	}
-	lower := strings.ToLower(out)
-	if !strings.Contains(lower, "read-only") && !strings.Contains(lower, "permission denied") && !strings.Contains(lower, "no such") {
-		t.Errorf("expected read-only or permission error, got: %q", out)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("sandbox wrote host fixture: %v", err)
 	}
 }
 
 func TestSandboxFull_BlocksNetwork(t *testing.T) {
-	if _, err := exec.LookPath("curl"); err != nil {
-		t.Skip("curl not available")
+	marker, args := sandboxHTTPFixture(t)
+	out, code, err := runUnderSandbox(t, SandboxNone, "curl", args...)
+	if err != nil || code != 0 || out != marker {
+		t.Fatalf("network positive control failed: %v code=%d out=%q", err, code, out)
 	}
-	out, code, err := runUnderSandbox(t, SandboxFull, "curl",
-		"-s", "-o", "/dev/null",
-		"-w", "%{http_code}",
-		"--connect-timeout", "3",
-		"https://1.1.1.1",
-	)
+	out, code, err = runUnderSandbox(t, SandboxFull, "curl", args...)
 	if err != nil {
-		t.Fatalf("wrap err: %v", err)
+		t.Fatal(err)
 	}
-	if code == 0 {
-		t.Fatalf("expected curl to fail under SandboxFull, code=0 out=%q", out)
-	}
-	if strings.Contains(out, "200") {
-		t.Fatalf("response 200 leaked through sandbox: %q", out)
+	if code == 0 || strings.Contains(out, marker) {
+		t.Fatalf("SandboxFull network restriction failed: code=%d out=%q", code, out)
 	}
 }
 
 func TestSandboxFull_BlocksHomeRead(t *testing.T) {
-	user := os.Getenv("USER")
-	if user == "" {
-		t.Skip("USER unset")
-	}
-	target := "/home/" + user + "/.ssh"
-	out, code, err := runUnderSandbox(t, SandboxFull, "ls", target)
+	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Fatalf("wrap err: %v", err)
+		t.Fatal(err)
 	}
-	// Either the directory is missing (tmpfs overlay) or ls fails;
-	// either way the host's real .ssh contents must not appear.
-	if code == 0 && strings.Contains(out, "id_") {
-		t.Fatalf("SandboxFull leaked $HOME/.ssh contents: %q", out)
+	dir, err := os.MkdirTemp(home, ".opq-sandbox-integration-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	target := filepath.Join(dir, "synthetic.txt")
+	const marker = "opq-synthetic-home-fixture"
+	if err := os.WriteFile(target, []byte(marker), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, code, err := runUnderSandbox(t, SandboxNone, "cat", target)
+	if err != nil || code != 0 || out != marker {
+		t.Fatalf("fixture unreadable outside sandbox: %v code=%d out=%q", err, code, out)
+	}
+	out, code, err = runUnderSandbox(t, SandboxFull, "cat", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code == 0 || strings.Contains(out, marker) {
+		t.Fatalf("SandboxFull exposed synthetic home fixture: code=%d out=%q", code, out)
 	}
 }
 
 func TestSandboxNone_AllowsNetwork(t *testing.T) {
-	if !hasInternet(t) {
-		t.Skip("no internet")
-	}
-	if _, err := exec.LookPath("curl"); err != nil {
-		t.Skip("curl not available")
-	}
-	out, code, err := runUnderSandbox(t, SandboxNone, "curl",
-		"-s", "-o", "/dev/null",
-		"-w", "%{http_code}",
-		"--connect-timeout", "5",
-		"https://1.1.1.1",
-	)
-	if err != nil {
-		t.Fatalf("wrap err: %v", err)
-	}
-	if code != 0 {
-		t.Fatalf("expected curl to succeed without sandbox, code=%d out=%q", code, out)
-	}
-	if !strings.Contains(out, "200") && !strings.Contains(out, "301") && !strings.Contains(out, "302") {
-		t.Fatalf("expected HTTP response from 1.1.1.1, got %q", out)
+	marker, args := sandboxHTTPFixture(t)
+	out, code, err := runUnderSandbox(t, SandboxNone, "curl", args...)
+	if err != nil || code != 0 || out != marker {
+		t.Fatalf("unsandboxed local network control failed: %v code=%d out=%q", err, code, out)
 	}
 }
 
@@ -181,8 +170,8 @@ func TestSandboxNone_AllowsNetwork(t *testing.T) {
 // empty) or the file is absent; either way, the child must not be able
 // to reach the host's keyring/D-Bus socket. Same check for /tmp.
 func TestSandboxNet_DBusUnreachable(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("/bin/sh required")
@@ -241,8 +230,8 @@ func TestSandboxNet_DBusUnreachable(t *testing.T) {
 // the sandbox. The canary must NOT appear in the child's output, and the
 // tmpfs-masked directory must be empty (or the read must fail outright).
 func TestSandboxNet_AuditLogUnreachable(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("/bin/sh required")
@@ -332,8 +321,8 @@ func TestSandboxNet_DockerSocketUnreachable(t *testing.T) {
 	if _, err := os.Lstat("/run/docker.sock"); err != nil {
 		t.Skip("host has no /run/docker.sock; nothing to mask")
 	}
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("/bin/sh required")
@@ -380,8 +369,8 @@ func TestSandboxNet_SystemDBusUnreachable(t *testing.T) {
 	if _, err := os.Lstat("/run/dbus/system_bus_socket"); err != nil {
 		t.Skip("host has no /run/dbus/system_bus_socket; nothing to mask")
 	}
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("/bin/sh required")
@@ -426,8 +415,8 @@ func TestSandboxNet_SystemDBusUnreachable(t *testing.T) {
 // host interference. The mask shape (--bind /dev/null <path>) is the
 // same one production emits in appendRuntimeSocketMasks.
 func TestSandboxNet_FakeSocketMaskTechnique(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("/bin/sh required")
@@ -487,8 +476,8 @@ func TestSandboxNet_FakeSocketMaskTechnique(t *testing.T) {
 // the socket disappears from the child's view. Independent of host
 // state.
 func TestSandboxNet_FakeTmpfsMaskTechnique(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("/bin/sh required")
@@ -555,8 +544,8 @@ func TestSandboxNet_FakeTmpfsMaskTechnique(t *testing.T) {
 // then launch subprocess B that attempts to grep /proc/*/environ for a canary value.
 // B must not find A's environ.
 func TestSandboxNet_SiblingProcIsolation(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not available")
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatalf("integration tests require a working bubblewrap sandbox: %v", err)
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")
@@ -631,5 +620,70 @@ func TestSandboxNet_SiblingProcIsolation(t *testing.T) {
 
 	if strings.Contains(outB, canary) {
 		t.Errorf("SandboxNet sibling /proc leakage: subprocess B found canary in output:\n%s", outB)
+	}
+}
+
+func TestSandboxNet_PolicyDirectoryUnreachable(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureHome, err := os.MkdirTemp(home, ".opq-policy-sandbox-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fixtureHome)
+	setPolicyHomeForTest(t, fixtureHome)
+	dir, err := policyLockDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "synthetic.txt")
+	const marker = "opq-synthetic-policy-state"
+	if err := os.WriteFile(target, []byte(marker), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, code, err := runUnderSandbox(t, SandboxNone, "cat", target)
+	if err != nil || code != 0 || out != marker {
+		t.Fatalf("fixture control failed: %v code=%d out=%q", err, code, out)
+	}
+	for _, profile := range []SandboxProfile{SandboxNet, SandboxNetAllowed, SandboxFull} {
+		t.Run(profile.String(), func(t *testing.T) {
+			out, code, err := runUnderSandbox(t, profile, "cat", target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code == 0 || strings.Contains(out, marker) {
+				t.Fatalf("policy state exposed: code=%d out=%q", code, out)
+			}
+		})
+	}
+}
+
+func TestSandboxNet_DeadlineClosesDescendantPipes(t *testing.T) {
+	if err := VerifySandboxAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	wrapped, args, err := WrapCommand(SandboxNet, "/bin/sh", []string{"-c", "/bin/sleep 10 & wait"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, wrapped, args...)
+	configureChildProcess(cmd)
+	defer stopChildProcesses(cmd)
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	start := time.Now()
+	err = cmd.Run()
+	if err == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("expected deadline cancellation: %v / %v out=%q", err, ctx.Err(), output.String())
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("descendant kept sandbox pipes open: %v", elapsed)
 	}
 }

@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
-	"strings"
 	"sync"
+	"sync/atomic"
+
+	"github.com/awnumar/memguard"
 )
 
 // RedactingWriter wraps an io.Writer and replaces any registered secret
@@ -18,11 +20,15 @@ import (
 // stdout and stderr in separate instances and write to each from one
 // goroutine, which is the natural pattern with exec.Cmd's pipe wiring.
 type RedactingWriter struct {
-	mu       sync.Mutex
-	w        io.Writer
-	secrets  []redactSecret
-	maxLen   int
-	holdover []byte
+	mu          sync.Mutex
+	w           io.Writer
+	secrets     []redactSecret
+	maxLen      int
+	holdover    []byte
+	work        []byte
+	out         []byte
+	candidates  [256][]redactSecret
+	patternRefs *atomic.Int32
 	// downTrunc, if set, lets Write short-circuit to pass-through once the
 	// downstream starts dropping bytes; otherwise a high-volume producer
 	// (`yes`) burns the whole timeout scanning bytes the cap will discard.
@@ -57,27 +63,49 @@ func (r *RedactingWriter) hasTruncationShortCircuit() bool {
 // encodedSecretForms), so an accidental base64/hex emission is still redacted
 // to the same NAME.
 func NewRedactingWriter(w io.Writer, secrets []NamedSecret) *RedactingWriter {
-	rw := &RedactingWriter{w: w}
+	rw := &RedactingWriter{w: w, patternRefs: new(atomic.Int32)}
+	rw.patternRefs.Store(1)
 	if tr, ok := w.(truncatedReporter); ok {
 		rw.downTrunc = tr
 	}
-	// De-dup: a secret's encoded forms can coincide; one entry suffices.
-	seen := make(map[string]bool)
 	for _, s := range secrets {
 		for _, form := range encodedSecretForms(s.Value) {
-			if seen[string(form)] {
+			// Compare bytes directly: map[string] keys would leave immutable secret
+			// copies on the garbage-collected heap after Destroy.
+			duplicate := false
+			for _, prior := range rw.candidates[form[0]] {
+				if bytes.Equal(prior.value, form) {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				memguard.WipeBytes(form)
 				continue
 			}
-			seen[string(form)] = true
-			val := make([]byte, len(form))
-			copy(val, form)
-			rw.secrets = append(rw.secrets, redactSecret{name: s.Name, value: val})
-			if len(val) > rw.maxLen {
-				rw.maxLen = len(val)
+			entry := redactSecret{name: s.Name, value: form}
+			rw.secrets = append(rw.secrets, entry)
+			rw.candidates[form[0]] = append(rw.candidates[form[0]], entry)
+			if len(form) > rw.maxLen {
+				rw.maxLen = len(form)
 			}
 		}
 	}
 	return rw
+}
+
+// NewRedactingWriterPair prepares the secret forms once for two independent
+// streams. The caller may destroy the source buffers immediately. Each writer
+// must be Destroyed; the last Destroy wipes their shared immutable patterns.
+func NewRedactingWriterPair(stdout, stderr io.Writer, secrets []NamedSecret) (*RedactingWriter, *RedactingWriter) {
+	first := NewRedactingWriter(stdout, secrets)
+	first.patternRefs.Add(1)
+	second := &RedactingWriter{w: stderr, secrets: first.secrets,
+		maxLen: first.maxLen, candidates: first.candidates, patternRefs: first.patternRefs}
+	if tr, ok := stderr.(truncatedReporter); ok {
+		second.downTrunc = tr
+	}
+	return first, second
 }
 
 // encodingMinRawLen is the floor below which encoded forms are skipped: a short
@@ -103,19 +131,21 @@ func encodedSecretForms(raw []byte) [][]byte {
 	if len(raw) < encodingMinRawLen {
 		return forms
 	}
-	// base64: both alphabets, padded and unpadded. EncodeToString gives
-	// the padded form; trimming trailing '=' yields the raw form, which
-	// is also what RawStdEncoding / RawURLEncoding emit directly.
-	stdPadded := base64.StdEncoding.EncodeToString(raw)
-	urlPadded := base64.URLEncoding.EncodeToString(raw)
-	stdRaw := base64.RawStdEncoding.EncodeToString(raw)
-	urlRaw := base64.RawURLEncoding.EncodeToString(raw)
-	// hex: lower (Go default) and upper (Java/some hexdumps).
-	hexLower := hex.EncodeToString(raw)
-	hexUpper := strings.ToUpper(hexLower)
-	for _, s := range []string{stdPadded, stdRaw, urlPadded, urlRaw, hexLower, hexUpper} {
-		forms = append(forms, []byte(s))
+	// Encode directly to mutable byte slices, so every cached form can be wiped.
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		dst := make([]byte, enc.EncodedLen(len(raw)))
+		enc.Encode(dst, raw)
+		forms = append(forms, dst)
 	}
+	lower := make([]byte, hex.EncodedLen(len(raw)))
+	hex.Encode(lower, raw)
+	upper := append([]byte(nil), lower...)
+	for i, c := range upper {
+		if c >= 'a' && c <= 'f' {
+			upper[i] = c - ('a' - 'A')
+		}
+	}
+	forms = append(forms, lower, upper)
 	return forms
 }
 
@@ -153,13 +183,17 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 		return r.w.Write(p)
 	}
 
-	// Build the working buffer: holdover + p.
-	work := make([]byte, 0, len(r.holdover)+len(p))
-	work = append(work, r.holdover...)
-	work = append(work, p...)
-
-	out, hold := r.scan(work, false)
+	// Reuse input/output scratch, wiping the previous backing storage before
+	// growing it and the consumed input immediately after scanning.
+	r.work = resizeRedactionScratch(r.work, len(r.holdover)+len(p))
+	copied := copy(r.work, r.holdover)
+	copy(r.work[copied:], p)
+	memguard.WipeBytes(r.holdover[:cap(r.holdover)])
+	out, hold := r.scan(r.work, false)
 	r.holdover = hold
+	memguard.WipeBytes(r.work)
+	r.out = out
+	defer memguard.WipeBytes(r.out[:cap(r.out)])
 	if len(out) > 0 {
 		if _, err := r.w.Write(out); err != nil {
 			// Return len(p): all of p was consumed (some into holdover, some
@@ -181,7 +215,10 @@ func (r *RedactingWriter) Flush() error {
 		return nil
 	}
 	out, _ := r.scan(r.holdover, true)
-	r.holdover = nil
+	memguard.WipeBytes(r.holdover[:cap(r.holdover)])
+	r.holdover = r.holdover[:0]
+	r.out = out
+	defer memguard.WipeBytes(r.out[:cap(r.out)])
 	if len(out) == 0 {
 		return nil
 	}
@@ -194,17 +231,19 @@ func (r *RedactingWriter) Flush() error {
 func (r *RedactingWriter) Destroy() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for i := range r.secrets {
-		for j := range r.secrets[i].value {
-			r.secrets[i].value[j] = 0
+	if r.patternRefs != nil && r.patternRefs.Add(-1) == 0 {
+		for i := range r.secrets {
+			memguard.WipeBytes(r.secrets[i].value)
+			r.secrets[i].value = nil
 		}
-		r.secrets[i].value = nil
 	}
+	r.patternRefs = nil
 	r.secrets = nil
-	for i := range r.holdover {
-		r.holdover[i] = 0
+	r.candidates = [256][]redactSecret{}
+	for _, scratch := range [][]byte{r.holdover, r.work, r.out} {
+		memguard.WipeBytes(scratch[:cap(scratch)])
 	}
-	r.holdover = nil
+	r.holdover, r.work, r.out = nil, nil, nil
 }
 
 // scan walks work byte-by-byte, emitting [REDACTED:NAME] for the longest secret
@@ -216,14 +255,14 @@ func (r *RedactingWriter) Destroy() {
 // potential start; emitUpTo tracks how far coverage extends so inner bytes are
 // suppressed rather than re-emitted.
 func (r *RedactingWriter) scan(work []byte, finalize bool) (out, holdover []byte) {
-	out = make([]byte, 0, len(work))
+	out = resizeRedactionScratch(r.out, len(work))[:0]
 	emitUpTo := 0 // bytes [0, emitUpTo) are already covered by a redaction token
 	i := 0
 	for i < len(work) {
 		// Find the longest exact match at position i.
 		bestLen := 0
 		bestName := ""
-		for _, s := range r.secrets {
+		for _, s := range r.candidates[work[i]] {
 			if len(s.value) <= len(work)-i && bytes.HasPrefix(work[i:], s.value) {
 				if len(s.value) > bestLen {
 					bestLen = len(s.value)
@@ -232,9 +271,9 @@ func (r *RedactingWriter) scan(work []byte, finalize bool) (out, holdover []byte
 			}
 		}
 		if bestLen > 0 {
-			out = append(out, "[REDACTED:"...)
-			out = append(out, bestName...)
-			out = append(out, ']')
+			out = appendRedactionOutput(out, []byte("[REDACTED:"))
+			out = appendRedactionOutput(out, []byte(bestName))
+			out = appendRedactionOutput(out, []byte{']'})
 			end := i + bestLen
 			if end > emitUpTo {
 				emitUpTo = end
@@ -251,15 +290,35 @@ func (r *RedactingWriter) scan(work []byte, finalize bool) (out, holdover []byte
 		// Check for a partial-prefix match at i (only meaningful when i is
 		// not already covered and the tail is shorter than the longest secret).
 		if !finalize && len(work)-i < r.maxLen {
-			for _, s := range r.secrets {
+			for _, s := range r.candidates[work[i]] {
 				if len(work)-i < len(s.value) && bytes.HasPrefix(s.value, work[i:]) {
-					holdover = append(holdover, work[i:]...)
+					holdover = resizeRedactionScratch(r.holdover, len(work)-i)
+					copy(holdover, work[i:])
 					return out, holdover
 				}
 			}
 		}
-		out = append(out, work[i])
+		out = appendRedactionOutput(out, work[i:i+1])
 		i++
 	}
-	return out, nil
+	return out, r.holdover[:0]
+}
+
+// resizeRedactionScratch never abandons a backing array containing plaintext.
+func resizeRedactionScratch(buf []byte, size int) []byte {
+	if cap(buf) < size {
+		memguard.WipeBytes(buf[:cap(buf)])
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func appendRedactionOutput(buf, value []byte) []byte {
+	if len(value) > cap(buf)-len(buf) {
+		next := make([]byte, len(buf), max(2*cap(buf), len(buf)+len(value)))
+		copy(next, buf)
+		memguard.WipeBytes(buf[:cap(buf)])
+		buf = next
+	}
+	return append(buf, value...)
 }

@@ -5,7 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -533,5 +536,162 @@ func TestEncodedSecretForms_NoDuplicates(t *testing.T) {
 		if n > 1 {
 			t.Errorf("duplicate registered form %q (count=%d); de-dup missing", v, n)
 		}
+	}
+}
+
+func TestRedact_PairLifetimeAndWiping(t *testing.T) {
+	var firstOut, secondOut bytes.Buffer
+	source := []byte("fake-pair-secret")
+	first, second := NewRedactingWriterPair(&firstOut, &secondOut, []NamedSecret{{Name: "K", Value: source}})
+	cached := first.secrets[0].value
+	if &cached[0] != &second.secrets[0].value[0] {
+		t.Fatal("pair did not share prepared patterns")
+	}
+	first.Destroy()
+	first.Destroy()
+	if !bytes.Equal(cached, source) {
+		t.Fatal("first destroy wiped patterns still used by second")
+	}
+	second.Write(source)
+	second.Flush()
+	if secondOut.String() != "[REDACTED:K]" {
+		t.Fatalf("second writer lost redaction: %q", secondOut.String())
+	}
+	second.Destroy()
+	for _, v := range cached {
+		if v != 0 {
+			t.Fatal("final Destroy did not wipe shared pattern")
+		}
+	}
+	if string(source) != "fake-pair-secret" {
+		t.Fatal("constructor changed caller's source")
+	}
+}
+
+func TestRedact_ScratchWipedAfterWriteAndFlush(t *testing.T) {
+	rw := NewRedactingWriter(io.Discard, []NamedSecret{{Name: "K", Value: []byte("fake-secret")}})
+	defer rw.Destroy()
+	rw.Write([]byte("ordinary fake-sec"))
+	for _, b := range rw.work {
+		if b != 0 {
+			t.Fatal("consumed work retains plaintext")
+		}
+	}
+	for _, b := range rw.out[:cap(rw.out)] {
+		if b != 0 {
+			t.Fatal("output scratch retains plaintext")
+		}
+	}
+	hold := rw.holdover
+	if !bytes.Equal(hold, []byte("fake-sec")) {
+		t.Fatal("expected retained partial prefix")
+	}
+	rw.Flush()
+	for _, b := range hold {
+		if b != 0 {
+			t.Fatal("Flush did not wipe partial prefix")
+		}
+	}
+}
+
+func TestRedact_PairConcurrentStreamsAndDestroy(t *testing.T) {
+	first, second := NewRedactingWriterPair(io.Discard, io.Discard, []NamedSecret{{Name: "K", Value: []byte("fake-pair-secret")}})
+	var wg sync.WaitGroup
+	for _, rw := range []*RedactingWriter{first, second} {
+		wg.Go(func() {
+			defer rw.Destroy()
+			for range 100 {
+				rw.Write([]byte("fake-pair-secret"))
+			}
+			rw.Flush()
+		})
+	}
+	wg.Wait()
+}
+
+// Arbitrary chunks must never expose a registered complete form. Delimiters
+// prevent accidental overlapping matches between the synthetic forms.
+func FuzzRedactEncodedChunkBoundaries(f *testing.F) {
+	f.Add([]byte("token"), uint8(1))
+	f.Add([]byte("overlapping fake prefix"), uint8(7))
+	f.Fuzz(func(t *testing.T, seed []byte, chunk uint8) {
+		if len(seed) > 64 {
+			seed = seed[:64]
+		}
+		raw := append([]byte("fake-"), hex.AppendEncode(nil, seed)...)
+		forms := encodedSecretForms(raw)
+		input := bytes.Join(forms, []byte("|"))
+		var output bytes.Buffer
+		rw := NewRedactingWriter(&output, []NamedSecret{{Name: "K", Value: raw}})
+		defer rw.Destroy()
+		stride := 1 + int(chunk)%65
+		for start := 0; start < len(input); start += stride {
+			end := min(start+stride, len(input))
+			if _, err := rw.Write(input[start:end]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		for _, form := range forms {
+			if bytes.Contains(output.Bytes(), form) {
+				t.Fatalf("registered form survived chunked writes")
+			}
+		}
+	})
+}
+
+func BenchmarkRedactingWriter(b *testing.B) {
+	for _, count := range []int{1, 8, 32} {
+		named := make([]NamedSecret, count)
+		for i := range named {
+			named[i] = NamedSecret{Name: fmt.Sprintf("K%d", i), Value: []byte(fmt.Sprintf("fake-%03d-long-credential-0123456789", i))}
+		}
+		for _, workload := range []struct {
+			name  string
+			input []byte
+		}{
+			{"ordinary", []byte(strings.Repeat("response payload with ordinary text 0123456789\n", 728))},
+			{"shared_prefix", []byte(strings.Repeat("fake-000-long-credential-012345678X ", 980))},
+		} {
+			b.Run(fmt.Sprintf("%s/secrets_%d", workload.name, count), func(b *testing.B) {
+				rw := NewRedactingWriter(io.Discard, named)
+				defer rw.Destroy()
+				rw.Write(workload.input) // Warm reusable scratch before measuring steady state.
+				b.ReportAllocs()
+				b.SetBytes(int64(len(workload.input)))
+				b.ResetTimer()
+				for range b.N {
+					rw.Write(workload.input)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkRedactingWriterSplitWrites(b *testing.B) {
+	for _, count := range []int{1, 8, 32} {
+		b.Run(fmt.Sprintf("secrets_%d", count), func(b *testing.B) {
+			named := make([]NamedSecret, count)
+			for i := range named {
+				named[i] = NamedSecret{Name: fmt.Sprintf("K%d", i), Value: []byte(fmt.Sprintf("fake-%03d-long-credential-0123456789", i))}
+			}
+			input := []byte(strings.Repeat("prefix fake-000-long-credential-0123456789 suffix\n", 128))
+			rw := NewRedactingWriter(io.Discard, named)
+			defer rw.Destroy()
+			writeChunks := func() {
+				for start := 0; start < len(input); start += 31 {
+					rw.Write(input[start:min(start+31, len(input))])
+				}
+			}
+			writeChunks()
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			b.ResetTimer()
+			for range b.N {
+				writeChunks()
+			}
+		})
 	}
 }

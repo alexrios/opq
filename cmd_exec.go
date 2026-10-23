@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -73,6 +74,13 @@ var errNoRedactGate = errors.New("no-redact release gate")
 // flow straight back.
 
 func (c *ExecCmd) Run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	// Keep the original signals for graceful forwarding while the context stops
+	// preparation and starts the bounded shutdown grace period.
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 	// kong's passthrough captures "--" literally as the first positional;
 	// strip it so users can write the conventional `opq exec ... -- cmd`.
 	if len(c.Command) > 0 && c.Command[0] == "--" {
@@ -83,13 +91,27 @@ func (c *ExecCmd) Run() error {
 	}
 
 	if c.NoRedact {
+		// Closing this call's terminal interrupts its confirmation read on signal.
+		// Join the callback before returning; no background reader outlives Run.
+		var stopTTYClose func() bool
+		ttyClosed := make(chan struct{})
 		cfg := retypeGateConfig{
-			stdoutIsTTY:    term.IsTerminal(int(os.Stdout.Fd())),
-			envHumanFlag:   os.Getenv(envHumanConfirm),
-			openConfirmTTY: openControllingTTY,
+			stdoutIsTTY:  term.IsTerminal(int(os.Stdout.Fd())),
+			envHumanFlag: os.Getenv(envHumanConfirm),
+			openConfirmTTY: func() (io.Reader, io.Writer, io.Closer, error) {
+				r, w, closer, err := openControllingTTY()
+				if err == nil {
+					stopTTYClose = context.AfterFunc(ctx, func() { closer.Close(); close(ttyClosed) })
+				}
+				return r, w, closer, err
+			},
 		}
-		if userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate); err != nil {
-			_ = AppendAudit(AuditEvent{
+		userReason, auditReason, err := checkRetypeGate(cfg, noRedactConfirmInputPrompt, noRedactConfirmInputLiteral, errNoRedactGate)
+		if stopTTYClose != nil && !stopTTYClose() {
+			<-ttyClosed
+		}
+		if err != nil {
+			_ = AppendAuditContext(ctx, AuditEvent{
 				Action:  ActionDenied,
 				Caller:  callerTag(),
 				Message: "no_redact_refused:" + auditReason,
@@ -123,10 +145,12 @@ func (c *ExecCmd) Run() error {
 		return fmt.Errorf("wrap command for sandbox: %w", err)
 	}
 
-	ctx := context.Background()
-	backend, err := OpenDefaultBackend()
-	if err != nil {
-		return err
+	var backend Backend
+	if len(envMappings) > 0 {
+		backend, err = OpenDefaultBackend()
+		if err != nil {
+			return err
+		}
 	}
 
 	// Resolve all secrets up front so we fail before spawning anything.
@@ -142,15 +166,14 @@ func (c *ExecCmd) Run() error {
 	}
 	defer cleanup()
 
-	now := time.Now().UTC()
 	for _, m := range envMappings {
-		buf, err := resolveSecret(ctx, backend, m.secretName, now)
+		buf, err := resolveSecret(ctx, backend, m.secretName, time.Now().UTC())
 		if err != nil {
-			_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: m.secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
+			_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, SecretName: m.secretName, Caller: callerTag(), Message: sanitizePolicyErr(err)})
 			return fmt.Errorf("resolve %s: %w", m.secretName, err)
 		}
 		resolvedSecrets = append(resolvedSecrets, resolved{envName: m.envName, buf: buf})
-		_ = AppendAudit(AuditEvent{Action: ActionExecInject, SecretName: m.secretName, Caller: callerTag()})
+		_ = AppendAuditContext(ctx, AuditEvent{Action: ActionExecInject, SecretName: m.secretName, Caller: callerTag()})
 	}
 
 	if c.NoRedact {
@@ -159,7 +182,7 @@ func (c *ExecCmd) Run() error {
 		// in the audit log in plaintext. Log only the binary basename plus
 		// an arg-count so the loud `redaction_disabled` entry remains useful
 		// for review without leaking caller-controlled values.
-		_ = AppendAudit(AuditEvent{
+		_ = AppendAuditContext(ctx, AuditEvent{
 			Action:  ActionRedactionDisabled,
 			Caller:  callerTag(),
 			Message: fmt.Sprintf("%s (+%d args)", filepath.Base(c.Command[0]), len(c.Command)-1),
@@ -173,6 +196,10 @@ func (c *ExecCmd) Run() error {
 	}
 
 	cmd := exec.CommandContext(ctx, execCmd, execArgs...)
+	configureCLIChildProcess(cmd)
+	// The forwarding goroutine sends the original signal. Let WaitDelay bound
+	// graceful shutdown instead of racing it with an immediate SIGKILL.
+	cmd.Cancel = func() error { return nil }
 	cmd.Env = childEnv
 	cmd.Stdin = os.Stdin
 
@@ -182,8 +209,7 @@ func (c *ExecCmd) Run() error {
 		for _, r := range resolvedSecrets {
 			named = append(named, NamedSecret{Name: r.envName, Value: r.buf.Bytes()})
 		}
-		stdoutRW = NewRedactingWriter(os.Stdout, named)
-		stderrRW = NewRedactingWriter(os.Stderr, named)
+		stdoutRW, stderrRW = NewRedactingWriterPair(os.Stdout, os.Stderr, named)
 		cmd.Stdout = stdoutRW
 		cmd.Stderr = stderrRW
 		// Destroy after subprocess exits (done below).
@@ -193,11 +219,6 @@ func (c *ExecCmd) Run() error {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 	}
-
-	// Forward signals to the child so users can ^C cleanly.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigCh)
 
 	if err := cmd.Start(); err != nil {
 		clearEnvStrings(childEnv)
@@ -217,10 +238,11 @@ func (c *ExecCmd) Run() error {
 	fwdDone := make(chan struct{})
 	go func() {
 		defer close(fwdDone)
-		forwardSignals(sigCh, done, func(sig os.Signal) { _ = cmd.Process.Signal(sig) })
+		forwardSignals(sigCh, done, func(sig os.Signal) { _ = signalChildProcesses(cmd, sig) })
 	}()
 
 	waitErr := cmd.Wait()
+	stopChildProcesses(cmd)
 	close(done)
 	<-fwdDone
 	if !c.NoRedact {
@@ -239,6 +261,19 @@ func (c *ExecCmd) Run() error {
 		return waitErr
 	}
 	return nil
+}
+
+// A redirected stdin does not imply a detached CLI. Commands such as ssh and
+// sudo can still open /dev/tty for a prompt. Preserve the foreground group when
+// a controlling terminal exists, without reading it or displaying a prompt.
+func configureCLIChildProcess(cmd *exec.Cmd) {
+	_, _, tty, err := openControllingTTY()
+	if err == nil {
+		tty.Close()
+		cmd.WaitDelay = 250 * time.Millisecond
+		return
+	}
+	configureChildProcess(cmd)
 }
 
 // forwardSignals relays every signal received on sigCh to signaller until

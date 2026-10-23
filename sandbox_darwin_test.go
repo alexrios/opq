@@ -71,6 +71,13 @@ func TestWrapCommand_SandboxNetAllowed_Seatbelt(t *testing.T) {
 	if strings.Contains(profile, "(deny network*)") {
 		t.Errorf("net-allowed profile MUST NOT deny network:\n%s", profile)
 	}
+	dockerSocket, err := canonicalSandboxPath("/var/run/docker.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(profile, "(deny network-outbound (remote unix-socket "+sbplLiteral(dockerSocket)+"))") {
+		t.Errorf("net-allowed profile must reject system Docker socket connections:\n%s", profile)
+	}
 }
 
 func TestWrapCommand_SandboxFull_Seatbelt(t *testing.T) {

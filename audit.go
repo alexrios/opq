@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -187,15 +188,37 @@ func openAuditFileLocked(path string) (*os.File, error) {
 	return f, nil
 }
 
-// ensureAuditFileLocked returns the cached audit-log fd, opening it if
-// needed. Caller MUST hold auditMu.
+// ensureAuditFileLocked returns the active audit-log fd, reopening a cached fd
+// when another process has rotated the file. Caller MUST hold auditMu and the
+// audit.lock exclusive flock so path identity cannot change between this check
+// and the append through a cooperating writer.
 func ensureAuditFileLocked() (*os.File, error) {
-	if auditFile != nil {
-		return auditFile, nil
-	}
 	path, err := auditLogPath()
 	if err != nil {
 		return nil, err
+	}
+	if auditFile != nil {
+		cached, err := auditFile.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stat cached audit log: %w", err)
+		}
+		current, err := os.Lstat(path)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("stat active audit log: %w", err)
+		}
+		if err == nil {
+			if current.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("audit log %q is a symlink, refusing to write", path)
+			}
+			if os.SameFile(cached, current) {
+				return auditFile, nil
+			}
+		}
+		if err := auditFile.Close(); err != nil {
+			auditFile = nil
+			return nil, fmt.Errorf("close retired audit log: %w", err)
+		}
+		auditFile = nil
 	}
 	if err := prepareAuditDir(filepath.Dir(path)); err != nil {
 		return nil, err
@@ -246,7 +269,10 @@ func ensureAuditLockFileLocked() (*os.File, error) {
 
 // appendAuditInternal performs the actual write under auditMu + flock (see the
 // package header for why the lock lives on a separate fd).
-func appendAuditInternal(ev AuditEvent) error {
+func appendAuditInternal(ctx context.Context, ev AuditEvent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if ev.Timestamp.IsZero() {
 		ev.Timestamp = time.Now().UTC()
 	}
@@ -267,20 +293,25 @@ func appendAuditInternal(ev AuditEvent) error {
 		return err
 	}
 
-	auditMu.Lock()
+	if err := lockAuditMutex(ctx); err != nil {
+		return err
+	}
 	defer auditMu.Unlock()
 
 	lockFile, err := ensureAuditLockFileLocked()
 	if err != nil {
 		return err
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockAuditContext(ctx, int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("flock audit lock: %w", err)
 	}
 	defer func() {
 		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := ensureAuditFileLocked(); err != nil {
 		return err
 	}
@@ -289,6 +320,9 @@ func appendAuditInternal(ev AuditEvent) error {
 	}
 	if auditFile == nil {
 		return fmt.Errorf("audit log not open")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if _, err := auditFile.Write(line); err != nil {
 		return fmt.Errorf("write audit log: %w", err)
@@ -304,13 +338,72 @@ func appendAuditInternal(ev AuditEvent) error {
 // error encountered in the process lifetime, a single loud warning is emitted
 // to stderr so the operator notices that auditing is degraded.
 func AppendAudit(ev AuditEvent) error {
-	err := appendAuditInternal(ev)
-	if err != nil {
+	return AppendAuditContext(context.Background(), ev)
+}
+
+// AppendAuditContext bounds lock acquisition by ctx. Once a native filesystem
+// operation (including Write or Sync) has started, Go cannot cancel that syscall.
+// No detached writer continues after a canceled lock wait returns. Expected
+// context cancellation does not consume the warning reserved for storage failures.
+func AppendAuditContext(ctx context.Context, ev AuditEvent) error {
+	err := appendAuditInternal(ctx, ev)
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		auditWarnOnce.Do(func() {
 			fmt.Fprintf(os.Stderr, "opq: AUDIT LOG WRITE FAILED: %v. Subsequent audit failures will not be reported.\n", err)
 		})
 	}
 	return err
+}
+
+// Background callers retain the blocking fast path. Request-scoped callers use
+// nonblocking acquisition so a slow audit reader/writer cannot retain an MCP slot.
+func lockAuditMutex(ctx context.Context) error {
+	if ctx.Done() == nil {
+		auditMu.Lock()
+		return nil
+	}
+	return waitAuditLock(ctx, func() error {
+		if auditMu.TryLock() {
+			return nil
+		}
+		return syscall.EWOULDBLOCK
+	})
+}
+
+func flockAuditContext(ctx context.Context, fd, mode int) error {
+	if ctx.Done() == nil {
+		return syscall.Flock(fd, mode)
+	}
+	return waitAuditLock(ctx, func() error { return syscall.Flock(fd, mode|syscall.LOCK_NB) })
+}
+
+func waitAuditLock(ctx context.Context, acquire func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := acquire()
+	if !auditLockContended(err) {
+		return err
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := acquire(); !auditLockContended(err) {
+				return err
+			}
+		}
+	}
+}
+
+func auditLockContended(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR)
 }
 
 // auditReadCap bounds a single audit-file read. The active log is capped
@@ -323,11 +416,22 @@ const auditReadCap = 32 * 1024 * 1024
 // rotated .log.1 if needed). Holds auditMu + LOCK_SH on a fresh lock fd across
 // both reads; see the package header for the locking rationale.
 func tailAudit(n int) ([]string, error) {
+	return tailAuditContext(context.Background(), n)
+}
+
+// tailAuditContext bounds mutex and cross-process lock waits by ctx. Native
+// filesystem reads themselves remain synchronous, like writes in AppendAuditContext.
+func tailAuditContext(ctx context.Context, n int) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	path, err := auditLogPath()
 	if err != nil {
 		return nil, err
 	}
-	auditMu.Lock()
+	if err := lockAuditMutex(ctx); err != nil {
+		return nil, err
+	}
 	defer auditMu.Unlock()
 
 	readerLock, err := openAuditLockReaderLocked()
@@ -337,20 +441,33 @@ func tailAudit(n int) ([]string, error) {
 	// Close runs LAST (LIFO); LOCK_UN below must release the lock before the
 	// fd is closed, otherwise Close would release it implicitly.
 	defer readerLock.Close()
-	if err := syscall.Flock(int(readerLock.Fd()), syscall.LOCK_SH); err != nil {
+	if err := flockAuditContext(ctx, int(readerLock.Fd()), syscall.LOCK_SH); err != nil {
 		return nil, fmt.Errorf("flock audit lock: %w", err)
 	}
 	defer syscall.Flock(int(readerLock.Fd()), syscall.LOCK_UN)
 
-	lines, err := readAuditFileLinesLocked(path)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	lines, err := readAuditFileLinesLocked(path, n)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if n > 0 && len(lines) >= n {
 		return lines[len(lines)-n:], nil
 	}
-	rotated, err := readAuditFileLinesLocked(path + ".1")
+	remaining := n
+	if n > 0 {
+		remaining -= len(lines)
+	}
+	rotated, err := readAuditFileLinesLocked(path+".1", remaining)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	combined := append(rotated, lines...)
@@ -393,11 +510,12 @@ func openAuditLockReaderLocked() (*os.File, error) {
 	return f, nil
 }
 
-// readAuditFileLinesLocked opens path with O_NOFOLLOW|O_CLOEXEC, reads up
-// to auditReadCap bytes, and returns the split lines. Caller MUST already
-// hold auditMu and LOCK_SH (or LOCK_EX) on a reader lock fd. A missing
-// file returns (nil, nil); a file exceeding the cap returns an error.
-func readAuditFileLinesLocked(path string) ([]string, error) {
+// readAuditFileLinesLocked opens path with O_NOFOLLOW|O_CLOEXEC and returns
+// its last n non-empty records. For n <= 0 it returns all records. Positive
+// tails read backward in fixed-size blocks, stopping at the requested record
+// boundary instead of allocating the whole file. Caller MUST hold auditMu and
+// LOCK_SH (or LOCK_EX). Missing files are empty; files above auditReadCap fail.
+func readAuditFileLinesLocked(path string, n int) ([]string, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -409,12 +527,66 @@ func readAuditFileLinesLocked(path string) ([]string, error) {
 		return nil, fmt.Errorf("open audit log %q: %w", path, err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat audit log: %w", err)
+	}
+	if info.Size() > auditReadCap {
+		return nil, fmt.Errorf("audit log too large (>%d bytes), refusing to read", auditReadCap)
+	}
+	if n > 0 {
+		return readAuditTail(f, info.Size(), n)
+	}
 	data, err := io.ReadAll(io.LimitReader(f, auditReadCap+1))
 	if err != nil {
 		return nil, fmt.Errorf("read audit log: %w", err)
 	}
 	if int64(len(data)) > auditReadCap {
 		return nil, fmt.Errorf("audit log too large (>%d bytes), refusing to read", auditReadCap)
+	}
+	return splitAuditLines(data), nil
+}
+
+// readAuditTail counts non-empty records from EOF. Chunks are retained in
+// reverse order until the nth boundary is found, then joined once. This also
+// handles unterminated records and records longer than a read block without
+// repeatedly copying a growing partial record.
+func readAuditTail(f *os.File, size int64, n int) ([]string, error) {
+	const blockSize = 8 * 1024
+	var chunks [][]byte
+	var total int
+	inRecord := false
+	for end := size; end > 0; {
+		start := end - blockSize
+		if start < 0 {
+			start = 0
+		}
+		chunk := make([]byte, int(end-start))
+		if _, err := f.ReadAt(chunk, start); err != nil {
+			return nil, fmt.Errorf("read audit log: %w", err)
+		}
+		for i := len(chunk) - 1; i >= 0; i-- {
+			if chunk[i] != '\n' {
+				inRecord = true
+				continue
+			}
+			if inRecord {
+				n--
+				inRecord = false
+				if n == 0 {
+					chunk = chunk[i+1:]
+					start = 0
+					break
+				}
+			}
+		}
+		chunks = append(chunks, chunk)
+		total += len(chunk)
+		end = start
+	}
+	data := make([]byte, 0, total)
+	for i := len(chunks) - 1; i >= 0; i-- {
+		data = append(data, chunks[i]...)
 	}
 	return splitAuditLines(data), nil
 }
