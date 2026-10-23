@@ -16,6 +16,11 @@ func (c *ListCmd) Run() error {
 	if err != nil {
 		return err
 	}
+	unlock, err := lockPolicy(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	keys, err := backend.List(ctx)
 	if err != nil {
 		return err
@@ -53,6 +58,8 @@ func (c *ListCmd) Run() error {
 			// secret, which would hide a revoked/expired status from the
 			// operator. resolveSecret still fails closed on the same error.
 			status = "meta-error"
+		case m != nil && m.Pending:
+			status = "UPDATE-PENDING"
 		case m.IsRevoked():
 			status = "REVOKED"
 		case m.IsExpiredAt(now):

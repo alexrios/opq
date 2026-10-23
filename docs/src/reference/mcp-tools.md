@@ -1,7 +1,8 @@
 # MCP Tools
 
 `opq mcp` exposes three tools over stdio. There is no `get_secret_value` tool; that
-absence is the security control. Register the server as shown in the
+absence blocks direct value retrieval. Arbitrary consuming commands still have output
+and encoding channels. Register the server as shown in the
 [MCP tutorial](../tutorials/mcp-claude-code.md#1-register-the-mcp-server).
 
 ## `list_secrets`
@@ -49,13 +50,24 @@ to the AI), and a `timed_out` flag.
 `allow_network: true` requires the default `"net"` isolation; combining it with
 `isolation: "full"` is rejected as a validation error.
 
-### Limits and quantization
+### Resource limits and output
 
-Each output stream is capped at 256 KiB. Truncation happens silently: no truncation flag
-is returned to the AI, since that flag was an output-volume oracle. AI-visible
-stdout/stderr lengths are bucket-quantized, padded up to 1/4/16/64 KiB or 256 KiB, to
-blunt the length side channel; the padding tail starts with a visible `\n[opq-pad]\n`
-marker so tooling can strip it.
+Each output stream is capped at 256 KiB after redaction. Output has no artificial
+padding. Content and exact length remain visible; neither padding nor a normalized
+exit code prevents a caller-controlled command from encoding secret information.
+
+At most four runs may prepare or execute concurrently. Additional requests return
+`server_busy` without waiting. Command and argument strings together are capped at
+1 MiB. The deadline starts before preparation and is checked across secret resolution;
+native keyring calls cannot be canceled while in flight. Ordinary child process groups
+are killed on cancellation and after the direct command exits. Server signals and
+abrupt stdio disconnects cancel active tool handlers before shutdown waits for them. Pipe draining is bounded
+by a further 250 ms, including when a child leaves inherited pipes open. Completion
+auditing has its own bounded 250 ms lock-wait budget after cancellation. Native
+filesystem operations such as `fsync`, like native keyring prompts, cannot be
+preempted while in flight. Processes that
+deliberately escape the group require OS-level containment. Interactive CLI commands
+retain their foreground terminal group and use bounded pipe draining.
 
 ### Error taxonomy
 
@@ -64,7 +76,7 @@ never wrapped backend or library text:
 
 `backend_error` · `not_found: <name>` · `exec_not_found` · `exec_permission_denied` ·
 `exec_start_failed` · `sandbox_unavailable` · `wrap_command_failed` · `invalid_input`
-· `invalid_secret_name`
+· `invalid_secret_name` · `server_busy` · `request_canceled`
 
 Revoked, expired, and missing secrets all collapse to `not_found`, so the error channel
 cannot be used as a policy-state oracle. The precise reason goes to the audit log only.
@@ -82,8 +94,8 @@ audit_tail({ n: 20 })   // n capped at 200
 Returns recent audit entries. Over MCP the results are restricted to `caller="mcp"`
 entries, and the `msg` field of `mcp_run` lines passes through a closed allowlist where
 only `timed_out` survives; `raw_exit`, `elapsed_ms`, truncation flags, and AI-supplied
-command/args echoes are stripped, closing the exit-code, timing, and output-volume
-oracle paths.
+command/args echoes are stripped, avoiding those additional detailed disclosures. Command output, success, and observable
+request timing remain channels.
 
 Each `audit_tail` call appends its own `audit_tail` entry before reading, so an AI
 scraping operator activity is itself visible. The self-entry is stripped from the AI's

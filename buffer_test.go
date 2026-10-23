@@ -160,3 +160,16 @@ func TestWipeBytes_MemguardReplacement(t *testing.T) {
 		}
 	}
 }
+
+func TestBuffer_RejectNULWipesSource(t *testing.T) {
+	source := []byte("fake\x00secret")
+	_, err := NewBufferFromBytes(source)
+	if !errors.Is(err, ErrSecretContainsNUL) {
+		t.Fatalf("error=%v", err)
+	}
+	for _, b := range source {
+		if b != 0 {
+			t.Fatal("rejected input retains secret bytes")
+		}
+	}
+}

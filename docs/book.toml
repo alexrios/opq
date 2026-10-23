@@ -1,7 +1,7 @@
 [book]
 title = "opq: the AI-safe secrets CLI"
 authors = ["Alex Rios"]
-description = "Documentation for opq: store secrets in your OS keyring and let programs (and AI agents) use them without ever exposing plaintext."
+description = "Documentation for opq: store secrets in your OS keyring and let programs (and AI agents) use them with output redaction against accidental disclosure."
 language = "en"
 src = "src"
 

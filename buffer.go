@@ -8,9 +8,9 @@ import (
 	"github.com/awnumar/memguard"
 )
 
-// Buffer wraps a memguard.LockedBuffer so the rest of the codebase never
-// touches a raw []byte or string that holds a secret value. Pages backing
-// the buffer are mlocked and zeroed on Destroy.
+// Buffer holds a secret in mlocked pages, zeroed on Destroy. Consumers such as
+// os/exec and the redactor may need additional copies; see the memory-lifetime
+// limits documented with the redactor.
 type Buffer struct {
 	inner *memguard.LockedBuffer
 }
@@ -30,6 +30,7 @@ func NewBufferFromBytes(src []byte) (*Buffer, error) {
 		return nil, errors.New("empty secret value")
 	}
 	if bytes.IndexByte(src, 0) >= 0 {
+		memguard.WipeBytes(src)
 		return nil, ErrSecretContainsNUL
 	}
 	b := memguard.NewBuffer(len(src))

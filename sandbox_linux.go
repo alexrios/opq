@@ -354,6 +354,10 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve command %q: %w", cmd, err)
 	}
+	policyDir, err := resolvePolicyDirForMask()
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve policy dir for sandbox mask: %w", err)
+	}
 
 	var bwArgs []string
 	switch profile {
@@ -367,6 +371,7 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 			return "", nil, fmt.Errorf("resolve audit dir for sandbox mask: %w", err)
 		}
 		bwArgs = sandboxNetArgvCommon(auditDir)
+		bwArgs = append(bwArgs, "--tmpfs", policyDir)
 		if profile == SandboxNet {
 			// SandboxNet adds the netns; without it (SandboxNetAllowed) the
 			// child keeps host network reachability.
@@ -391,6 +396,14 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 			"--new-session",
 			"--die-with-parent",
 			"--cap-drop", "ALL",
+		}
+		// Most homes are absent from the minimal view. An account database
+		// may put a home under an exposed system directory; mask that case too.
+		for _, root := range []string{"/usr", "/etc", "/lib", "/lib64", "/bin", "/sbin"} {
+			if policyDir == root || strings.HasPrefix(policyDir, root+"/") {
+				bwArgs = append(bwArgs, "--tmpfs", policyDir)
+				break
+			}
 		}
 	default:
 		return "", nil, fmt.Errorf("unknown sandbox profile %d", profile)

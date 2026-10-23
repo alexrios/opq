@@ -48,15 +48,12 @@ func (c *PruneCmd) Run() error {
 
 	pruned := 0
 	for _, n := range names {
-		m, err := loadMeta(ctx, backend, n)
+		m, expired, err := pruneSecret(ctx, backend, n, now, c.DryRun)
 		if err != nil {
-			// Don't silently skip a secret whose policy we couldn't read; the
-			// operator relies on prune to clear lapsed values, so make the gap
-			// visible rather than reporting a clean sweep that missed one.
-			fmt.Fprintf(os.Stderr, "prune %s: cannot read policy, skipped: %v\n", n, err)
+			fmt.Fprintf(os.Stderr, "prune %s: %v\n", n, err)
 			continue
 		}
-		if !m.IsExpiredAt(now) {
+		if !expired {
 			continue
 		}
 		if c.DryRun {
@@ -64,11 +61,7 @@ func (c *PruneCmd) Run() error {
 			pruned++
 			continue
 		}
-		if err := backend.Delete(ctx, n); err != nil {
-			fmt.Fprintf(os.Stderr, "prune %s: %v\n", n, err)
-			continue
-		}
-		_ = deleteMeta(ctx, backend, n)
+
 		_ = AppendAudit(AuditEvent{Action: ActionPrune, SecretName: n, Caller: callerTag()})
 		fmt.Fprintf(os.Stdout, "pruned %s\n", n)
 		pruned++

@@ -38,7 +38,9 @@ func clampAuditTailN(requested int) int {
 	return requested
 }
 
-func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailInput) (*mcp.CallToolResult, auditTailOutput, error) {
+func handleAuditTail(ctx context.Context, _ *mcp.CallToolRequest, input auditTailInput) (*mcp.CallToolResult, auditTailOutput, error) {
+	ctx, cancel := context.WithTimeout(ctx, mcpDefaultTimeout)
+	defer cancel()
 	// Over-fetch from the log so that after the MCP-caller filter is applied
 	// we still return up to n entries. In the worst case all entries are CLI
 	// entries and we return an empty list; that is correct behaviour.
@@ -50,13 +52,13 @@ func handleAuditTail(_ context.Context, _ *mcp.CallToolRequest, input auditTailI
 	// crypto/rand fails the nonce is empty and the strip no-ops; the AI sees
 	// one bookkeeping row, not a security violation; better than crashing.
 	nonce := generateAuditNonce()
-	_ = AppendAudit(AuditEvent{
+	_ = AppendAuditContext(ctx, AuditEvent{
 		Action:  ActionAuditTail,
 		Caller:  callerTag(),
 		Message: fmt.Sprintf("n=%d", n),
 		Nonce:   nonce,
 	})
-	lines, err := tailAudit(mcpMaxAuditTailN)
+	lines, err := tailAuditContext(ctx, mcpMaxAuditTailN)
 	if err != nil {
 		return aiErr("internal_error"), auditTailOutput{}, nil
 	}

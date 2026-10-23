@@ -21,7 +21,7 @@ so a value that straddles a write boundary is still matched.
 ## Overlapping secrets
 
 If two stored secrets overlap (`ABC` and `BCD` are both registered and the subprocess
-prints `ABCD`), both are redacted, producing `[REDACTED:S1][REDACTED:S2]`. `scan()`
+prints `ABCD`), both are redacted, producing `[REDACTED:S1][REDACTED:S2]`. `scan()` indexes candidate forms by their first byte, so unrelated forms are skipped. It
 uses two cursors: `i` advances one byte per iteration so every position is tested as a
 possible secret start, and `emitUpTo` tracks how far the current match extends, so
 bytes inside a match that do not begin a new secret are suppressed rather than emitted.
@@ -38,7 +38,9 @@ all mapped to the same `[REDACTED:NAME]` token:
 | Base64 | standard and URL-safe, padded and unpadded |
 | Hex | lower- and upper-case |
 
-Identical forms register once: a short secret whose standard and URL base64 match does
+Stdout and stderr share one prepared, immutable set of forms through
+`NewRedactingWriterPair`; the last writer to call `Destroy` wipes the shared bytes.
+Each writer owns its streaming state independently. Identical forms register once: a short secret whose standard and URL base64 match does
 not register twice. Secrets shorter than 4 bytes (`encodingMinRawLen`) skip the encoded
 forms, because their short encoded outputs match innocuous log text too often; the raw
 form still registers.
@@ -60,8 +62,32 @@ The check is a one-shot type assertion in `NewRedactingWriter`. An interposer pl
 between the redactor and the capped writer has to proxy `Truncated()` or the
 short-circuit stops working; a structural test guards this.
 
+## Memory lifetime
+
+The source `Buffer` uses locked memory. The redactor's matching forms and streaming
+scratch are mutable byte slices on the ordinary Go heap, so they are **not** covered
+by `memguard`'s page locking. Encodings are built directly into byte slices, duplicate
+forms are wiped immediately, and consumed input and output scratch are wiped after
+each write or flush. Replacing scratch storage wipes its old backing array; `Destroy`
+wipes the remaining partial prefix, scratch, and patterns.
+
+This reduces plaintext lifetime but does not guarantee that every copy is locked or
+wiped. In particular, Go's `os/exec` API requires environment strings, and clearing
+references to those strings cannot overwrite their immutable backing storage. The
+consuming child also owns its environment and memory. Avoid crash dumps and treat a
+compromised parent or child process as outside the redactor's protection.
+
+## Performance
+
+`BenchmarkRedactingWriter` measures ordinary output and adversarial shared prefixes
+with 1, 8, and 32 secrets; `BenchmarkRedactingWriterSplitWrites` uses 31-byte writes.
+Candidate indexing avoids checking every form at every byte;
+scratch reuse avoids per-write allocation in steady state. Preserve overlap and
+streaming guarantees when changing either optimization.
+
 ## Tests
 
 `redact_test.go` covers byte-by-byte writes, split writes, overlapping and
-self-overlapping secrets, and each encoded form. Changes to `scan()` or the form
-expansion need to keep those passing.
+self-overlapping secrets, each encoded form, shared-pattern destruction, and scratch
+wiping. `FuzzRedactEncodedChunkBoundaries` exercises arbitrary chunk boundaries across
+registered forms. Changes to `scan()` or form expansion need to keep those passing.

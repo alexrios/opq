@@ -2,13 +2,14 @@ module github.com/alexrios/opq
 
 go 1.25.0
 
-toolchain go1.26.4
+toolchain go1.26.10
 
 require (
 	github.com/99designs/keyring v1.2.2
 	github.com/alecthomas/kong v1.15.0
 	github.com/awnumar/memguard v0.23.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
+	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.43.0
 )
 
@@ -26,5 +27,4 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 )

@@ -21,8 +21,10 @@ enforces them with tests against unexported internals.
 - Subprocess output redacted by default; `--no-redact` is gated like `get --plaintext`.
 - The redactor handles split writes, overlapping secrets, and encoded forms; see
   [The Redactor](./redactor.md).
-- Secret values live in `memguard` buffers, never in a long-lived `string`, always with
-  `defer buf.Destroy()`.
+- Primary secret values live in `memguard` buffers with `defer buf.Destroy()`.
+  Redactor scratch and encoded forms are explicitly wiped. Keyring libraries and
+  `os/exec` still require ordinary-memory copies, including immutable environment
+  strings; clearing references does not zero those strings.
 - Audit writes go through the flock pattern; audit `msg` never carries raw backend error
   text.
 - The MCP sandbox masks the keyring, runtime sockets, and credential agents; see
@@ -32,7 +34,8 @@ enforces them with tests against unexported internals.
 
 The most important design decision is a tool that does not exist. An AI can use secrets
 (`run_with_secrets`) and list names (`list_secrets`), but no API returns a value. Adding
-one, even for debugging, would void the core property.
+one, even for debugging, would introduce a direct plaintext retrieval path. Its absence
+does not close encoding, output-content, timing, or permitted network channels.
 
 ## The flat package layout
 
@@ -60,7 +63,9 @@ a publishable library boundary, or a file past ~2k lines.
 Considered and declined for v1; do not re-pitch without new information:
 
 - Use-count limits: break the read-only read path (need a per-resolve write-back plus a
-  cross-process counter lock). Cost outweighs value.
+  cross-process counter update). The policy path now uses cross-process locks for
+  consistency, but use counting still needs an additional write per resolution.
+  That feature remains out of scope.
 - Absolute `--expires-at`: sugar over `--ttl` unless mirroring an external token's own
   expiry, which is not a current workflow.
 - Auto-destruction daemon: a cron/systemd `opq prune` recipe, not a resident daemon.
@@ -72,8 +77,9 @@ Considered and declined for v1; do not re-pitch without new information:
 
 ## Supply-chain posture
 
-`go.mod` pins `toolchain go1.26.4` for the patched stdlib (closes 11 reachable CVEs in
-`crypto/tls`, `crypto/x509`, `net`, `net/textproto`, `net/url`, `os`). `golang.org/x/crypto` is pinned at
-`v0.52.0`. Two residual vulns in transitive `dvsekhvalnov/jose2go` (via `99designs/keyring`)
-are confirmed not reachable from opq by `govulncheck`; they wait on the upstream PR rather
-than a local vendor-and-patch. Re-run `mise run vulncheck` after any dependency bump.
+`go.mod` and `mise.toml` pin Go 1.26.10. The previous Go 1.26.4 pin now has
+11 standard-library advisories reported reachable by `govulncheck`. Go 1.26.10
+contains their reported fixes. `golang.org/x/crypto` remains pinned at v0.52.0.
+Run `mise run vulncheck` after toolchain or dependency changes; the scan distinguishes
+reachable symbols from affected packages or modules that are not called. A successful
+scan is evidence against known advisories, not proof that the program has no defects.

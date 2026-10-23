@@ -42,6 +42,14 @@ for eager destruction, run `opq prune` from cron or a systemd timer.
 A plain `opq set NAME` (no `--ttl`) clears any prior policy on that name, including a
 revoked tombstone, so re-setting a secret revives it cleanly.
 
+## Interrupted updates
+
+From v1.3.0, `set` marks an update pending before replacing the stored value. If the
+process crashes or the backend cannot finish the policy write, reads stay blocked and
+`opq list` shows `UPDATE-PENDING`. Retry `opq set NAME` with the intended value and TTL,
+or explicitly delete the interrupted item. All clients of the same keyring must be
+upgraded together; older clients do not understand this marker.
+
 ## Revocation: kill it now
 
 `opq revoke` is for a leaked secret. Unlike TTL expiry, it wipes the value from the

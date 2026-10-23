@@ -141,13 +141,21 @@ The profiles are `(allow default)` with targeted denies:
 
 | Profile | Network | Filesystem | Credential masks |
 | --- | --- | --- | --- |
-| `SandboxNet` | `(deny network*)` | `(deny file-write*)` (read-only host) | deny-read `$HOME/.gnupg`, `.ssh`, `.docker/run/docker.sock`, `$SSH_AUTH_SOCK`, and the audit dir |
-| `SandboxNetAllowed` | (allowed) | identical to `SandboxNet` | identical to `SandboxNet` |
+| `SandboxNet` | `(deny network*)` | `(deny file-write*)` (read-only host) | deny-read and deny Unix-socket connections to `$HOME/.gnupg`, `.ssh`, `.docker/run/docker.sock`, `$SSH_AUTH_SOCK`, `/var/run/docker.sock`, and the state dirs |
+| `SandboxNetAllowed` | IP networking allowed; protected Unix sockets denied | identical to `SandboxNet` | identical to `SandboxNet` |
 | `SandboxFull` | `(deny network*)` | `(deny file-write*)` + deny-read `/Users`, `/private/var/root`, `/tmp`, `/private/tmp`, `/private/var/tmp`, `/private/var/folders` | (covered by the `/Users` deny) |
 
 `(deny network*)` also blocks AF_UNIX `connect(2)`, so credential agents reachable by
-socket are closed under `SandboxNet` without a per-socket bind mask. The audit-dir path is
-resolved with `filepath.EvalSymlinks` (the kernel canonicalizes `/tmp -> /private/tmp`
+socket are closed under `SandboxNet` without a per-socket bind mask.
+
+Under `SandboxNetAllowed`, file-read restrictions alone do not stop Unix-socket
+`connect(2)`. Protected credential, Docker, and state paths also have explicit
+`network-outbound` denials with `remote unix-socket` filters. Paths are canonicalized
+so symlink aliases cannot reopen the protected endpoint. Custom Unix sockets outside
+those paths remain available when network access is allowed. Live socket regressions
+check connection refusal alongside positive controls for HTTP and custom local IPC.
+
+The audit-dir path is resolved with `filepath.EvalSymlinks` (the kernel canonicalizes `/tmp -> /private/tmp`
 before the Seatbelt check), and `WrapCommand` fails closed if neither `HOME` nor
 `XDG_STATE_HOME` resolves, matching the Linux contract.
 
@@ -172,3 +180,12 @@ where Seatbelt is wedged by MDM policy fails at startup rather than at the first
 AppArmor, seccomp, or a missing `CONFIG_USER_NS` blocks unprivileged namespace creation,
 the server stops with a clear error instead of failing at the first tool call. The macOS
 equivalent is described in the [macOS section](#macos-seatbelt) above.
+
+## Policy transaction lock
+
+The policy lock directory is resolved from the OS account database rather than
+`HOME` or `XDG_STATE_HOME`, so processes using the same keyring share one transaction
+lock. Net profiles mask it independently of the audit directory. Full profiles hide
+it through their minimal filesystem view, or an explicit mask when the path is
+inside an exposed directory. Seatbelt credential masks resolve symlinks and existing
+ancestors, matching the canonical paths checked by the kernel.

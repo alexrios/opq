@@ -3,13 +3,16 @@
 `opq` stores secrets in your OS keyring and runs programs with those secrets injected
 as environment variables. The program receives the value; anything it prints is
 scanned, and the secret is replaced with `[REDACTED:VAR]` before the output comes
-back. An AI agent can use a secret to run a command without reading the secret itself.
+back. This protects against accidental disclosure by consuming programs; a hostile
+caller-controlled command can still encode a secret into output.
 
-It pays off without an AI agent, too: secrets stay out of your shell history and `ps`
-output and live in the OS keyring instead of a `.env` file. The AI-safety properties
+It pays off without an AI agent, too: secrets stay out of command arguments and shell
+history and live in the OS keyring instead of a `.env` file. The consuming program
+receives plaintext in its environment, which may be inspectable by privileged or
+same-user processes depending on the operating system. The AI-safety properties
 build on that base.
 
-Status: v1.2.1. Supported on Linux (Secret Service) and macOS (Keychain), licensed under
+Status: v1.3.0. Supported on Linux (Secret Service) and macOS (Keychain), licensed under
 the GNU AGPL-3.0.
 
 ## The problem
@@ -34,7 +37,7 @@ opq mcp                                                # MCP server over stdio
 
 ## Guarantees
 
-These rules hold even when the calling agent is trying to extract the secret:
+These controls prevent direct retrieval and accidental output:
 
 - Reading a value to anything other than a terminal is refused.
 - Secret values never appear on argv. `set` reads from stdin or a hidden prompt.
@@ -43,8 +46,10 @@ These rules hold even when the calling agent is trying to extract the secret:
 - Subprocess output is redacted by default, including base64 and hex forms of the
   value.
 - MCP subprocesses run in an OS-native sandbox with no network route (and, on Linux, a
-  private PID namespace), so a leaked value still cannot leave the machine.
-- Every use is written to an audit log the agent cannot read in full.
+  private PID namespace) unless network access is explicitly granted. Output and
+  non-network channels remain possible; see the [threat model](./security/threat-model.md).
+- Uses are submitted to an audit log that MCP cannot read in full. Audit write
+  failures are reported to the operator; execution currently continues.
 
 The [MCP tutorial](./tutorials/mcp-claude-code.md) includes a session where the agent
 tries each of these in turn and fails.

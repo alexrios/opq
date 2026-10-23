@@ -127,11 +127,9 @@ func resolveAuditDirForMask() (string, error) {
 	return real, nil
 }
 
-// homeCredentialReadDenies lists $HOME-relative paths whose reads are denied
-// under the FS sandbox, mirroring sandbox_linux.go's homeDirSocketTmpfsRel /
-// homeDirSocketFileRel. Denying reads hides both the credential material and the
-// agent socket file, so connect() can't find it even under SandboxNetAllowed
-// where network() is permitted. As on Linux, masking .gnupg breaks gpg run
+// homeCredentialReadDenies lists $HOME-relative paths protected by file-read
+// and Unix-socket connection denials. Seatbelt checks connect() separately from
+// file reads, including under SandboxNetAllowed. Masking .gnupg breaks gpg
 // inside the sandbox; the trade is intentional (the sandbox is for arbitrary AI
 // commands, not the operator's keys).
 var homeCredentialReadDenies = []string{
@@ -149,6 +147,11 @@ func buildSeatbeltProfile(profile SandboxProfile) (string, error) {
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
 	b.WriteString("(allow default)\n")
+	policyDir, err := resolvePolicyDirForMask()
+	if err != nil {
+		return "", fmt.Errorf("resolve policy dir for sandbox mask: %w", err)
+	}
+	b.WriteString(sbplSensitivePathDeny(sbplSubpath(policyDir)))
 
 	switch profile {
 	case SandboxNet, SandboxNetAllowed:
@@ -164,15 +167,28 @@ func buildSeatbeltProfile(profile SandboxProfile) (string, error) {
 		home, herr := homeDirForMask()
 		if herr == nil && home != "" {
 			for _, rel := range homeCredentialReadDenies {
-				b.WriteString("(deny file-read* " + sbplSubpath(filepath.Join(home, rel)) + ")\n")
+				path, err := canonicalSandboxPath(filepath.Join(home, rel))
+				if err != nil {
+					return "", fmt.Errorf("resolve credential mask: %w", err)
+				}
+				b.WriteString(sbplSensitivePathDeny(sbplSubpath(path)))
 			}
 		}
 		// $SSH_AUTH_SOCK is the operator's (parent env; the AI can't influence
-		// it). Deny reads of the literal socket path so the agent is unreachable
-		// even under SandboxNetAllowed, mirroring Linux's /run/user tmpfs mask.
+		// it). Deny both reads and connections, even under SandboxNetAllowed.
 		if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-			b.WriteString("(deny file-read* " + sbplLiteral(sock) + ")\n")
+			path, err := canonicalSandboxPath(sock)
+			if err != nil {
+				return "", fmt.Errorf("resolve SSH socket mask: %w", err)
+			}
+			b.WriteString(sbplSensitivePathDeny(sbplLiteral(path)))
 		}
+		// Docker can use a system socket instead of the Docker Desktop home path.
+		dockerSocket, err := canonicalSandboxPath("/var/run/docker.sock")
+		if err != nil {
+			return "", fmt.Errorf("resolve Docker socket mask: %w", err)
+		}
+		b.WriteString(sbplSensitivePathDeny(sbplLiteral(dockerSocket)))
 
 		// Mask the audit dir so the child can't cat audit.log and recover the
 		// raw tokens filterAuditMessageForAI strips from the MCP response.
@@ -180,7 +196,7 @@ func buildSeatbeltProfile(profile SandboxProfile) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve audit dir for sandbox mask: %w", err)
 		}
-		b.WriteString("(deny file-read* " + sbplSubpath(auditDir) + ")\n")
+		b.WriteString(sbplSensitivePathDeny(sbplSubpath(auditDir)))
 
 	case SandboxFull:
 		b.WriteString("(deny network*)\n")
@@ -192,8 +208,14 @@ func buildSeatbeltProfile(profile SandboxProfile) (string, error) {
 		// resolved $HOME is added too in case it lives outside /Users.
 		b.WriteString("(deny file-read* (subpath \"/Users\"))\n")
 		b.WriteString("(deny file-read* (subpath \"/private/var/root\"))\n")
-		if home, err := homeDirForMask(); err == nil && home != "" && !strings.HasPrefix(home, "/Users/") {
-			b.WriteString("(deny file-read* " + sbplSubpath(home) + ")\n")
+		if home, err := homeDirForMask(); err == nil && home != "" {
+			path, err := canonicalSandboxPath(home)
+			if err != nil {
+				return "", fmt.Errorf("resolve home mask: %w", err)
+			}
+			if !strings.HasPrefix(path, "/Users/") {
+				b.WriteString("(deny file-read* " + sbplSubpath(path) + ")\n")
+			}
 		}
 		for _, tmp := range []string{"/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders"} {
 			b.WriteString("(deny file-read* (subpath \"" + tmp + "\"))\n")
@@ -204,6 +226,35 @@ func buildSeatbeltProfile(profile SandboxProfile) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+// Sensitive paths must reject socket connections as well as filesystem reads.
+// filter is an escaped literal/subpath expression from sbplLiteral/sbplSubpath.
+func sbplSensitivePathDeny(filter string) string {
+	return "(deny file-read* " + filter + ")\n" +
+		"(deny network-outbound (remote unix-socket " + filter + "))\n"
+}
+
+// Seatbelt checks canonical kernel paths. Resolve existing ancestors too when
+// a credential directory or socket is absent, rather than emitting an alias
+// such as /var/... that does not match the kernel's /private/var/... path.
+func canonicalSandboxPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return real, nil
+	}
+	if !os.IsNotExist(err) || filepath.Dir(abs) == abs {
+		return "", err
+	}
+	parent, err := canonicalSandboxPath(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(abs)), nil
 }
 
 // WrapCommand returns the argv to run `cmd args...` under the given profile via

@@ -1,8 +1,9 @@
 # Threat Model
 
-`opq` keeps one property: an AI agent can use a secret to run a command but never sees
-the plaintext value. This page lists what that covers, what it does not, and the residual
-risks.
+`opq` prevents direct secret retrieval over MCP and redacts accidental raw, base64,
+and hex output from consuming programs. It cannot keep secrets confidential from an
+adversarial caller that controls an arbitrary consuming command. This page defines
+the boundary and the residual risks.
 
 ## In scope
 
@@ -14,9 +15,12 @@ risks.
 - Subprocesses accidentally echoing secrets; output is redacted by default, including
   base64 and hex encodings.
 - Shell-history exposure; no secret appears on argv.
-- Process-list exposure (`ps auxe`); secrets enter the child via `exec` env, not shell
-  interpolation.
-- Memory swap-out of secret pages; values live in `memguard` mlocked buffers.
+- Secret exposure through command arguments; secrets enter the child environment
+  without shell interpolation. Environment visibility to same-user or privileged
+  processes depends on the OS and is not an end-to-end confidentiality guarantee.
+- Swap-out of the primary secret buffers, which use `memguard` locked pages.
+  Redaction scratch and the copies required by native keyring APIs and `os/exec`
+  may live on the ordinary heap; memory locking is not an end-to-end guarantee.
 - Intentional network exfiltration via the MCP `run_with_secrets` tool, blocked by
   default. On Linux, every MCP subprocess runs in a network namespace (`--unshare-net`), a
   private PID namespace (`--unshare-pid`), and a private `/proc`, so `curl`, DNS-label
@@ -69,9 +73,11 @@ the exploit behind each):
 - Loopback channels (`curl http://127.0.0.1:6379`, `psql -h 127.0.0.1`). The network
   sandbox blocks egress at the namespace boundary but not loopback to co-resident
   services. Treat loopback as open egress unless you have audited every listening port.
-- Process-level resource exhaustion. Per-call limits bound a single call's blast radius,
-  but a tight loop can still consume CPU, keyring, or network; rate-limiting belongs in a
-  policy proxy.
+- Process-level resource exhaustion. MCP permits four active runs, caps arguments at
+  1 MiB and output at 256 KiB per stream, and bounds subprocess waiting. These are
+  operational limits, not CPU/memory quotas or a containment boundary. A hostile child
+  can create a new process group; use OS resource isolation and a policy proxy for
+  adversarial programs. Native keyring calls cannot be interrupted while in flight.
 - `allow_network=true` exfil. When the AI opts in (audited as `network_allowed`), there
   is no opq-layer defense against it shipping the secret to an external host. That is the
   contract of the flag.
@@ -80,10 +86,11 @@ the exploit behind each):
 
 Reduced, not eliminated:
 
-- Output-volume oracle. The AI controls subprocess output length, which leaks bits per
-  call. Bucket-quantization collapses this from ~17 bits to ~2.3 bits per call (~4 calls
-  per byte instead of ~1). Closing it fully requires not returning output to the AI, or a
-  policy proxy.
+- Output content, volume, success, and timing remain information channels. Previous
+  releases padded output and claimed a reduced length-channel capacity. The padding
+  marker exposed the original length exactly, and caller-chosen content defeats padding
+  even without a marker. Padding is removed; no information-theoretic bound is claimed.
+  Use fixed approved operations and narrow typed responses in a policy proxy.
 - Custom Unix sockets the operator placed outside the masked paths
   (`~/.local/share/kwalletd/*.socket`, any AF_UNIX endpoint under `$HOME`). Use
   `isolation="full"` for a complete filesystem view.

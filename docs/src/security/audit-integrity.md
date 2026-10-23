@@ -18,8 +18,23 @@ a freshly-opened `audit.lock` fd, a distinct OFD from the writer's cached fd, so
 self-conflicts work in-process.
 
 Rotation (at 10 MiB, keeping one `audit.log.1`) never drops the lock, so readers cannot
-observe torn or duplicated entries even when a writer rotates mid-read. Do not open
-`audit.log` for write outside `appendAuditInternal`, or read it outside `tailAudit`.
+observe torn or duplicated entries even when a writer rotates mid-read. Before each
+append, a writer checks that its cached descriptor still names the active file. If another
+process rotated the log, it reopens `audit.log` under the same exclusive lock before
+writing; new events never continue into the retired inode. Every append still calls
+`fsync` before releasing the lock. MCP uses context-aware mutex and flock waits;
+cancellation returns without leaving a detached writer. Native filesystem calls,
+including `fsync`, remain synchronous once started. Completion auditing gets a
+separate 250 ms lock-wait budget so a canceled run can still leave an audit entry.
+
+Positive tail requests read backward in 8 KiB blocks and stop after finding enough
+non-empty records, crossing into `audit.log.1` only when needed. They retain complete
+records, including an unterminated final record, without allocating the entire log. Files
+above the 32 MiB defensive cap are refused before reading. A non-positive tail request
+retains the full-history behavior within that cap.
+
+Do not open `audit.log` for write outside `appendAuditInternal`, or read it outside
+`tailAudit`.
 
 ## No raw backend errors in the log
 

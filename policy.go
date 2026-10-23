@@ -6,8 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,7 +24,7 @@ const metaKeyPrefix = "meta/"
 
 // secretMetaVersion stamps each SecretMeta; bump only on an incompatible
 // JSON-shape change.
-const secretMetaVersion = 1
+const secretMetaVersion = 2
 
 func metaKey(name string) string { return metaKeyPrefix + name }
 
@@ -36,8 +40,9 @@ func secretNameFromMetaKey(key string) (string, bool) {
 // ErrSecretExpired and ErrSecretRevoked are distinct from ErrSecretNotFound so
 // the read paths can report a precise audit taxonomy.
 var (
-	ErrSecretExpired = errors.New("secret has expired")
-	ErrSecretRevoked = errors.New("secret has been revoked")
+	ErrSecretExpired       = errors.New("secret has expired")
+	ErrSecretRevoked       = errors.New("secret has been revoked")
+	ErrSecretUpdatePending = errors.New("secret update is incomplete; retry set or delete the secret")
 )
 
 // SecretMeta is a secret's policy, stored as a companion keyring item. Times are
@@ -45,6 +50,7 @@ var (
 // so it is co-located with, and as tamper-resistant as, the secret it governs.
 type SecretMeta struct {
 	V         int       `json:"v"`
+	Pending   bool      `json:"pending,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 	RevokedAt time.Time `json:"revoked_at,omitempty"`
@@ -77,6 +83,9 @@ func loadMeta(ctx context.Context, backend Backend, name string) (*SecretMeta, e
 	var m SecretMeta
 	if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
 		return nil, fmt.Errorf("parse secret metadata for %q: %w", name, err)
+	}
+	if m.V != 1 && m.V != secretMetaVersion {
+		return nil, fmt.Errorf("unsupported secret metadata version %d", m.V)
 	}
 	return &m, nil
 }
@@ -113,23 +122,229 @@ func deleteMeta(ctx context.Context, backend Backend, name string) error {
 // checked before expired so a deliberately-killed secret reports the precise
 // ErrSecretRevoked.
 func resolveSecret(ctx context.Context, backend Backend, name string, now time.Time) (*Buffer, error) {
+	started := time.Now()
 	// Defense in depth: a valid name can't contain '/', so it can't reach the
 	// meta/ namespace. Re-checking here stops a future caller that skips the
 	// guard from turning this into a namespace-confusion primitive.
 	if !validSecretName(name) {
 		return nil, ErrSecretNotFound
 	}
+	unlock, err := lockPolicy(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	meta, err := loadMeta(ctx, backend, name)
 	if err != nil {
 		return nil, err
 	}
+	if meta != nil && meta.Pending {
+		return nil, ErrSecretUpdatePending
+	}
 	if meta.IsRevoked() {
 		return nil, ErrSecretRevoked
 	}
-	if meta.IsExpiredAt(now) {
+	if meta.IsExpiredAt(now.Add(time.Since(started))) {
 		return nil, ErrSecretExpired
 	}
-	return backend.Get(ctx, name)
+	buf, err := backend.Get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		buf.Destroy()
+		return nil, err
+	}
+	if meta.IsExpiredAt(now.Add(time.Since(started))) {
+		buf.Destroy()
+		return nil, ErrSecretExpired
+	}
+	return buf, nil
+}
+
+// policyHomeDir comes from the OS account database, never HOME/XDG_STATE_HOME.
+// Those environment variables can differ between clients of the same keyring and
+// must not create independent policy locks. Indirection is only for test fixtures.
+var policyHomeDir = func() (string, error) {
+	account, err := user.LookupId(strconv.Itoa(os.Getuid()))
+	if err != nil {
+		return "", fmt.Errorf("resolve policy lock account: %w", err)
+	}
+	if !filepath.IsAbs(account.HomeDir) {
+		return "", errors.New("OS account has no absolute home directory")
+	}
+	return account.HomeDir, nil
+}
+
+func policyLockDir() (string, error) {
+	home, err := policyHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "state", "opq-policy"), nil
+}
+
+// lockPolicy serializes policy/value transactions across processes and goroutines.
+// Every acquisition uses a fresh fd so shared readers compete with writers even
+// inside one process. Sandbox profiles mask policyLockDir() independently of the
+// audit directory, which remains configurable through XDG_STATE_HOME.
+func lockPolicy(ctx context.Context, exclusive bool) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dir, err := policyLockDir()
+	if err != nil {
+		return nil, err
+	}
+	if err := prepareAuditDir(dir); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "policy.lock"), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open policy lock: %w", err)
+	}
+	fail := func(err error) (func(), error) { f.Close(); return nil, err }
+	st, err := f.Stat()
+	if err != nil {
+		return fail(err)
+	}
+	if !st.Mode().IsRegular() {
+		return fail(errors.New("policy lock is not a regular file"))
+	}
+	if err := f.Chmod(0600); err != nil {
+		return fail(err)
+	}
+	mode := syscall.LOCK_SH
+	if exclusive {
+		mode = syscall.LOCK_EX
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), mode|syscall.LOCK_NB)
+		if err == nil {
+			return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN && err != syscall.EINTR {
+			return fail(fmt.Errorf("flock policy lock: %w", err))
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fail(ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// storeSecret marks the item unavailable before replacing its value. A process
+// crash or backend failure between writes leaves the encrypted pending marker,
+// so no reader can mistake an incomplete update for a policy-free credential.
+func storeSecret(ctx context.Context, backend Backend, name string, value *Buffer, meta *SecretMeta) error {
+	unlock, err := lockPolicy(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := storeMeta(ctx, backend, name, &SecretMeta{V: secretMetaVersion, Pending: true}); err != nil {
+		return fmt.Errorf("prepare secret update: %w", err)
+	}
+	if err := backend.Set(ctx, name, value); err != nil {
+		return fmt.Errorf("store secret (update remains blocked): %w", err)
+	}
+	if meta == nil {
+		err = deleteMeta(ctx, backend, name)
+	} else {
+		err = storeMeta(ctx, backend, name, meta)
+	}
+	if err != nil {
+		return fmt.Errorf("finish secret update (reads remain blocked; retry set or delete): %w", err)
+	}
+	return nil
+}
+
+func deleteSecretLocked(ctx context.Context, backend Backend, name string) error {
+	// Delete can recover an unreadable or interrupted metadata record too.
+	meta, err := backend.Get(ctx, metaKey(name))
+	metaExisted := err == nil
+	if meta != nil {
+		meta.Destroy()
+	}
+	if err != nil && !errors.Is(err, ErrSecretNotFound) {
+		return err
+	}
+
+	err = backend.Delete(ctx, name)
+	if err != nil && (!errors.Is(err, ErrSecretNotFound) || !metaExisted) {
+		return err
+	}
+	return deleteMeta(ctx, backend, name)
+}
+
+func deleteSecret(ctx context.Context, backend Backend, name string) error {
+	unlock, err := lockPolicy(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return deleteSecretLocked(ctx, backend, name)
+}
+
+func revokeSecret(ctx context.Context, backend Backend, name string, now time.Time) error {
+	unlock, err := lockPolicy(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// Revocation must still wipe a live value when its policy is unreadable.
+	// Metadata only supplies optional timestamps; it must not gate emergency deletion.
+	existing, metaErr := loadMeta(ctx, backend, name)
+	err = backend.Delete(ctx, name)
+	if err != nil {
+		if !errors.Is(err, ErrSecretNotFound) {
+			return err
+		}
+		if existing == nil {
+			if metaErr != nil {
+				return fmt.Errorf("value absent; revocation metadata unreadable: %w", metaErr)
+			}
+			return err
+		}
+	}
+	tomb := &SecretMeta{V: secretMetaVersion, RevokedAt: now}
+	if existing != nil {
+		tomb.CreatedAt = existing.CreatedAt
+		tomb.ExpiresAt = existing.ExpiresAt
+	}
+	if err := storeMeta(ctx, backend, name, tomb); err != nil {
+		return fmt.Errorf("value wiped but revocation record failed: %w", err)
+	}
+	return nil
+}
+
+// pruneSecret checks and deletes under the same lock, so a concurrently re-set
+// name cannot be deleted using the previous generation's expiry.
+func pruneSecret(ctx context.Context, backend Backend, name string, now time.Time, dryRun bool) (*SecretMeta, bool, error) {
+	unlock, err := lockPolicy(ctx, !dryRun)
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlock()
+	m, err := loadMeta(ctx, backend, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if m != nil && m.Pending {
+		return nil, false, ErrSecretUpdatePending
+	}
+	if m.IsRevoked() || !m.IsExpiredAt(now) {
+		return m, false, nil
+	}
+	if !dryRun {
+		if err := deleteSecretLocked(ctx, backend, name); err != nil {
+			return nil, false, err
+		}
+	}
+	return m, true, nil
 }
 
 // filterVisibleSecretNames drops companion meta/ keys from a raw listing. The

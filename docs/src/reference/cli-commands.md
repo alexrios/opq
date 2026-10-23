@@ -7,7 +7,7 @@ log itself.
 | Command | Behavior |
 | --- | --- |
 | `opq set <name> [--ttl 24h\|7d\|2w]` | Read value from stdin (or hidden TTY prompt). Never accepts values on argv. `--ttl` sets a time-to-live after which reads are refused; omit for no expiry. |
-| `opq list` | Print stored secret names, annotated with `expires <ts>` / `EXPIRED` / `REVOKED` where a policy applies. |
+| `opq list` | Print stored secret names, annotated with `expires <ts>` / `EXPIRED` / `REVOKED` / `UPDATE-PENDING` where a policy applies. |
 | `opq get <name> --plaintext` | Print value to stdout. Refuses unless stdout is a TTY (plus the human gate, below). |
 | `opq exec --env VAR=name [...] -- cmd args` | Run `cmd` with named secrets injected as env vars. Output redacted by default. |
 | `opq delete <name>` | Remove a secret and any TTL/revocation record. |
@@ -27,8 +27,9 @@ stdin is a terminal. Values are never read from argv.
 
 Names match `[A-Za-z0-9_.-]{1,128}`: no slashes (the `/` namespace is reserved for
 internal policy items), no spaces. `--ttl` accepts `90m`, `24h`, `7d`, `2w`, and so on;
-it writes a companion policy item and fails closed, rolling back the value if the policy
-write fails. The interactive prompt disables bracketed-paste mode and trims surrounding
+it writes a pending companion item before replacing the value and commits the policy
+afterward. An interrupted or failed update remains blocked as `UPDATE-PENDING`; retry
+`set` with the intended value/policy or explicitly `delete` the item. The interactive prompt disables bracketed-paste mode and trims surrounding
 whitespace; the piped path stores bytes verbatim, so supply whitespace-significant
 values over stdin. A plain `set` with no `--ttl` clears any prior policy on the name,
 including a revoked tombstone. NUL-bearing values are rejected, since `os/exec` cannot
@@ -41,7 +42,8 @@ opq list
 ```
 
 Prints names only, never values. Annotations: `expires <ts>` for a live TTL, `EXPIRED`
-past it, `REVOKED` for a tombstone, `meta-error` for an unreadable policy item.
+past it, `REVOKED` for a tombstone, `UPDATE-PENDING` for an interrupted update, and
+`meta-error` for an unreadable policy item.
 Internal `meta/` items appear as status on the parent name, not as separate entries.
 
 ## `opq get`

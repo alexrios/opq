@@ -33,5 +33,6 @@
 
 # Appendix
 
+- [Performance & Security Verification](./appendix/performance-security-verification.md)
 - [Version & Hardening History](./appendix/version-history.md)
 - [Adding a Backend](./appendix/backends.md)

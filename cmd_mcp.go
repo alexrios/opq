@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"os/signal"
+	"syscall"
 )
 
 type MCPCmd struct{}
 
 func (c *MCPCmd) Run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
 	SetCallerTag("mcp")
 	// The MCP server's default isolation is SandboxNet for every
 	// run_with_secrets call. If the sandbox cannot start, refuse to
@@ -16,11 +20,7 @@ func (c *MCPCmd) Run() error {
 	if err := VerifySandboxAvailable(); err != nil {
 		return fmt.Errorf("opq mcp requires a working subprocess sandbox: %w\nInstall bubblewrap (Debian/Ubuntu: apt install bubblewrap; Fedora: dnf install bubblewrap; Arch: pacman -S bubblewrap)", err)
 	}
-	srv, err := newMCPServer()
-	if err != nil {
-		return err
-	}
-	if err := runMCPServer(context.Background(), srv); err != nil {
+	if err := runMCPServer(ctx); err != nil {
 		return fmt.Errorf("mcp server: %w", err)
 	}
 	return nil

@@ -15,6 +15,9 @@ import (
 // and the macOS Keychain on darwin (backend_darwin.go); other OSes have no
 // backend (backend_other.go). Future backends (e.g. Proton Pass) implement this
 // same interface.
+// Native keyring APIs do not accept contexts. Checks around each call prevent
+// starting work or returning secret bytes after cancellation, but an in-flight
+// OS keyring prompt cannot be interrupted by the caller context.
 type Backend interface {
 	Name() string
 	Get(ctx context.Context, name string) (*Buffer, error)
@@ -46,8 +49,15 @@ type keyringBackend struct {
 
 func (b *keyringBackend) Name() string { return b.name }
 
-func (b *keyringBackend) Get(_ context.Context, name string) (*Buffer, error) {
+func (b *keyringBackend) Get(ctx context.Context, name string) (*Buffer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	item, err := b.kr.Get(name)
+	if cerr := ctx.Err(); cerr != nil {
+		memguard.WipeBytes(item.Data)
+		return nil, cerr
+	}
 	if errors.Is(err, keyring.ErrKeyNotFound) {
 		return nil, ErrSecretNotFound
 	}
@@ -63,7 +73,10 @@ func (b *keyringBackend) Get(_ context.Context, name string) (*Buffer, error) {
 	return buf, nil
 }
 
-func (b *keyringBackend) Set(_ context.Context, name string, value *Buffer) error {
+func (b *keyringBackend) Set(ctx context.Context, name string, value *Buffer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if value == nil || !value.IsAlive() {
 		return errors.New("set: empty value")
 	}
@@ -84,21 +97,30 @@ func (b *keyringBackend) Set(_ context.Context, name string, value *Buffer) erro
 	if err != nil {
 		return fmt.Errorf("keyring set: %w", err)
 	}
-	return nil
+	return ctx.Err()
 }
 
-func (b *keyringBackend) Delete(_ context.Context, name string) error {
+func (b *keyringBackend) Delete(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := b.kr.Remove(name); err != nil {
 		if errors.Is(err, keyring.ErrKeyNotFound) {
 			return ErrSecretNotFound
 		}
 		return fmt.Errorf("keyring remove: %w", err)
 	}
-	return nil
+	return ctx.Err()
 }
 
-func (b *keyringBackend) List(_ context.Context) ([]string, error) {
+func (b *keyringBackend) List(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	keys, err := b.kr.Keys()
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	if err != nil {
 		return nil, fmt.Errorf("keyring keys: %w", err)
 	}

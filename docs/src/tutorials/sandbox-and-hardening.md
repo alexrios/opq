@@ -83,25 +83,42 @@ command.
 
 ## The policy-proxy pattern
 
-The opq CLI ships as a low-trust building block. For deployments fronting an actively
-adversarial model, put a small policy-enforcing MCP server in front of `opq mcp`:
+The opq CLI is a building block for trusted consuming programs. For an untrusted agent,
+put an operator-controlled MCP server in front of the private `opq mcp` process. The
+repository includes a runnable example at `examples/policy-proxy/`:
 
-```text
-   AI agent
-      │  MCP
-      ▼
- ┌─────────────────────┐
- │  policy proxy        │   allowlists (command, args pattern, env var set)
- │  (your wrapper)      │   per secret; denies everything else
- └─────────┬───────────┘
-           │  MCP (forwarded, approved calls only)
-           ▼
-      opq mcp
+```sh
+go build -o /tmp/opq-policy-proxy ./examples/policy-proxy
+go test -race ./examples/policy-proxy
 ```
 
-The proxy allowlists `(command, args pattern, env var set)` tuples per secret, denies
-anything not on the list, and forwards only approved calls to `opq`. This removes the
-agent's ability to supply secret-conditional commands, which is what the residual side
-channels (the output-volume oracle, loopback services, a legitimately granted
-`allow_network`) depend on. The [Threat Model](../security/threat-model.md) has the
-full list of in- and out-of-scope risks.
+The operator installs that binary, the opq binary, approved consumer programs, and a JSON
+policy outside agent-writable paths. The supplied policy approves no operations. Each
+approved operation fixes an absolute command, every argument, the exact secret mapping,
+timeout, network permission, and isolation profile. The proxy exposes one named tool per
+operation, each accepting only `{}`. It exposes no arbitrary command, secret-list, or audit
+passthrough tool.
+
+```text
+AI agent -> fixed-operation proxy -> private opq mcp -> approved consumer
+             status only               redaction + OS sandbox
+```
+
+The proxy discards upstream output, errors, and metadata. Its only response fields are
+`succeeded` and `timed_out`; it does not rely on output padding to hide secret-dependent
+content or lengths. Closed input schemas and runtime validation reject caller-supplied
+arguments. Per-operation deadlines and a two-call concurrency limit bound execution. Client
+disconnect and shutdown signals cancel active requests before the proxy closes its private
+upstream session, allowing opq to clean up consuming subprocesses.
+See `examples/policy-proxy/README.md` for configuration, installation, and a local smoke
+operation.
+
+The deployment must also deny the agent direct access to opq, the keyring, and the trusted
+programs' writable inputs. A wrapper cannot constrain an agent with unrestricted shell
+access as the same OS principal. For network operations, review the fixed consumer's
+redirect handling, ambient proxies, native configuration loading, and endpoint behavior.
+The example fixes the permission to use the network; it is not a destination firewall.
+Never expand credentials into shell arguments; consumers read them directly from the
+environment. Approved operations still disclose coarse status and timing, which the
+operator must review. The [Threat Model](../security/threat-model.md) describes the
+remaining limits.

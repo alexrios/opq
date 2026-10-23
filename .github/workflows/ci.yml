@@ -15,7 +15,11 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
 
@@ -25,8 +29,34 @@ jobs:
         with:
           cache: true
 
+      # The runner is disposable. Bubblewrap requires unprivileged user
+      # namespaces; Ubuntu's generic AppArmor restriction may disable them.
+      - name: Prepare Linux sandbox
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --unshare-net --unshare-pid --die-with-parent --new-session /usr/bin/true
+
       # Same gate developers run locally: vet + test + build.
       - run: mise run check
+
+      - name: Race regressions
+        run: mise exec -- go test -race -count=1 -timeout=2m ./...
+
+      # Select sandbox tests explicitly: keychain-writing integration tests
+      # require an operator session and must never run in this job.
+      - name: Sandbox behavior
+        run: mise exec -- go test -race -tags=integration -run '^TestSandbox' -count=1 -timeout=2m ./...
+
+      - name: Redactor fuzz smoke
+        run: mise exec -- go test -run '^$' -fuzz '^FuzzRedactEncodedChunkBoundaries$' -fuzztime=5s -parallel=2 -timeout=45s
+
+      - name: Audit tail fuzz smoke
+        run: mise exec -- go test -run '^$' -fuzz '^FuzzAuditTailMatchesFullRead$' -fuzztime=5s -parallel=2 -timeout=45s
 
   vulncheck:
     runs-on: ubuntu-latest
