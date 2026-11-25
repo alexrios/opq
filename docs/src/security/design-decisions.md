@@ -77,9 +77,10 @@ Considered and declined for v1; do not re-pitch without new information:
 
 ## Supply-chain posture
 
-`go.mod` and `mise.toml` pin Go 1.26.10. The previous Go 1.26.4 pin now has
-11 standard-library advisories reported reachable by `govulncheck`. Go 1.26.10
-contains their reported fixes. `golang.org/x/crypto` remains pinned at v0.52.0.
+`go.mod` and `mise.toml` pin Go 1.26.11 (bumped from Go 1.26.10 for `GO-2026-6859`
+in `net/http`). Earlier Go 1.26.x pins had standard-library advisories reported
+reachable by `govulncheck`; Go 1.26.11 contains their reported fixes.
+`golang.org/x/crypto` remains pinned at v0.52.0.
 Run `mise run vulncheck` after toolchain or dependency changes; the scan distinguishes
 reachable symbols from affected packages or modules that are not called. A successful
 scan is evidence against known advisories, not proof that the program has no defects.

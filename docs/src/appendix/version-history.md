@@ -4,7 +4,40 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
-## v1.3.0 (current)
+## v1.4.0 (current)
+
+CLI ergonomics, diagnostic and completion commands, MCP and policy-proxy usability
+improvements, and refreshed documentation.
+
+### Changes
+
+- **CLI ergonomics:**
+  - `set` adds `--keep-ttl`, `--no-clobber`, and `--trim`, plus warnings on overwrites and
+    trailing newlines.
+  - `list` adds `--long`, `--json`, and `--status` filters with aligned TTY output.
+  - `audit` adds `--all`, `--json`, `--caller`, `--action`, and `--secret` filters,
+    formatted TTY tables, and removes the 200-entry tail cap.
+  - `exec` accepts `-e VAR` shorthand (mapping `VAR` to secret `VAR`).
+  - `get` adds an invocation hint when blocked; `delete` accepts multiple secret names;
+    `prune` adds `--include-revoked` and exits non-zero on errors.
+- **New commands:**
+  - `opq doctor` checks keyring, sandbox, audit log, and policy state (with ANSI-safe
+    column alignment and `TERM=dumb` support).
+  - `opq info` inspects secret policy metadata without revealing values.
+  - `opq completion bash|zsh|fish` generates shell completion scripts.
+- **MCP & policy-proxy UX:**
+  - MCP tools expose `ToolAnnotations`, tightened JSON Schema bounds, the
+    `isolation: "readonly"` alias, and clearer operational descriptions; macOS and Linux
+    sandbox error messages are cleaned up.
+  - The policy-proxy example adds per-operation `description` fields, pinpoint config
+    validation errors, and sanitized startup diagnostics.
+- **Documentation & skill:** Refreshed onboarding UX, inline SVG architecture diagrams,
+  updated CLI/MCP references (with portable `/bin/sh` examples), and an updated
+  `opq.skill` bundle.
+- **Toolchain:** Release builds and `mise.toml`/`go.mod` bump Go from `1.26.10` to
+  `1.26.11` to address stdlib advisory `GO-2026-6859` in `net/http`.
+
+## v1.3.0
 
 Security and performance fixes for command execution, policy updates, and auditing.
 The CLI command surface is unchanged. An optional fixed-operation MCP proxy example

@@ -3,7 +3,7 @@
 [![Install with Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20alexrios%2Ftap%2Fopq-FBB040?logo=homebrew&logoColor=white)](https://github.com/alexrios/homebrew-tap)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-> **Status:** v1.3.0. Linux (Secret Service) and macOS (Keychain) supported.
+> **Status:** v1.4.0. Linux (Secret Service) and macOS (Keychain) supported.
 
 An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them with output redaction against accidental disclosure. Invoked as `opq`.
 
@@ -103,7 +103,7 @@ mise run docs:serve  # live-reload preview at http://localhost:3000
 
 ## Upgrade to v1.3.0
 
-Stop existing `opq` MCP, policy-proxy, and `exec` processes before upgrading, then restart them with the new binary. Older binaries do not understand interrupted policy updates and must not access the same keyring concurrently. See the [release and upgrade notes](https://alexrios.github.io/opq/appendix/version-history.html#v130-current).
+Stop existing `opq` MCP, policy-proxy, and `exec` processes before upgrading, then restart them with the new binary. Older binaries do not understand interrupted policy updates and must not access the same keyring concurrently. See the [release and upgrade notes](https://alexrios.github.io/opq/appendix/version-history.html#v130).
 
 ## Development
 
