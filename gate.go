@@ -68,8 +68,8 @@ func checkRetypeGate(cfg retypeGateConfig, prompt, expected string, sentinel err
 // openControllingTTY opens /dev/tty for read/write. O_NONBLOCK lets Go poll
 // terminal reads so closing the file can interrupt a pending confirmation.
 // It returns an error if the process has no controlling terminal (e.g. some CI
-// runners). On systems without /dev/tty (Windows) this will fail, acceptable
-// because opaque's production target is linux.
+// runners). On systems without /dev/tty (e.g. Windows) this will fail,
+// acceptable because opq targets Unix platforms (Linux and macOS).
 func openControllingTTY() (io.Reader, io.Writer, io.Closer, error) {
 	f, err := os.OpenFile("/dev/tty", os.O_RDWR|syscall.O_NOCTTY|syscall.O_NONBLOCK, 0)
 	if err != nil {

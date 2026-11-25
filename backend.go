@@ -92,7 +92,7 @@ func (b *keyringBackend) Set(ctx context.Context, name string, value *Buffer) er
 		Key:         name,
 		Data:        local,
 		Label:       "opq:" + name,
-		Description: "managed by opaque",
+		Description: "managed by opq",
 	})
 	if err != nil {
 		return fmt.Errorf("keyring set: %w", err)

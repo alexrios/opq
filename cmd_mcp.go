@@ -18,7 +18,7 @@ func (c *MCPCmd) Run() error {
 	// expose the tool surface: running unsandboxed would silently
 	// regress the v1.1 security guarantee.
 	if err := VerifySandboxAvailable(); err != nil {
-		return fmt.Errorf("opq mcp requires a working subprocess sandbox: %w\nInstall bubblewrap (Debian/Ubuntu: apt install bubblewrap; Fedora: dnf install bubblewrap; Arch: pacman -S bubblewrap)", err)
+		return fmt.Errorf("opq mcp requires a working subprocess sandbox: %w", err)
 	}
 	if err := runMCPServer(ctx); err != nil {
 		return fmt.Errorf("mcp server: %w", err)

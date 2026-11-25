@@ -177,3 +177,57 @@ func TestCheckInteractiveGate_RefusesOnEOFBeforeNewline(t *testing.T) {
 		t.Fatal("expected refusal on empty TTY input")
 	}
 }
+
+func TestGetCmd_MissingPlaintextIncludesExecAndExactHumanInvocation(t *testing.T) {
+	err := (&GetCmd{Name: "stripe_secret_key", Plaintext: false}).Run()
+	if err == nil {
+		t.Fatal("expected refusal without --plaintext")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "opq exec") {
+		t.Errorf("error should still recommend opq exec, got: %q", msg)
+	}
+	wantCmd := "OPQ_I_AM_HUMAN=1 opq get stripe_secret_key --plaintext"
+	if !strings.Contains(msg, wantCmd) {
+		t.Errorf("error should include exact human invocation %q, got: %q", wantCmd, msg)
+	}
+}
+
+func TestGetCmd_MissingPlaintextSanitizesInvalidNameInHint(t *testing.T) {
+	err := (&GetCmd{Name: "bad;name", Plaintext: false}).Run()
+	if err == nil {
+		t.Fatal("expected refusal without --plaintext")
+	}
+	if strings.Contains(err.Error(), "bad;name") {
+		t.Errorf("invalid name should not be echoed into suggested command: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "OPQ_I_AM_HUMAN=1 opq get <name> --plaintext") {
+		t.Errorf("expected <name> placeholder in hint: %q", err.Error())
+	}
+}
+
+func TestGetCmd_PlaintextGateRunsAndAuditsBeforeKeyring(t *testing.T) {
+	withAuditTmpDir(t)
+	t.Setenv(envHumanConfirm, "")
+	err := (&GetCmd{Name: "api_key", Plaintext: true}).Run()
+	if err == nil {
+		t.Fatal("expected human gate refusal when stdout is not a TTY")
+	}
+	if !strings.Contains(err.Error(), "refusing to release plaintext secret") {
+		t.Fatalf("unexpected error (gate may not have run before keyring): %v", err)
+	}
+	lines, tailErr := tailAudit(10)
+	if tailErr != nil {
+		t.Fatalf("tailAudit: %v", tailErr)
+	}
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, `"action":"denied"`) && strings.Contains(l, "get_plaintext_refused:") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected get_plaintext_refused audit entry before keyring access; got %v", lines)
+	}
+}

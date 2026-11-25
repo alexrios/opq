@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -15,8 +16,11 @@ import (
 )
 
 type SetCmd struct {
-	Name string `arg:"" help:"Secret name (e.g. openai_api_key)."`
-	TTL  string `name:"ttl" help:"Optional time-to-live after which reads are refused (e.g. 24h, 90m, 7d, 2w). Omit for no expiry."`
+	Name      string `arg:"" help:"Secret name (e.g. openai_api_key)."`
+	TTL       string `name:"ttl" help:"Optional time-to-live after which reads are refused (e.g. 24h, 90m, 7d, 2w). Omit for no expiry."`
+	KeepTTL   bool   `name:"keep-ttl" help:"Preserve the existing unexpired expiry timestamp when updating a secret. Cannot be combined with --ttl."`
+	NoClobber bool   `name:"no-clobber" help:"Refuse to overwrite an existing live secret."`
+	Trim      bool   `name:"trim" help:"Strip trailing newlines (\\r\\n and \\n) from piped stdin before storing."`
 }
 
 // maxSecretSize bounds the buffer we read for a single secret. Generous for
@@ -32,6 +36,11 @@ const (
 	bracketedPasteStart   = "\x1b[200~"
 	bracketedPasteEnd     = "\x1b[201~"
 )
+
+// trailingNewlineWarning is emitted on stderr when piped stdin ends in \n or
+// \r\n and --trim was not passed, catching the common `echo ... | opq set`
+// pitfall while still preserving verbatim storage by default.
+const trailingNewlineWarning = "warning: stored value ends with a newline; use printf instead of echo or pass --trim"
 
 // stripBytesInPlace removes every occurrence of sep from b, compacting the
 // surviving bytes toward the front, and returns the compacted prefix. It does
@@ -57,28 +66,154 @@ func stripBytesInPlace(b, sep []byte) []byte {
 // sanitizePastedSecret strips bracketed-paste markers that survived raw-mode
 // reading, then trims surrounding whitespace a paste often carries. Works in
 // place on raw's backing array. Only the interactive path trims; the piped path
-// stores bytes verbatim, so a value needing surrounding whitespace must come via
-// stdin.
+// stores bytes verbatim unless --trim is passed, so a value needing surrounding
+// whitespace must come via stdin.
 func sanitizePastedSecret(raw []byte) []byte {
 	b := stripBytesInPlace(raw, []byte(bracketedPasteStart))
 	b = stripBytesInPlace(b, []byte(bracketedPasteEnd))
 	return bytes.TrimSpace(b)
 }
 
-func (c *SetCmd) Run() error {
-	if !validSecretName(c.Name) {
-		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
+// trimTrailingNewlines strips trailing \r\n and \n line endings without
+// touching other whitespace or interior newlines.
+func trimTrailingNewlines(b []byte) []byte {
+	for len(b) > 0 {
+		if bytes.HasSuffix(b, []byte("\r\n")) {
+			b = b[:len(b)-2]
+		} else if b[len(b)-1] == '\n' {
+			b = b[:len(b)-1]
+		} else {
+			break
+		}
 	}
+	return b
+}
 
-	// Validate the TTL up front so a bad value fails before we prompt for or
-	// store anything.
-	var ttl time.Duration
+// existingSecretState captures a secret's current presence and policy metadata
+// WITHOUT ever reading the plaintext secret value.
+type existingSecretState struct {
+	hasKey  bool
+	meta    *SecretMeta
+	metaErr error
+}
+
+func (s existingSecretState) isLiveAt(now time.Time) bool {
+	if !s.hasKey || s.metaErr != nil {
+		return false
+	}
+	if s.meta == nil {
+		return true
+	}
+	return !s.meta.Pending && !s.meta.IsRevoked() && !s.meta.IsExpiredAt(now)
+}
+
+// inspectExistingSecret checks key presence (via List) and companion metadata
+// (via loadMeta) under a shared policy lock. It NEVER calls backend.Get on the
+// secret key itself.
+func inspectExistingSecret(ctx context.Context, backend Backend, name string) (existingSecretState, error) {
+	unlock, err := lockPolicy(ctx, false)
+	if err != nil {
+		return existingSecretState{}, err
+	}
+	defer unlock()
+
+	keys, err := backend.List(ctx)
+	if err != nil {
+		return existingSecretState{}, err
+	}
+	hasKey := slices.Contains(keys, name)
+	meta, metaErr := loadMeta(ctx, backend, name)
+	return existingSecretState{
+		hasKey:  hasKey,
+		meta:    meta,
+		metaErr: metaErr,
+	}, nil
+}
+
+func (c *SetCmd) validateFlags() (time.Duration, error) {
+	if !validSecretName(c.Name) {
+		return 0, fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
+	}
+	if c.TTL != "" && c.KeepTTL {
+		return 0, errors.New("--keep-ttl cannot be combined with --ttl")
+	}
 	if c.TTL != "" {
 		d, err := parseTTL(c.TTL)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		ttl = d
+		return d, nil
+	}
+	return 0, nil
+}
+
+func checkSetPreconditions(name string, existing existingSecretState, now time.Time, noClobber, keepTTL bool) (time.Time, error) {
+	if noClobber {
+		if existing.hasKey && existing.metaErr != nil {
+			return time.Time{}, fmt.Errorf("secret %q already exists with unreadable metadata; refusing --no-clobber (run 'opq delete %s' to clear)", name, name)
+		}
+		if existing.isLiveAt(now) {
+			return time.Time{}, fmt.Errorf("secret %q already exists (omit --no-clobber to overwrite)", name)
+		}
+	}
+	if keepTTL {
+		if existing.metaErr != nil {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: unreadable metadata for %q: %w", name, existing.metaErr)
+		}
+		if existing.meta != nil && existing.meta.Pending {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: secret %q has an incomplete update (UPDATE-PENDING)", name)
+		}
+		if existing.meta.IsRevoked() {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: secret %q is revoked; pass --ttl to set a new TTL", name)
+		}
+		if !existing.hasKey {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: secret %q does not exist", name)
+		}
+		if !existing.meta.HasExpiry() {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: secret %q has no active TTL", name)
+		}
+		if existing.meta.IsExpiredAt(now) {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: secret %q has already expired (%s); pass --ttl to set a new TTL", name, uiFormatUTC(existing.meta.ExpiresAt))
+		}
+		return existing.meta.ExpiresAt, nil
+	}
+	return time.Time{}, nil
+}
+
+func printSetExistingNote(stderr io.Writer, name string, existing existingSecretState, now time.Time, ttl time.Duration, keepTTL bool) {
+	switch {
+	case existing.metaErr != nil:
+		fmt.Fprintf(stderr, "note: secret %q has unreadable metadata; storing will replace it\n", name)
+	case existing.meta != nil && existing.meta.Pending:
+		fmt.Fprintf(stderr, "note: recovering %q from incomplete update (UPDATE-PENDING)\n", name)
+	case existing.meta.IsRevoked():
+		fmt.Fprintf(stderr, "note: reviving previously REVOKED secret %q\n", name)
+	case existing.meta.IsExpiredAt(now):
+		fmt.Fprintf(stderr, "note: replacing EXPIRED secret %q (expired %s)\n", name, uiFormatUTC(existing.meta.ExpiresAt))
+	case existing.hasKey && existing.meta.HasExpiry():
+		exp := uiFormatUTC(existing.meta.ExpiresAt)
+		switch {
+		case keepTTL:
+			fmt.Fprintf(stderr, "note: overwriting existing secret %q (preserving expiry %s)\n", name, exp)
+		case ttl > 0:
+			fmt.Fprintf(stderr, "note: overwriting existing secret %q (replacing TTL that expires %s)\n", name, exp)
+		default:
+			fmt.Fprintf(stderr, "note: overwriting existing secret %q (clearing existing TTL that expires %s; pass --keep-ttl to preserve it)\n", name, exp)
+		}
+	case existing.hasKey:
+		if ttl > 0 {
+			fmt.Fprintf(stderr, "note: overwriting existing secret %q (adding TTL)\n", name)
+		} else {
+			fmt.Fprintf(stderr, "note: overwriting existing secret %q\n", name)
+		}
+	}
+}
+
+func (c *SetCmd) Run() error {
+	// Validate name and flags up front so bad arguments fail before opening
+	// the keyring or prompting for anything.
+	if _, err := c.validateFlags(); err != nil {
+		return err
 	}
 
 	ctx := context.Background()
@@ -87,18 +222,57 @@ func (c *SetCmd) Run() error {
 		return err
 	}
 
-	var value *Buffer
 	stdinFd := int(os.Stdin.Fd())
-	if term.IsTerminal(stdinFd) {
+	stdinIsTTY := term.IsTerminal(stdinFd)
+	stderrIsTTY := term.IsTerminal(int(os.Stderr.Fd()))
+	readPassword := func() ([]byte, error) {
+		return term.ReadPassword(stdinFd)
+	}
+	return c.runWith(ctx, backend, os.Stdin, stdinIsTTY, os.Stderr, stderrIsTTY, readPassword, time.Now)
+}
+
+func (c *SetCmd) runWith(
+	ctx context.Context,
+	backend Backend,
+	stdin io.Reader,
+	stdinIsTTY bool,
+	stderr io.Writer,
+	stderrIsTTY bool,
+	readPassword func() ([]byte, error),
+	nowFn func() time.Time,
+) error {
+	ttl, err := c.validateFlags()
+	if err != nil {
+		return err
+	}
+
+	existing, err := inspectExistingSecret(ctx, backend, c.Name)
+	if err != nil {
+		return err
+	}
+
+	checkNow := nowFn().UTC()
+	keptExpiresAt, err := checkSetPreconditions(c.Name, existing, checkNow, c.NoClobber, c.KeepTTL)
+	if err != nil {
+		return err
+	}
+
+	// Show overwrite / TTL / revive notices before prompting in interactive mode
+	// and before storing in piped mode.
+	printSetExistingNote(stderr, c.Name, existing, checkNow, ttl, c.KeepTTL)
+
+	var value *Buffer
+	var warnTrailingNewline bool
+	if stdinIsTTY {
 		// Disable bracketed-paste while reading (only when stderr is the
 		// terminal); restore after.
-		if term.IsTerminal(int(os.Stderr.Fd())) {
-			fmt.Fprint(os.Stderr, bracketedPasteDisable)
-			defer fmt.Fprint(os.Stderr, bracketedPasteEnable)
+		if stderrIsTTY {
+			fmt.Fprint(stderr, bracketedPasteDisable)
+			defer fmt.Fprint(stderr, bracketedPasteEnable)
 		}
-		fmt.Fprintf(os.Stderr, "Enter value for %q (input hidden): ", c.Name)
-		raw, err := term.ReadPassword(stdinFd)
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(stderr, "Enter value for %q (input hidden): ", c.Name)
+		raw, err := readPassword()
+		fmt.Fprintln(stderr)
 		if err != nil {
 			return fmt.Errorf("read password: %w", err)
 		}
@@ -115,7 +289,7 @@ func (c *SetCmd) Run() error {
 			return fmt.Errorf("buffer: %w", err)
 		}
 	} else {
-		value, err = NewBufferFromReader(io.LimitReader(os.Stdin, maxSecretSize+1))
+		value, err = NewBufferFromReader(io.LimitReader(stdin, maxSecretSize+1))
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
@@ -123,31 +297,78 @@ func (c *SetCmd) Run() error {
 			value.Destroy()
 			return fmt.Errorf("secret too large (>%d bytes)", maxSecretSize)
 		}
+		rawBytes := value.Bytes()
+		hasTrailingNewline := len(rawBytes) > 0 && rawBytes[len(rawBytes)-1] == '\n'
+		if c.Trim {
+			trimmed := trimTrailingNewlines(rawBytes)
+			if len(trimmed) == 0 {
+				value.Destroy()
+				return errors.New("empty secret value")
+			}
+			if len(trimmed) < len(rawBytes) {
+				cp := make([]byte, len(trimmed))
+				copy(cp, trimmed)
+				// NewBufferFromBytes moves cp into a locked buffer and wipes cp.
+				newBuf, berr := NewBufferFromBytes(cp)
+				memguard.WipeBytes(cp)
+				value.Destroy()
+				if berr != nil {
+					return fmt.Errorf("buffer: %w", berr)
+				}
+				value = newBuf
+			}
+		} else if hasTrailingNewline {
+			warnTrailingNewline = true
+		}
 	}
 	defer value.Destroy()
 
-	now := time.Now().UTC()
+	now := nowFn().UTC()
+	if stdinIsTTY && (c.NoClobber || c.KeepTTL) {
+		// Re-check preconditions after an interactive prompt in case the secret
+		// was created or its TTL lapsed while waiting for user input.
+		latest, err := inspectExistingSecret(ctx, backend, c.Name)
+		if err != nil {
+			return err
+		}
+		keptExpiresAt, err = checkSetPreconditions(c.Name, latest, now, c.NoClobber, c.KeepTTL)
+		if err != nil {
+			return err
+		}
+	}
+
 	var expiresAt time.Time
 	var meta *SecretMeta
-	if ttl > 0 {
+	switch {
+	case c.KeepTTL:
+		if !now.Before(keptExpiresAt) {
+			return fmt.Errorf("cannot use --keep-ttl: secret %q has already expired (%s); pass --ttl to set a new TTL", c.Name, uiFormatUTC(keptExpiresAt))
+		}
+		expiresAt = keptExpiresAt
+		meta = &SecretMeta{V: secretMetaVersion, CreatedAt: now, ExpiresAt: expiresAt}
+	case ttl > 0:
 		expiresAt = now.Add(ttl)
 		meta = &SecretMeta{V: secretMetaVersion, CreatedAt: now, ExpiresAt: expiresAt}
 	}
+
 	if err := storeSecret(ctx, backend, c.Name, value, meta); err != nil {
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizeBackendErr(err)})
 		return err
 	}
 
 	auditMsg := ""
-	if ttl > 0 {
+	if !expiresAt.IsZero() {
 		auditMsg = "expires_at=" + expiresAt.Format(time.RFC3339)
 	}
 	_ = AppendAudit(AuditEvent{Action: ActionSet, SecretName: c.Name, Caller: callerTag(), Message: auditMsg})
-	fmt.Fprintf(os.Stderr, "stored %q in %s", c.Name, backend.Name())
-	if ttl > 0 {
-		fmt.Fprintf(os.Stderr, " (expires %s)", expiresAt.Format(time.RFC3339))
+	fmt.Fprintf(stderr, "stored %q in %s", c.Name, backend.Name())
+	if !expiresAt.IsZero() {
+		fmt.Fprintf(stderr, " (expires %s)", expiresAt.Format(time.RFC3339))
 	}
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(stderr)
+	if warnTrailingNewline {
+		fmt.Fprintln(stderr, trailingNewlineWarning)
+	}
 	return nil
 }
 

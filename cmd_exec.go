@@ -32,9 +32,9 @@ func (e *exitCodeError) Error() string {
 func (e *exitCodeError) ExitCode() int { return e.code }
 
 type ExecCmd struct {
-	Env      []string `name:"env" short:"e" help:"Inject a secret as an environment variable for the child. Format: VAR=secret_name. Repeatable."`
+	Env      []string `name:"env" short:"e" help:"Inject a secret as an environment variable for the child. Format: VAR=secret_name, or VAR as shorthand for VAR=VAR. Repeatable."`
 	NoRedact bool     `name:"no-redact" help:"DISABLE output redaction. HUMAN-ONLY: refuses unless stdout is a TTY AND OPQ_I_AM_HUMAN=1 is set inline AND you retype 'no-redact' on the controlling terminal. Logged loudly to the audit log."`
-	Sandbox  string   `name:"sandbox" enum:"none,net,full" default:"none" help:"Subprocess sandbox profile: none (default, no isolation), net (block network), full (block network + tmpfs /home /tmp + minimal ro-binds)."`
+	Sandbox  string   `name:"sandbox" enum:"none,net,full" default:"none" help:"Subprocess sandbox profile: none (default, no isolation), net (block network, read-only host filesystem), full (block network and deny access to home and temp directories; bubblewrap on Linux, sandbox-exec on macOS)."`
 	Command  []string `arg:"" passthrough:"" help:"Command and arguments to run. Use -- to separate from opq flags."`
 }
 
@@ -299,16 +299,23 @@ func parseEnvMappings(specs []string) ([]envMapping, error) {
 	out := make([]envMapping, 0, len(specs))
 	seen := map[string]bool{}
 	for _, s := range specs {
-		eq := strings.IndexByte(s, '=')
-		if eq <= 0 || eq == len(s)-1 {
-			return nil, fmt.Errorf("invalid --env %q (expected VAR=secret_name)", s)
+		var envName, secretName string
+		if eq := strings.IndexByte(s, '='); eq < 0 {
+			if s == "" {
+				return nil, fmt.Errorf("invalid --env %q (expected VAR=secret_name or VAR)", s)
+			}
+			envName, secretName = s, s
+		} else {
+			if eq == 0 || eq == len(s)-1 {
+				return nil, fmt.Errorf("invalid --env %q (expected VAR=secret_name or VAR)", s)
+			}
+			envName, secretName = s[:eq], s[eq+1:]
 		}
-		envName, secretName := s[:eq], s[eq+1:]
 		if !validEnvName(envName) {
 			return nil, fmt.Errorf("invalid env var name %q", envName)
 		}
 		if isBlockedEnvName(envName) {
-			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.; see env_policy.go); cannot be injected via --env", envName)
+			return nil, fmt.Errorf("env var %q is on the injected-env deny-list (blocks loader/interpreter variables such as PATH, LD_*, BASH_ENV; see https://alexrios.github.io/opq/reference/env-deny-list.html); cannot be injected via --env", envName)
 		}
 		if !validSecretName(secretName) {
 			return nil, fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", secretName)

@@ -51,9 +51,37 @@ func TestParseEnvMappings(t *testing.T) {
 			want: want{errSub: "invalid secret name"},
 		},
 		{
-			name: "missing equals is rejected",
+			name: "shorthand without equals maps VAR=VAR",
 			in:   []string{"API_KEY"},
+			want: want{mappings: []envMapping{{envName: "API_KEY", secretName: "API_KEY"}}},
+		},
+		{
+			name: "mixed shorthand and explicit mappings preserve order",
+			in:   []string{"API_KEY", "OTHER=other_secret"},
+			want: want{mappings: []envMapping{
+				{envName: "API_KEY", secretName: "API_KEY"},
+				{envName: "OTHER", secretName: "other_secret"},
+			}},
+		},
+		{
+			name: "empty spec is rejected",
+			in:   []string{""},
 			want: want{errSub: "expected VAR=secret_name"},
+		},
+		{
+			name: "shorthand invalid env name is rejected",
+			in:   []string{"1FOO"},
+			want: want{errSub: "invalid env var name"},
+		},
+		{
+			name: "shorthand over secret-name max length is rejected",
+			in:   []string{strings.Repeat("A", 129)},
+			want: want{errSub: "invalid secret name"},
+		},
+		{
+			name: "shorthand duplicate with explicit mapping is rejected",
+			in:   []string{"API_KEY", "API_KEY=other"},
+			want: want{errSub: `env var "API_KEY" specified twice`},
 		},
 		{
 			name: "leading equals is rejected (empty env name)",
@@ -245,6 +273,10 @@ func TestParseEnvMappings_RejectsBlockedNames(t *testing.T) {
 		// GIT_CONFIG_ prefix (newly added)
 		"GIT_CONFIG_KEY_0=some_secret",
 		"GIT_CONFIG_VALUE_0=some_secret",
+		// shorthand forms must also hit the deny-list
+		"PATH",
+		"LD_PRELOAD",
+		"BASH_ENV",
 	}
 	for _, spec := range cases {
 		t.Run(spec, func(t *testing.T) {
@@ -255,7 +287,27 @@ func TestParseEnvMappings_RejectsBlockedNames(t *testing.T) {
 			if !strings.Contains(err.Error(), "deny-list") {
 				t.Fatalf("expected deny-list in error, got %q", err.Error())
 			}
+			if strings.Contains(err.Error(), "env_policy.go") {
+				t.Fatalf("error should not reference internal source file env_policy.go: %q", err.Error())
+			}
+			if !strings.Contains(err.Error(), "https://alexrios.github.io/opq/reference/env-deny-list.html") {
+				t.Fatalf("error should point to env-deny-list docs URL: %q", err.Error())
+			}
 		})
+	}
+}
+
+func TestExecCmd_SandboxHelpTextIsOSPortable(t *testing.T) {
+	field, ok := reflect.TypeOf(ExecCmd{}).FieldByName("Sandbox")
+	if !ok {
+		t.Fatal("ExecCmd.Sandbox field missing")
+	}
+	help := field.Tag.Get("help")
+	if strings.Contains(help, "tmpfs") || strings.Contains(help, "ro-binds") {
+		t.Fatalf("--sandbox help text still contains Linux-only phrasing: %q", help)
+	}
+	if !strings.Contains(help, "Linux") || !strings.Contains(help, "macOS") {
+		t.Fatalf("--sandbox help text should describe Linux and macOS portability: %q", help)
 	}
 }
 

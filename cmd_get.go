@@ -31,7 +31,11 @@ var errInteractiveGate = errors.New("interactive release gate")
 
 func (c *GetCmd) Run() error {
 	if !c.Plaintext {
-		return errors.New("refusing to print a secret without --plaintext; use `opq exec` to use the secret without exposing it")
+		displayName := c.Name
+		if !validSecretName(displayName) {
+			displayName = "<name>"
+		}
+		return fmt.Errorf("refusing to print a secret without --plaintext; use `opq exec` to use the secret without exposing it, or if you are a human operator, run `%s=1 opq get %s --plaintext` from an interactive terminal", envHumanConfirm, displayName)
 	}
 	if !validSecretName(c.Name) {
 		return fmt.Errorf("invalid secret name %q (must match [A-Za-z0-9_.-]{1,128})", c.Name)
