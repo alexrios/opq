@@ -18,16 +18,19 @@ import (
 var version string
 
 type CLI struct {
-	Version kong.VersionFlag `help:"Print the opq version and exit."`
-	Set     SetCmd           `cmd:"" help:"Store a secret. Reads value from stdin (or TTY prompt if interactive). The value never appears in argv."`
-	Get     GetCmd           `cmd:"" help:"Print a secret to stdout. Refuses to run unless stdout is a TTY (blocks AI piping)."`
-	List    ListCmd          `cmd:"" help:"List secret names and their TTL/revocation status. Never prints values."`
-	Delete  DeleteCmd        `cmd:"" help:"Delete a secret (and any TTL/revocation record)."`
-	Revoke  RevokeCmd        `cmd:"" help:"Revoke a secret: wipe its value now and leave a revoked tombstone."`
-	Prune   PruneCmd         `cmd:"" help:"Delete all expired secrets (use --dry-run to preview)."`
-	Exec    ExecCmd          `cmd:"" help:"Run a command with secrets injected as environment variables."`
-	Audit   AuditCmd         `cmd:"" help:"Show recent audit-log entries."`
-	MCP     MCPCmd           `cmd:"mcp" help:"Run as a Model Context Protocol server over stdio."`
+	Version    kong.VersionFlag `help:"Print the opq version and exit."`
+	Set        SetCmd           `cmd:"" help:"Store a secret. Reads value from stdin (or TTY prompt if interactive). The value never appears in argv."`
+	Get        GetCmd           `cmd:"" help:"Print a secret to stdout (requires --plaintext, OPQ_I_AM_HUMAN=1, a TTY stdout, and TTY name confirmation)."`
+	List       ListCmd          `cmd:"" help:"List secret names and their TTL/revocation status. Never prints values."`
+	Info       InfoCmd          `cmd:"" help:"Show metadata and TTL/revocation status for a single secret. Never prints values."`
+	Delete     DeleteCmd        `cmd:"" help:"Delete a secret (and any TTL/revocation record)."`
+	Revoke     RevokeCmd        `cmd:"" help:"Revoke a secret: wipe its value now and leave a revoked tombstone."`
+	Prune      PruneCmd         `cmd:"" help:"Delete all expired secrets (use --dry-run to preview)."`
+	Exec       ExecCmd          `cmd:"" help:"Run a command with secrets injected as environment variables."`
+	Audit      AuditCmd         `cmd:"" help:"Show recent audit-log entries."`
+	Doctor     DoctorCmd        `cmd:"" help:"Check keyring, sandbox, audit log, and secret policy health."`
+	Completion CompletionCmd    `cmd:"" help:"Generate shell completion script for bash, zsh, or fish."`
+	MCP        MCPCmd           `cmd:"mcp" help:"Run as a Model Context Protocol server over stdio."`
 }
 
 func main() {
