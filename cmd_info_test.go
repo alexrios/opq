@@ -317,6 +317,25 @@ func TestInfo_ColorAndNoColor(t *testing.T) {
 	}
 }
 
+func TestInfo_DefaultDepsDisablesColorOnDumbTerm(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "dumb")
+	if deps := defaultInfoDeps(); !deps.noColor {
+		t.Error("defaultInfoDeps().noColor = false with TERM=dumb, want true")
+	}
+
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "1")
+	if deps := defaultInfoDeps(); !deps.noColor {
+		t.Error("defaultInfoDeps().noColor = false with NO_COLOR=1, want true")
+	}
+
+	t.Setenv("NO_COLOR", "")
+	if deps := defaultInfoDeps(); deps.noColor {
+		t.Error("defaultInfoDeps().noColor = true with TERM=xterm-256color and unset NO_COLOR, want false")
+	}
+}
+
 func TestInfo_FormatRelativeAndDuration(t *testing.T) {
 	base := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
 	cases := []struct {

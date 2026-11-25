@@ -49,7 +49,7 @@ func defaultInfoDeps() infoDeps {
 		now:         func() time.Time { return time.Now().UTC() },
 		stdout:      os.Stdout,
 		isTTY:       term.IsTerminal(int(os.Stdout.Fd())),
-		noColor:     os.Getenv("NO_COLOR") != "",
+		noColor:     os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb",
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -88,7 +87,7 @@ func defaultDoctorDeps() doctorDeps {
 		now:             func() time.Time { return time.Now().UTC() },
 		stdout:          os.Stdout,
 		isTTY:           term.IsTerminal(int(os.Stdout.Fd())),
-		noColor:         os.Getenv("NO_COLOR") != "",
+		noColor:         os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb",
 	}
 }
 
@@ -847,10 +846,28 @@ func doctorTryReadOnlyPolicyLock(ctx context.Context, lockPath string) (func(), 
 }
 
 func doctorRenderText(w io.Writer, report doctorReport, useColor bool) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	// Pad by plain visible width before applying ANSI SGR codes so check rows
+	// and remediation rows stay strictly aligned whether color is enabled or not.
+	const colGap = "  "
+	badgeWidth := len("[FAIL]")
+	nameWidth := len("->")
 	for _, ch := range report.Checks {
-		badge := doctorStatusBadge(ch.Status, useColor)
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\n", badge, ch.Name, ch.Summary); err != nil {
+		if l := len(ch.Status) + 2; l > badgeWidth {
+			badgeWidth = l
+		}
+		if l := len(ch.Name); l > nameWidth {
+			nameWidth = l
+		}
+	}
+
+	blankBadge := strings.Repeat(" ", badgeWidth)
+	arrowPad := strings.Repeat(" ", nameWidth-len("->"))
+
+	for _, ch := range report.Checks {
+		plainBadgeLen := len(ch.Status) + 2
+		badge := doctorStatusBadge(ch.Status, useColor) + strings.Repeat(" ", badgeWidth-plainBadgeLen)
+		name := ch.Name + strings.Repeat(" ", nameWidth-len(ch.Name))
+		if _, err := fmt.Fprintf(w, "%s%s%s%s%s\n", badge, colGap, name, colGap, ch.Summary); err != nil {
 			return err
 		}
 		for _, rem := range ch.Remediation {
@@ -858,12 +875,12 @@ func doctorRenderText(w io.Writer, report doctorReport, useColor bool) error {
 			if useColor {
 				prefix = "\x1b[2m->\x1b[0m"
 			}
-			if _, err := fmt.Fprintf(tw, "\t%s\t%s\n", prefix, rem); err != nil {
+			if _, err := fmt.Fprintf(w, "%s%s%s%s%s%s\n", blankBadge, colGap, prefix, arrowPad, colGap, rem); err != nil {
 				return err
 			}
 		}
 	}
-	return tw.Flush()
+	return nil
 }
 
 func doctorStatusBadge(status doctorStatus, useColor bool) string {

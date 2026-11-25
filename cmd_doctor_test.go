@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -808,5 +809,94 @@ func TestDoctor_ColorRespectsTTYAndNoColor(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "\x1b[") {
 		t.Errorf("NO_COLOR=1 must suppress ANSI escapes, got:\n%q", buf.String())
+	}
+}
+
+func TestDoctor_ColorTTYPreservesExactColumnAlignment(t *testing.T) {
+	ansiSGRRe := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	mb := newMemBackend(t)
+	now := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	mustSet(t, mb, "exp_key", "VAL_EXP")
+	_ = storeMeta(ctx, mb, "exp_key", &SecretMeta{
+		V:         secretMetaVersion,
+		CreatedAt: now.Add(-2 * time.Hour),
+		ExpiresAt: now.Add(-1 * time.Hour),
+	})
+	_ = storeMeta(ctx, mb, "pending_key", &SecretMeta{
+		V:       secretMetaVersion,
+		Pending: true,
+	})
+
+	deps, colorBuf, _ := newTestDoctorDeps(t, mb)
+	deps.now = func() time.Time { return now }
+	deps.isTTY = true
+	deps.noColor = false
+	if err := runDoctor(ctx, false, deps); err != nil {
+		t.Fatalf("color runDoctor failed: %v", err)
+	}
+	colorOut := colorBuf.String()
+	if !strings.Contains(colorOut, "\x1b[32m[OK]\x1b[0m") ||
+		!strings.Contains(colorOut, "\x1b[33m[WARN]\x1b[0m") ||
+		!strings.Contains(colorOut, "\x1b[2m->\x1b[0m") {
+		t.Fatalf("expected ANSI styled [OK], [WARN], and -> in color output:\n%q", colorOut)
+	}
+
+	var plainBuf bytes.Buffer
+	deps.stdout = &plainBuf
+	deps.isTTY = false
+	if err := runDoctor(ctx, false, deps); err != nil {
+		t.Fatalf("plain runDoctor failed: %v", err)
+	}
+	plainOut := plainBuf.String()
+
+	stripped := ansiSGRRe.ReplaceAllString(colorOut, "")
+	if stripped != plainOut {
+		t.Fatalf("stripped color output drifted from plain output:\n--- stripped ---\n%s\n--- plain ---\n%s", stripped, plainOut)
+	}
+
+	// Explicitly check that column 1 (check names and '->') and column 2
+	// (summaries and remediation text) start at identical visible offsets.
+	lines := strings.Split(strings.TrimRight(stripped, "\n"), "\n")
+	var binaryCol, metaCol, arrowCol, summaryCol, remCol int
+	binaryCol, metaCol, arrowCol, summaryCol, remCol = -1, -1, -1, -1, -1
+	for _, line := range lines {
+		if idx := strings.Index(line, "binary"); idx >= 0 {
+			binaryCol = idx
+			summaryCol = strings.Index(line, "opq v1.3.0-test")
+		}
+		if idx := strings.Index(line, "secret_metadata"); idx >= 0 {
+			metaCol = idx
+		}
+		if idx := strings.Index(line, "->"); idx >= 0 && arrowCol == -1 {
+			arrowCol = idx
+			remCol = strings.Index(line, "1 UPDATE-PENDING:")
+		}
+	}
+	if binaryCol < 0 || metaCol != binaryCol || arrowCol != binaryCol {
+		t.Errorf("column 1 misaligned: binary=%d secret_metadata=%d arrow=%d\n%s", binaryCol, metaCol, arrowCol, stripped)
+	}
+	if summaryCol < 0 || remCol != summaryCol {
+		t.Errorf("column 2 misaligned: summary=%d remediation=%d\n%s", summaryCol, remCol, stripped)
+	}
+}
+
+func TestDoctor_DefaultDepsDisablesColorOnDumbTerm(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "dumb")
+	if deps := defaultDoctorDeps(); !deps.noColor {
+		t.Error("defaultDoctorDeps().noColor = false with TERM=dumb, want true")
+	}
+
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "1")
+	if deps := defaultDoctorDeps(); !deps.noColor {
+		t.Error("defaultDoctorDeps().noColor = false with NO_COLOR=1, want true")
+	}
+
+	t.Setenv("NO_COLOR", "")
+	if deps := defaultDoctorDeps(); deps.noColor {
+		t.Error("defaultDoctorDeps().noColor = true with TERM=xterm-256color and unset NO_COLOR, want false")
 	}
 }
