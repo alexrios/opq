@@ -155,7 +155,7 @@ into `curl -H`, so the secret stays off `argv` and `ps`:
 
 ```jsonc
 run_with_secrets({
-  command: "/usr/bin/sh",
+  command: "/bin/sh",
   args: ["-c", "printf 'header = \"Authorization: Bearer %s\"\\n' \"$TOK\" | /usr/bin/curl -sS -K - https://api.example.com/me"],
   env: { TOK: "api_token" },
   isolation: "readonly",

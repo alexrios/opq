@@ -131,7 +131,7 @@ reads credentials directly from the environment, or pass headers to `curl` over 
 
 ```jsonc
 run_with_secrets({
-  command: "/usr/bin/sh",
+  command: "/bin/sh",
   args: ["-c", "printf 'header = \"Authorization: Bearer %s\"\\n' \"$TOK\" | /usr/bin/curl -sS -K - https://api.example.com/me"],
   env: { TOK: "api_token" },
   isolation: "readonly",
