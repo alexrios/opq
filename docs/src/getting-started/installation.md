@@ -1,13 +1,5 @@
 # Installation
 
-## Upgrading from an older release
-
-Before upgrading to v1.3.0, stop existing MCP servers, policy proxies, and secret-backed
-exec processes, then restart them with the new binary. Existing credentials remain in
-the OS keyring. Older clients must not run concurrently against the same keyring; see
-the [release and upgrade notes](../appendix/version-history.md#upgrade-notes) for
-pending-update recovery and MCP output/limit changes.
-
 ## Install with Homebrew
 
 ```sh
@@ -33,6 +25,51 @@ module path). Put your `$GOBIN` (or `$GOPATH/bin`) on `$PATH`.
 git clone https://github.com/alexrios/opq
 cd opq
 go build -o opq .          # or: mise run build  → dist/opq
+```
+
+## Verifying the install
+
+Run `opq doctor` to verify the binary, keyring backend, OS sandbox, audit log directory,
+and policy state in a single read-only check (it never reads secret values):
+
+```sh
+opq doctor
+```
+
+Use `opq doctor --json` for machine-readable output in CI or provisioning scripts.
+`doctor` exits `0` when all critical checks pass (`OK` or `WARN`) and `1` if any
+critical check reports `FAIL`.
+
+You can also inspect the version and binary path directly:
+
+```sh
+opq --version
+which opq          # confirm the right binary is on PATH
+```
+
+If `opq doctor` reports a D-Bus or Secret Service error on Linux, your keyring session is
+not unlocked. On a desktop, log into a graphical session so the keyring unlocks
+automatically. On a headless host, container, or WSL there is usually no session keyring
+yet: start one with `gnome-keyring-daemon --unlock` (or wrap the command in
+`dbus-run-session -- opq ...`), or install KeePassXC and enable its Secret Service
+integration. `opq` needs an unlocked libsecret provider and will not fall back to a
+plaintext file.
+
+## Shell completion
+
+Generate completion scripts for `bash`, `zsh`, or `fish` with `opq completion`. Tab
+completion covers all subcommands, flags, and dynamic secret names (fetched via
+`opq list`, so values are never read):
+
+```sh
+# Bash (~/.bashrc)
+eval "$(opq completion bash)"
+
+# Zsh (~/.zshrc)
+eval "$(opq completion zsh)"
+
+# Fish
+opq completion fish > ~/.config/fish/completions/opq.fish
 ```
 
 ## Install the Claude Code skill
@@ -88,7 +125,8 @@ start on a hardened or headless host.
 `opq mcp` runs a no-op namespace probe at startup (`bwrap --unshare-net --unshare-pid
 -- true`). If AppArmor (Ubuntu 23.10+ ships a profile on `bwrap`), seccomp, or a kernel
 without `CONFIG_USER_NS` blocks unprivileged namespace creation, the server stops with
-a clear error instead of failing at the first tool call.
+a clear error instead of failing at the first tool call. `opq doctor` runs the same
+sandbox probe so you can verify fixes interactively.
 
 If the probe fails on Ubuntu 23.10+, you likely need to allow `bwrap` in AppArmor or
 enable unprivileged user namespaces:
@@ -98,20 +136,12 @@ sysctl kernel.unprivileged_userns_clone 2>/dev/null
 cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null
 ```
 
-## Verifying the install
+## Upgrading from an older release
 
-```sh
-opq --version
-opq list           # succeeds (empty) on a fresh install
-which opq          # confirm the right binary is on PATH
-```
-
-If `opq list` reports a D-Bus or Secret Service error, your keyring session is not
-unlocked. On a desktop, log into a graphical session so the keyring unlocks
-automatically. On a headless host, container, or WSL there is usually no session keyring
-yet: start one with `gnome-keyring-daemon --unlock` (or wrap the command in
-`dbus-run-session -- opq ...`), or install KeePassXC and enable its Secret Service
-integration. `opq` needs an unlocked libsecret provider and will not fall back to a
-plaintext file.
+Before upgrading to v1.3.0, stop existing MCP servers, policy proxies, and secret-backed
+exec processes, then restart them with the new binary. Existing credentials remain in
+the OS keyring. Older clients must not run concurrently against the same keyring; see
+the [release and upgrade notes](../appendix/version-history.md#upgrade-notes) for
+pending-update recovery and MCP output/limit changes.
 
 Next: [Quick Start](./quick-start.md).

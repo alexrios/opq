@@ -1,24 +1,52 @@
 # opq + Claude Code (MCP)
 
-This registers `opq` with an MCP-aware client (Claude Code here), then explains
-name-based credential use and accidental-output redaction. Arbitrary consuming
-commands can still encode secrets or exfiltrate them when networking is allowed.
-For adversarial agents, use the [fixed-operation proxy](./sandbox-and-hardening.md#the-policy-proxy-pattern).
+This registers `opq` with an MCP-aware client (Claude Code, Claude Desktop, Cursor, or
+VS Code), then explains name-based credential use and accidental-output redaction.
+Arbitrary consuming commands can still encode secrets or exfiltrate them when networking
+is allowed. For adversarial agents, use the
+[fixed-operation proxy](./sandbox-and-hardening.md#the-policy-proxy-pattern).
 
 ## 1. Register the MCP server
 
-Add `opq` to your MCP client's server configuration. In Claude Code the quickest way is
-the CLI:
+First confirm your keyring and OS sandbox pass locally:
+
+```sh
+opq doctor
+```
+
+Then register `opq mcp` in your client:
+
+### Claude Code
 
 ```sh
 claude mcp add opq -- opq mcp
 ```
 
-That writes an entry equivalent to this `mcpServers` block, which is the format other
-MCP clients accept directly (Claude Code stores it in `~/.claude.json`; a project can
-also commit it to `.mcp.json`):
+Claude Code stores this in `~/.claude.json` (or commit the JSON block below to `.mcp.json`
+for a shared project). Confirm it registered with `claude mcp list` (or `/mcp` inside
+Claude Code); `opq` should show as connected.
 
-```jsonc
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+`~/.config/Claude/claude_desktop_config.json` (Linux):
+
+```json
+{
+  "mcpServers": {
+    "opq": {
+      "command": "/opt/homebrew/bin/opq",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
+
+```json
 {
   "mcpServers": {
     "opq": {
@@ -29,11 +57,46 @@ also commit it to `.mcp.json`):
 }
 ```
 
+### VS Code
+
+Add to `.vscode/mcp.json` (workspace) or your user MCP settings:
+
+```json
+{
+  "servers": {
+    "opq": {
+      "type": "stdio",
+      "command": "opq",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Generic `mcpServers` JSON
+
+Most other stdio MCP clients accept the standard `mcpServers` block:
+
+```json
+{
+  "mcpServers": {
+    "opq": {
+      "command": "opq",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+> **Minimal `PATH` in GUI apps:** Desktop clients such as Claude Desktop often start
+> with a minimal `PATH` that excludes Homebrew (`/opt/homebrew/bin`) or `~/go/bin`. If
+> the server fails to start with `ENOENT`, replace `"opq"` with the absolute path printed
+> by `which opq`.
+
 `opq mcp` speaks the Model Context Protocol over stdio. At startup it runs an OS sandbox
 probe (on Linux, a bubblewrap namespace probe; see
 [Installation](../getting-started/installation.md#troubleshooting-the-bubblewrap-startup-probe)) and
-stops if the sandbox cannot be built. Confirm the server registered with `claude mcp
-list` (or `/mcp` inside Claude Code); `opq` should show as connected.
+stops if the sandbox cannot be built.
 
 ## 2. The three tools
 
@@ -45,8 +108,8 @@ list` (or `/mcp` inside Claude Code); `opq` should show as connected.
 
 There is no `get_secret_value` tool. This blocks direct retrieval; consuming programs
 still receive plaintext, and their output can carry information. The
-[MCP Tools reference](../reference/mcp-tools.md) has every parameter and the error
-taxonomy.
+[MCP Tools reference](../reference/mcp-tools.md) has every parameter, tool annotation,
+schema bound, and the error taxonomy.
 
 ## 3. Store a secret to use
 
@@ -57,9 +120,12 @@ opq set api_token --ttl 24h
 ```
 
 The agent references `api_token` by name; the consuming subprocess receives its value.
-The subprocess is
-network-blocked by default, so start with a local command that works under the default
-sandbox:
+MCP children inherit a minimal environment (`PATH=/usr/bin:/usr/sbin:/bin:/sbin`,
+`HOME=/tmp`, plus the requested `env` mappings), so pass absolute paths for Homebrew or
+user-installed binaries (for example `/opt/homebrew/bin/gh`).
+
+The subprocess is network-blocked by default, so start with a local command that works
+under the default sandbox:
 
 ```jsonc
 run_with_secrets({
@@ -70,13 +136,29 @@ run_with_secrets({
 ```
 
 To reach an external service, the agent opts into the network explicitly with
-`allow_network: true` (recorded in the audit log as `network_allowed`):
+`allow_network: true` (recorded in the audit log as `network_allowed`) and `isolation: "readonly"`
+(an alias for `"net"`). Prefer a consumer that reads credentials directly from the
+environment (such as `gh`, `aws`, or an operator-reviewed wrapper):
 
 ```jsonc
 run_with_secrets({
-  command: "sh",
-  args: ["-c", "curl -s -H \"Authorization: Bearer $TOK\" https://api.example.com/me"],
+  command: "/opt/homebrew/bin/gh",
+  args: ["api", "/user"],
+  env: { GH_TOKEN: "github_token" },
+  isolation: "readonly",
+  allow_network: true
+})
+```
+
+When calling `curl`, feed the header over stdin (`-K -`) instead of expanding `$TOK`
+into `curl -H`, so the secret stays off `argv` and `ps`:
+
+```jsonc
+run_with_secrets({
+  command: "/usr/bin/sh",
+  args: ["-c", "printf 'header = \"Authorization: Bearer %s\"\\n' \"$TOK\" | /usr/bin/curl -sS -K - https://api.example.com/me"],
   env: { TOK: "api_token" },
+  isolation: "readonly",
   allow_network: true
 })
 ```

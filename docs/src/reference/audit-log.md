@@ -16,6 +16,30 @@ kept at `audit.log.1`. Writers follow rotations performed by other processes bef
 appending. `opq audit --tail N` spans both files and reads only the trailing blocks needed
 for a positive `N`. Each append is synced to disk before releasing the write lock.
 
+## Querying from the CLI
+
+`opq audit` is the operator-facing log viewer. Unlike the MCP `audit_tail` tool (capped at
+200 lines), the CLI has **no 200-entry cap** and supports pre-tail filtering:
+
+```sh
+opq audit                                   # recent entries (aligned table on TTY)
+opq audit -n 50                             # last 50 entries (no 200 cap on CLI)
+opq audit --all                             # every entry across audit.log + audit.log.1
+opq audit -n 20 --action denied             # last 20 denied events
+opq audit --caller mcp --secret api_token   # MCP events touching api_token
+opq audit --json | jq .                     # force raw JSONL output on a TTY
+```
+
+- **TTY vs. non-TTY output:** When stdout is a terminal (and `--json` is not passed),
+  `opq audit` renders an aligned table (`TIME`, `CALLER`, `ACTION`, `SECRET`, `DETAIL`)
+  with subtle ANSI emphasis on `denied`, `redaction_disabled`, and `network_allowed`
+  (respecting `NO_COLOR`), and prints a note to stderr when no entries match. When stdout
+  is piped or redirected — or when `--json` is set — `opq audit` emits the raw JSONL
+  records verbatim.
+- **Filter order:** `--caller` (`cli|mcp`), `--action`, and `--secret` (matching either
+  `secret_name` or `secret_names`) are applied **before** slicing the trailing `-n`
+  entries, so `-n 20 --action denied` always returns up to 20 matching rows.
+
 ## Actions
 
 | Action | When |
@@ -47,11 +71,11 @@ for a positive `N`. Each append is synced to disk before releasing the write loc
 
 ## CLI view vs. AI view
 
-The same entry looks different depending on who reads it. `opq audit` (CLI) shows full
-operator detail; the MCP `audit_tail` tool applies a closed allowlist.
+The same entry looks different depending on who reads it. `opq audit --json` (CLI) shows
+full operator detail; the MCP `audit_tail` tool applies a closed allowlist.
 
 ```json
-// CLI view via `opq audit` (full detail)
+// CLI view via `opq audit --json` (full detail)
 {"ts":"2026-05-24T15:50:17.189Z","action":"exec_inject","secret_name":"openai_key","caller":"cli","pid":50770,"ppid":50701}
 {"ts":"2026-05-24T15:50:18.012Z","action":"mcp_run","secret_names":["openai_key","stripe_secret_key"],"caller":"mcp","pid":50770,"ppid":50701,"msg":"raw_exit=0 elapsed_ms=143"}
 {"ts":"2026-05-24T15:50:19.422Z","action":"audit_tail","caller":"mcp","pid":50770,"ppid":50701,"msg":"n=20"}

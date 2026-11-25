@@ -24,6 +24,7 @@ keyed `meta/<name>`.
 | Variable | Effect |
 | --- | --- |
 | `OPQ_I_AM_HUMAN=1` | Required (inline on the command) for `opq get --plaintext` and `opq exec --no-redact`. Part of the human-confirmation gate. |
+| `NO_COLOR` | Disables ANSI color emphasis in TTY output (`opq list`, `opq audit`, `opq doctor`). |
 | `XDG_STATE_HOME` | Overrides the base directory for the audit log. |
 | `HOME` | Resolves `~/.local/state` and the home-directory socket masks under SandboxNet. |
 

@@ -21,8 +21,8 @@ against earlier versions; the hardening history is in the
 
 | Profile | `isolation` | Network | Filesystem |
 | --- | --- | --- | --- |
-| `SandboxNet` | `"net"` (default) | `--unshare-net` | `--ro-bind / /` + masks |
-| `SandboxNetAllowed` | `"net"` + `allow_network:true` | (no `--unshare-net`) | identical to `SandboxNet` |
+| `SandboxNet` | `"net"` or `"readonly"` (default) | `--unshare-net` | `--ro-bind / /` + masks |
+| `SandboxNetAllowed` | `"net"` / `"readonly"` + `allow_network:true` | (no `--unshare-net`) | identical to `SandboxNet` |
 | `SandboxFull` | `"full"` | `--unshare-all` | tmpfs `/home` + `/tmp`; minimal ro-binds |
 | `SandboxNone` | (n/a) | none | none (CLI default when `--sandbox` is not given) |
 

@@ -15,6 +15,7 @@ site-url = "/opq/"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 no-section-label = false
+additional-css = ["theme/custom.css"]
 
 [output.html.fold]
 enable = true

@@ -1,7 +1,7 @@
 # Quick Start
 
-Five commands, assuming `opq` is [installed](./installation.md) and your keyring
-session is unlocked. This first run stays local, so it needs no API key and no network.
+Five commands, assuming `opq` is [installed](./installation.md) and `opq doctor` passes.
+This first run stays local, so it needs no API key and no network.
 
 ```sh
 # 1. Store a secret under the name "demo_key"
@@ -33,18 +33,34 @@ the `[REDACTED:API]` token uses the env var name. `audit` shows the `set`,
 
 ## Use it for real
 
-Swap the demo for a real credential and command. `--env OPENAI_API_KEY=openai_key` maps
-the environment variable `OPENAI_API_KEY` (what the subprocess reads) to the secret
-stored as `openai_key` (left side is the env var, right side is the opq name):
+Swap the demo for a real credential and command. `--env VAR=secret_name` (or `-e VAR=secret_name`)
+maps an environment variable (left side) to a stored `opq` secret name (right side);
+when both names match, shorthand `-e VAR` maps `VAR=VAR`.
+
+Prefer tools and SDKs that read credentials directly from their environment — the secret
+never leaves the process environment or touches command arguments:
+
+```sh
+printf 'ghp_...' | opq set GH_TOKEN
+opq exec -e GH_TOKEN -- gh api /user
+```
+
+When using `curl`, pass the authorization header over stdin (`-K -`) instead of
+expanding `$OPENAI_API_KEY` into a `-H` flag:
 
 ```sh
 printf 'sk-...' | opq set openai_key
-opq exec --env OPENAI_API_KEY=openai_key -- \
-  sh -c 'curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"'
+opq exec -e OPENAI_API_KEY=openai_key -- \
+  sh -c 'printf "header = \"Authorization: Bearer %s\"\n" "$OPENAI_API_KEY" | curl -sS -K - https://api.openai.com/v1/models'
 ```
 
-The value exists only in the child's environment; it never reaches your shell's argv,
-and if the response echoed it back it would return as `[REDACTED:OPENAI_API_KEY]`.
+> **Why not `curl -H "Authorization: Bearer $OPENAI_API_KEY"`?** Expanding a secret via
+> `sh -c` into a child command's `argv` makes the plaintext visible to other processes
+> via `ps` or `/proc/<pid>/cmdline`. Reading from the environment directly (SDKs, `gh`,
+> `aws`) or passing config over stdin (`curl -K -`) keeps the value off `argv`.
+
+If the response echoes the key back, `opq` redacts it to `[REDACTED:OPENAI_API_KEY]`
+before it reaches your terminal or agent.
 
 ## Next
 

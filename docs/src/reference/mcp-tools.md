@@ -5,6 +5,17 @@ absence blocks direct value retrieval. Arbitrary consuming commands still have o
 and encoding channels. Register the server as shown in the
 [MCP tutorial](../tutorials/mcp-claude-code.md#1-register-the-mcp-server).
 
+## Tool annotations
+
+Each tool advertises MCP `ToolAnnotations` so clients can apply appropriate confirmation
+and safety policies:
+
+| Tool | `readOnlyHint` | `idempotentHint` | `destructiveHint` | `openWorldHint` | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `list_secrets` | `true` | `true` | `false` | `false` | Reads secret names only (audited). |
+| `run_with_secrets` | `false` | — | `true` | `true` | Executes an external command with injected credentials. |
+| `audit_tail` | `true` | `false` | `false` | `false` | Appends a self-audit entry on every call, so not idempotent. |
+
 ## `list_secrets`
 
 ```jsonc
@@ -18,14 +29,17 @@ leaves a trace.
 
 ## `run_with_secrets`
 
+Prefer consumers that read credentials directly from the environment (or feed headers via
+stdin such as `curl -K -` so secrets stay off `argv` and `ps`):
+
 ```jsonc
 run_with_secrets({
-  command: "sh",
-  args: ["-c", "curl -s -H \"Authorization: Bearer $TOK\" https://api.example.com"],
-  env: { TOK: "api_token" },
-  timeout_seconds: 60,        // optional, default 60, capped at 600
-  allow_network: true,        // optional, default false (external curl needs it)
-  isolation: "net"            // optional: "net" (default) | "full"
+  command: "/usr/local/libexec/provider-status",
+  args: [],
+  env: { API_TOKEN: "api_token" },
+  timeout_seconds: 60,        // optional, default 60, bounds 1..600
+  allow_network: true,        // optional, default false
+  isolation: "readonly"       // optional: "readonly" | "net" (default) | "full"
 })
 ```
 
@@ -36,19 +50,32 @@ injected secret, plus its base64/hex forms, replaced with `[REDACTED:VAR]`), a
 normalized exit of `success` or `failure` (the raw status goes to the audit log, never
 to the AI), and a `timed_out` flag.
 
-### Parameters
+### Parameters & JSON Schema bounds
 
-| Field | Type | Default | Notes |
+| Field | Type | Default | Schema & runtime bounds |
 | --- | --- | --- | --- |
 | `command` | string | (required) | Resolved and sandbox-wrapped before secret values are built into the env. |
-| `args` | string[] | `[]` | Capped at 256 entries. |
-| `env` | object | `{}` | `VAR → secret_name`. Max 32 entries; names ≤ 256 bytes and checked against the [deny-list](./env-deny-list.md). |
-| `timeout_seconds` | number | 60 | Capped at 600. |
-| `allow_network` | bool | false | `true` lifts the network block (audited as `network_allowed`); filesystem sandbox still applies. |
-| `isolation` | string | `"net"` | `"net"` or `"full"`; see [Sandbox profiles](../tutorials/sandbox-and-hardening.md#isolation-profiles). |
+| `args` | string[] | `[]` | `maxItems: 256`; total `command` + `args` text capped at 1 MiB. |
+| `env` | object | `{}` | `VAR → secret_name`. Max 32 entries; env names ≤ 256 bytes and checked against the [deny-list](./env-deny-list.md); secret names match `[A-Za-z0-9_.-]{1,128}`. |
+| `timeout_seconds` | integer | `60` | `minimum: 1`, `maximum: 600`. |
+| `allow_network` | boolean | `false` | `true` lifts the network block (audited as `network_allowed`); filesystem sandbox still applies. |
+| `isolation` | string | `"net"` | `enum: ["net", "readonly", "full"]`. `"readonly"` is an alias for `"net"`; see [Sandbox profiles](../tutorials/sandbox-and-hardening.md#isolation-profiles). |
 
-`allow_network: true` requires the default `"net"` isolation; combining it with
+`allow_network: true` requires `"readonly"` (or `"net"`) isolation; combining it with
 `isolation: "full"` is rejected as a validation error.
+
+### Child environment & macOS sandbox constraints
+
+- **Minimal child environment:** Subprocesses inherit no parent environment variables
+  beyond fixed minimal `PATH=/usr/bin:/usr/sbin:/bin:/sbin`, `HOME=/tmp`, and the
+  explicitly requested `env` mappings. On macOS/Homebrew or when running user-installed
+  tools outside standard system paths, invoke the binary by its absolute path (for
+  example `/opt/homebrew/bin/jq`).
+- **Read-only host filesystem & macOS writes:** The host filesystem is read-only under
+  all sandbox profiles. On Linux, `SandboxNet` overlays an ephemeral tmpfs at `/tmp`; on
+  macOS (Seatbelt), **all filesystem writes — including `/tmp` and `/dev/null` — are
+  denied** under the sandbox. Protected Docker, GPG, SSH, audit, and policy Unix sockets
+  remain blocked even when `allow_network: true`.
 
 ### Resource limits and output
 
@@ -88,7 +115,7 @@ carry no backend or library text.
 ## `audit_tail`
 
 ```jsonc
-audit_tail({ n: 20 })   // n capped at 200
+audit_tail({ n: 20 })   // integer, schema bounds: minimum 1, maximum 200
 ```
 
 Returns recent audit entries. Over MCP the results are restricted to `caller="mcp"`
