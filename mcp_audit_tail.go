@@ -19,7 +19,22 @@ import (
 )
 
 type auditTailInput struct {
-	N int `json:"n,omitempty" jsonschema:"number of trailing entries; default 20, capped at 200"`
+	N int `json:"n,omitempty" jsonschema:"Number of trailing MCP audit entries to return (default 20, range 1-200)."`
+}
+
+func auditTailInputSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"n": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     mcpMaxAuditTailN,
+				"description": "Number of trailing MCP audit entries to return (default 20, range 1-200).",
+			},
+		},
+	}
 }
 
 type auditTailOutput struct {

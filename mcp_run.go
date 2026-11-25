@@ -25,38 +25,85 @@ import (
 )
 
 type runWithSecretsInput struct {
-	Command        string            `json:"command" jsonschema:"executable to run (absolute path or name resolvable via PATH)"`
-	Args           []string          `json:"args,omitempty" jsonschema:"arguments to pass to the command"`
-	Env            map[string]string `json:"env" jsonschema:"mapping of ENV_VAR_NAME -> secret_name; the named secret's value will be set in the subprocess environment. Max 32 entries."`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"per-call wall-clock timeout in seconds. Defaults to 60. Capped at 600."`
-	AllowNetwork   bool              `json:"allow_network,omitempty" jsonschema:"if true, permits external networking while retaining filesystem and protected-socket restrictions; default false (network blocked)"`
-	Isolation      string            `json:"isolation,omitempty" jsonschema:"filesystem isolation: 'net' (default; host filesystem read-only) or 'full' (restricted host-file reads; platform-specific details in the sandbox reference)"`
+	Command        string            `json:"command" jsonschema:"Executable to run (name on minimal PATH /usr/bin:/usr/sbin:/bin:/sbin, or absolute path such as /opt/homebrew/bin/jq)."`
+	Args           []string          `json:"args,omitempty" jsonschema:"Arguments to pass to the command (max 256 items; command + args combined max 1 MiB)."`
+	Env            map[string]string `json:"env,omitempty" jsonschema:"Mapping of ENV_VAR_NAME -> secret_name (max 32 entries). Secret names must match [A-Za-z0-9_.-]{1,128}; env var names must match [A-Za-z_][A-Za-z0-9_]* and must not be on the loader/interpreter deny-list."`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty" jsonschema:"Per-call wall-clock timeout in seconds (default 60, range 1-600)."`
+	AllowNetwork   bool              `json:"allow_network,omitempty" jsonschema:"If true, permits external networking (audited as network_allowed) while keeping the read-only filesystem and protected-socket sandbox; default false (network blocked)."`
+	Isolation      string            `json:"isolation,omitempty" jsonschema:"Filesystem isolation: 'readonly' or 'net' (default, equivalent; host filesystem read-only) or 'full' (restricts host-file reads; incompatible with allow_network=true)."`
+}
+
+// runWithSecretsInputSchema defines the JSON Schema (2020-12) exposed for
+// run_with_secrets. Explicit bounds guide AI callers up front while keeping
+// secret-name shape checks in handleRunWithSecrets so malformed names continue
+// to audit and return the stable invalid_secret_name taxonomy.
+func runWithSecretsInputSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required":             []string{"command"},
+		"properties": map[string]any{
+			"command": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Executable to run (name on minimal PATH /usr/bin:/usr/sbin:/bin:/sbin, or absolute path such as /opt/homebrew/bin/jq).",
+			},
+			"args": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"maxItems":    mcpMaxArgCount,
+				"description": "Arguments to pass to the command (max 256 items; command + args combined max 1 MiB).",
+			},
+			"env": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"maxProperties":        mcpMaxEnvCount,
+				"description":          "Mapping of ENV_VAR_NAME -> secret_name (max 32 entries). Secret names must match [A-Za-z0-9_.-]{1,128}; env var names must match [A-Za-z_][A-Za-z0-9_]* and must not be on the loader/interpreter deny-list.",
+			},
+			"timeout_seconds": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     int(mcpMaxTimeout / time.Second),
+				"description": "Per-call wall-clock timeout in seconds (default 60, range 1-600).",
+			},
+			"allow_network": map[string]any{
+				"type":        "boolean",
+				"description": "If true, permits external networking (audited as network_allowed) while keeping the read-only filesystem and protected-socket sandbox; default false (network blocked).",
+			},
+			"isolation": map[string]any{
+				"type":        "string",
+				"enum":        []string{"net", "readonly", "full"},
+				"description": "Filesystem isolation: 'readonly' or 'net' (default, equivalent; host filesystem read-only) or 'full' (restricts host-file reads; incompatible with allow_network=true).",
+			},
+		},
+	}
 }
 
 // resolveMCPSandbox maps (AllowNetwork, Isolation) to a profile. Default is
-// SandboxNet: the AI gets the secret but can't ship it off-box.
+// SandboxNet: the AI gets the secret but can't ship it off-box. "readonly" is
+// an explicit alias for "net".
 //
-//	AllowNetwork=true  + Isolation=""|"net" -> SandboxNetAllowed (audit network_allowed)
-//	AllowNetwork=true  + Isolation="full"   -> error (incompatible until v1.2)
-//	AllowNetwork=false + Isolation=""|"net" -> SandboxNet (default)
-//	AllowNetwork=false + Isolation="full"   -> SandboxFull
+//	AllowNetwork=true  + Isolation=""|"net"|"readonly" -> SandboxNetAllowed (audit network_allowed)
+//	AllowNetwork=true  + Isolation="full"              -> error (incompatible)
+//	AllowNetwork=false + Isolation=""|"net"|"readonly" -> SandboxNet (default)
+//	AllowNetwork=false + Isolation="full"              -> SandboxFull
 //
 // allow_network keeps the FS sandbox (SandboxNetAllowed, not SandboxNone) and
 // only lifts the netns; otherwise the AI could write the secret to a host path
 // and read it back from a later sandboxed call.
 func resolveMCPSandbox(allowNetwork bool, isolation string) (SandboxProfile, error) {
 	iso := isolation
-	if iso == "" {
+	if iso == "" || iso == "readonly" {
 		iso = "net"
 	}
 	switch iso {
 	case "net", "full":
 	default:
-		return SandboxNone, fmt.Errorf("unknown isolation %q (want net|full)", isolation)
+		return SandboxNone, fmt.Errorf("unknown isolation %q (want readonly, net, or full)", isolation)
 	}
 	if allowNetwork {
 		if iso == "full" {
-			return SandboxNone, fmt.Errorf("isolation=full is incompatible with allow_network=true until v1.2")
+			return SandboxNone, fmt.Errorf("isolation=full cannot be combined with allow_network=true; use isolation=readonly (or net) with allow_network=true")
 		}
 		return SandboxNetAllowed, nil
 	}
@@ -195,7 +242,7 @@ func handleRunWithSecrets(ctx context.Context, _ *mcp.CallToolRequest, input run
 			// Refuse to inject into a loader/interpreter var (PATH, LD_*,
 			// BASH_ENV, ...); that would be arbitrary code execution.
 			_ = AppendAuditContext(ctx, AuditEvent{Action: ActionDenied, Caller: callerTag(), Message: "env_blocked"})
-			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (PATH, LD_*, BASH_ENV, etc.; see env_policy.go)", envName)), runWithSecretsOutput{}, nil
+			return aiUserErr(fmt.Sprintf("env var %q is on the injected-env deny-list (blocks loader/interpreter variables for safety; see https://alexrios.github.io/opq/reference/env-deny-list.html)", envName)), runWithSecretsOutput{}, nil
 		}
 		if !validSecretName(secretName) {
 			// Use a stable taxonomy and audit the validation failure.

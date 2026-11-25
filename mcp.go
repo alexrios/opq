@@ -70,6 +70,8 @@ const (
 
 var mcpRunSlots = make(chan struct{}, mcpMaxConcurrentRuns)
 
+func boolPtr(b bool) *bool { return &b }
+
 // newMCPServer wires the tools we expose to AI clients. Note that there is
 // deliberately NO tool that returns a plaintext secret value; that's the
 // whole point of this CLI. Tools exposed:
@@ -87,26 +89,54 @@ func newMCPServer(lifetime context.Context) (*mcp.Server, error) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "list_secrets",
 		Description: "List the names of secrets available in the user's keyring. Values are never returned.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "List Secrets",
+			ReadOnlyHint:    true,
+			IdempotentHint:  true,
+			DestructiveHint: boolPtr(false),
+			OpenWorldHint:   boolPtr(false),
+		},
 	}, withServerLifetime(lifetime, handleListSecrets))
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "run_with_secrets",
 		Description: strings.Join([]string{
-			"Run a subprocess with named secrets injected as environment variables.",
-			"Subprocess stdout/stderr is byte-redacted for the injected secrets and common base64/hex forms. Arbitrary output encodings and side channels remain visible; this is protection against accidental disclosure.",
-			"NETWORK SANDBOX (DEFAULT): the subprocess uses the platform sandbox with NO external connectivity (Linux namespaces or macOS Seatbelt; DNS, TCP/UDP/IP egress, and outbound HTTP fail). Set `allow_network=true` ONLY when the command's purpose is to reach the network (e.g. an API call). When you opt in, the call is recorded in the operator's audit log as `network_allowed`.",
-			"FILESYSTEM ISOLATION (opt-in): isolation=full gives Linux minimal read-only system mounts and empty /home and /tmp. macOS denies home/temp reads with a less hermetic Seatbelt profile. See the public sandbox reference for platform limits.",
-			"SECURITY CAVEATS (read before relying on this tool):",
-			"(1) Even with the network sandbox, the subprocess shares the kernel with the host. Loopback channels, kernel-keyring inheritance, and timing side-channels are NOT blocked.",
-			"(2) The redactor is byte-exact. Raw, common base64, and common hex forms are redacted; URL percent-encoding, base32, and arbitrary custom encodings are NOT covered.",
-			"(3) The output you receive does not reveal which secrets were resolved or their values; that information is in the operator's audit log only.",
-			"Use this whenever you need a tool to consume an API key, token, or password, but assume the operator is treating any command you run as authorized use of every secret you ask for.",
-		}, " "),
+			"Run a subprocess with named secrets injected as environment variables. Stdout and stderr are byte-redacted (raw, common base64, and common hex forms replaced with [REDACTED:VAR]) and capped at 256 KiB per stream.",
+			"",
+			"ENVIRONMENT: The child inherits no parent env vars and receives only PATH=/usr/bin:/usr/sbin:/bin:/sbin, HOME=/tmp, and the requested env secrets. Pass absolute paths for Homebrew or user-installed binaries (for example, /opt/homebrew/bin/jq).",
+			"",
+			"SANDBOX & NETWORK:",
+			"- Default (allow_network=false, isolation=\"readonly\" or \"net\"): external networking is blocked (Linux namespaces or macOS Seatbelt) and the host filesystem is read-only. On Linux /tmp is an isolated empty tmpfs; on macOS all writes—including /tmp and /dev/null—are denied under the sandbox.",
+			"- allow_network=true: permits external networking (recorded in the operator audit log as network_allowed) while keeping the read-only filesystem and protected-socket sandbox. Requires isolation=\"readonly\" (or \"net\"); cannot be combined with isolation=\"full\".",
+			"- isolation=\"full\": blocks network and restricts host-file reads (minimal read-only system mounts with empty /home and /tmp on Linux; denies $HOME and temp reads via Seatbelt on macOS).",
+			"",
+			"SECURITY CAVEATS:",
+			"(1) Even when sandboxed, the child shares the host kernel; loopback, kernel-keyring, and timing side channels are not blocked.",
+			"(2) Redaction is byte-exact for raw, common base64, and common hex forms; URL percent-encoding, base32, and custom encodings are not covered.",
+			"(3) Secret values are never returned by any tool, and detailed telemetry (raw exit codes, elapsed timing, output truncation, and expired/revoked policy states) lives in the operator audit log only—never in tool responses or audit_tail.",
+			"Assume the operator treats any command you run as authorized use of every secret you request.",
+		}, "\n"),
+		InputSchema: runWithSecretsInputSchema(),
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Run Command with Secrets",
+			ReadOnlyHint:    false,
+			IdempotentHint:  false,
+			DestructiveHint: boolPtr(true),
+			OpenWorldHint:   boolPtr(true),
+		},
 	}, withServerLifetime(lifetime, handleRunWithSecrets))
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "audit_tail",
-		Description: "Return the most recent opaque audit-log entries as JSON-line strings. Capped at 200 entries per call.",
+		Description: "Return the most recent opq audit-log entries as JSON-line strings (default 20, capped at 200 per call). Each call appends a self-audit entry to the operator log.",
+		InputSchema: auditTailInputSchema(),
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Tail Audit Log",
+			ReadOnlyHint:    true,
+			IdempotentHint:  false,
+			DestructiveHint: boolPtr(false),
+			OpenWorldHint:   boolPtr(false),
+		},
 	}, withServerLifetime(lifetime, handleAuditTail))
 
 	return srv, nil

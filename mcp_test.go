@@ -1608,3 +1608,265 @@ func TestHandleRunWithSecrets_AuditsOnWrapCommandFailed_AbsPath(t *testing.T) {
 		t.Errorf("audit Message leaks AI-supplied basename: %q", ev.Message)
 	}
 }
+
+func TestMCPServer_ToolAnnotationsDescriptionsAndSchemas(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	srv, err := newMCPServer(ctx)
+	if err != nil {
+		t.Fatalf("newMCPServer: %v", err)
+	}
+	a, b := mcp.NewInMemoryTransports()
+	ss, err := srv.Connect(ctx, a, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer ss.Close()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "1"}, nil).Connect(ctx, b, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer cs.Close()
+
+	listed, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	byName := make(map[string]*mcp.Tool, len(listed.Tools))
+	for _, tool := range listed.Tools {
+		byName[tool.Name] = tool
+	}
+	if len(byName) != 3 {
+		t.Fatalf("expected 3 tools, got %d: %v", len(byName), byName)
+	}
+	if _, forbidden := byName["get_secret_value"]; forbidden {
+		t.Fatal("forbidden get_secret_value tool exposed")
+	}
+
+	assertBoolPtr := func(tool, field string, got *bool, want bool) {
+		t.Helper()
+		if got == nil {
+			t.Errorf("%s: %s is nil, want %v", tool, field, want)
+			return
+		}
+		if *got != want {
+			t.Errorf("%s: %s = %v, want %v", tool, field, *got, want)
+		}
+	}
+
+	// 1. ToolAnnotations checks.
+	listTool := byName["list_secrets"]
+	if listTool == nil || listTool.Annotations == nil {
+		t.Fatalf("list_secrets missing or lacks annotations: %+v", listTool)
+	}
+	if !listTool.Annotations.ReadOnlyHint || !listTool.Annotations.IdempotentHint {
+		t.Errorf("list_secrets hints = (readOnly=%v, idempotent=%v), want (true, true)",
+			listTool.Annotations.ReadOnlyHint, listTool.Annotations.IdempotentHint)
+	}
+	assertBoolPtr("list_secrets", "DestructiveHint", listTool.Annotations.DestructiveHint, false)
+	assertBoolPtr("list_secrets", "OpenWorldHint", listTool.Annotations.OpenWorldHint, false)
+
+	auditTool := byName["audit_tail"]
+	if auditTool == nil || auditTool.Annotations == nil {
+		t.Fatalf("audit_tail missing or lacks annotations: %+v", auditTool)
+	}
+	if !auditTool.Annotations.ReadOnlyHint || auditTool.Annotations.IdempotentHint {
+		t.Errorf("audit_tail hints = (readOnly=%v, idempotent=%v), want (true, false)",
+			auditTool.Annotations.ReadOnlyHint, auditTool.Annotations.IdempotentHint)
+	}
+	assertBoolPtr("audit_tail", "DestructiveHint", auditTool.Annotations.DestructiveHint, false)
+	assertBoolPtr("audit_tail", "OpenWorldHint", auditTool.Annotations.OpenWorldHint, false)
+
+	runTool := byName["run_with_secrets"]
+	if runTool == nil || runTool.Annotations == nil {
+		t.Fatalf("run_with_secrets missing or lacks annotations: %+v", runTool)
+	}
+	if runTool.Annotations.ReadOnlyHint {
+		t.Errorf("run_with_secrets ReadOnlyHint = true, want false")
+	}
+	assertBoolPtr("run_with_secrets", "DestructiveHint", runTool.Annotations.DestructiveHint, true)
+	assertBoolPtr("run_with_secrets", "OpenWorldHint", runTool.Annotations.OpenWorldHint, true)
+
+	// 2. Descriptions checks.
+	if strings.Contains(strings.ToLower(auditTool.Description), "opaque") {
+		t.Errorf("audit_tail description still mentions opaque: %q", auditTool.Description)
+	}
+	if !strings.Contains(auditTool.Description, "opq") {
+		t.Errorf("audit_tail description missing opq: %q", auditTool.Description)
+	}
+	for _, want := range []string{
+		"PATH=/usr/bin:/usr/sbin:/bin:/sbin",
+		"HOME=/tmp",
+		"/opt/homebrew/bin/jq",
+		"read-only",
+		"/tmp",
+		"/dev/null",
+		"allow_network",
+		"readonly",
+		"operator audit log only",
+	} {
+		if !strings.Contains(runTool.Description, want) {
+			t.Errorf("run_with_secrets description missing %q:\n%s", want, runTool.Description)
+		}
+	}
+	if strings.Contains(runTool.Description, "does not reveal which secrets were resolved") {
+		t.Errorf("run_with_secrets description still contains stale caveat (3): %s", runTool.Description)
+	}
+
+	// 3. Generated JSON Schema checks.
+	toMap := func(v any) map[string]any {
+		t.Helper()
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal schema: %v", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal schema: %v", err)
+		}
+		return out
+	}
+
+	runSchema := toMap(runTool.InputSchema)
+	runProps := runSchema["properties"].(map[string]any)
+
+	isoProp := runProps["isolation"].(map[string]any)
+	isoEnumRaw := isoProp["enum"].([]any)
+	var isoEnum []string
+	for _, item := range isoEnumRaw {
+		isoEnum = append(isoEnum, item.(string))
+	}
+	wantEnum := []string{"net", "readonly", "full"}
+	if strings.Join(isoEnum, ",") != strings.Join(wantEnum, ",") {
+		t.Errorf("isolation.enum = %v, want %v", isoEnum, wantEnum)
+	}
+
+	timeoutProp := runProps["timeout_seconds"].(map[string]any)
+	if timeoutProp["minimum"] != float64(1) || timeoutProp["maximum"] != float64(600) {
+		t.Errorf("timeout_seconds bounds = (%v, %v), want (1, 600)", timeoutProp["minimum"], timeoutProp["maximum"])
+	}
+
+	argsProp := runProps["args"].(map[string]any)
+	if argsProp["maxItems"] != float64(mcpMaxArgCount) {
+		t.Errorf("args.maxItems = %v, want %d", argsProp["maxItems"], mcpMaxArgCount)
+	}
+
+	envProp := runProps["env"].(map[string]any)
+	if envProp["maxProperties"] != float64(mcpMaxEnvCount) {
+		t.Errorf("env.maxProperties = %v, want %d", envProp["maxProperties"], mcpMaxEnvCount)
+	}
+	if !strings.Contains(envProp["description"].(string), "[A-Za-z0-9_.-]{1,128}") {
+		t.Errorf("env.description missing secret name pattern: %q", envProp["description"])
+	}
+
+	auditSchema := toMap(auditTool.InputSchema)
+	auditProps := auditSchema["properties"].(map[string]any)
+	nProp := auditProps["n"].(map[string]any)
+	if nProp["minimum"] != float64(1) || nProp["maximum"] != float64(mcpMaxAuditTailN) {
+		t.Errorf("audit_tail n bounds = (%v, %v), want (1, %d)", nProp["minimum"], nProp["maximum"], mcpMaxAuditTailN)
+	}
+
+	// 4. Schema enforcement over the live MCP wire: out-of-range inputs are
+	// rejected, while invalid secret names still flow through to the handler so
+	// the stable invalid_secret_name taxonomy and audit entry are preserved.
+	withAuditTmpDir(t)
+	SetCallerTag("mcp")
+	t.Cleanup(func() { SetCallerTag("cli") })
+
+	for _, tc := range []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"invalid_isolation_enum", "run_with_secrets", map[string]any{"command": "/bin/true", "isolation": "bogus"}},
+		{"timeout_below_min", "run_with_secrets", map[string]any{"command": "/bin/true", "timeout_seconds": 0}},
+		{"timeout_above_max", "run_with_secrets", map[string]any{"command": "/bin/true", "timeout_seconds": 601}},
+		{"audit_n_below_min", "audit_tail", map[string]any{"n": 0}},
+		{"audit_n_above_max", "audit_tail", map[string]any{"n": 201}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
+			if err == nil && (res == nil || !res.IsError) {
+				t.Fatalf("expected schema rejection for %s, got res=%+v err=%v", tc.name, res, err)
+			}
+		})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "run_with_secrets",
+		Arguments: map[string]any{
+			"command": "/bin/true",
+			"env":     map[string]any{"API": "bad/secret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected protocol error for invalid_secret_name: %v", err)
+	}
+	if res == nil || !res.IsError || mcpResultText(res) != "invalid_secret_name" {
+		t.Fatalf("expected stable invalid_secret_name tool error, got res=%+v text=%q", res, mcpResultText(res))
+	}
+}
+
+func TestResolveMCPSandbox_ReadonlyAliasAndErrors(t *testing.T) {
+	cases := []struct {
+		name         string
+		allowNetwork bool
+		isolation    string
+		want         SandboxProfile
+		wantErr      string
+		forbidErr    string
+	}{
+		{"readonly default network off", false, "readonly", SandboxNet, "", ""},
+		{"readonly network on", true, "readonly", SandboxNetAllowed, "", ""},
+		{"net explicit network off", false, "net", SandboxNet, "", ""},
+		{"net explicit network on", true, "net", SandboxNetAllowed, "", ""},
+		{"full + network rejected without stale version", true, "full", SandboxNone, "isolation=readonly (or net)", "until v1.2"},
+		{"unknown isolation lists readonly", false, "bogus", SandboxNone, "readonly, net, or full", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := resolveMCPSandbox(c.allowNetwork, c.isolation)
+			if c.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", c.wantErr)
+				}
+				if !strings.Contains(err.Error(), c.wantErr) {
+					t.Errorf("error = %q, want substring %q", err.Error(), c.wantErr)
+				}
+				if c.forbidErr != "" && strings.Contains(err.Error(), c.forbidErr) {
+					t.Errorf("error = %q must not contain %q", err.Error(), c.forbidErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestHandleRunWithSecrets_BlockedEnvErrorPointsToDocs(t *testing.T) {
+	withAuditTmpDir(t)
+	res, _, err := handleRunWithSecrets(context.Background(), nil, runWithSecretsInput{
+		Command: "/bin/true",
+		Env:     map[string]string{"LD_PRELOAD": "some_secret"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("expected IsError result, got %+v", res)
+	}
+	text := mcpResultText(res)
+	if strings.Contains(text, "env_policy.go") {
+		t.Errorf("error should not reference internal file env_policy.go: %q", text)
+	}
+	want := "blocks loader/interpreter variables for safety; see https://alexrios.github.io/opq/reference/env-deny-list.html"
+	if !strings.Contains(text, want) {
+		t.Errorf("error = %q, want substring %q", text, want)
+	}
+}

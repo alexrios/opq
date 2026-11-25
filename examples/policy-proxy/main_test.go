@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -222,5 +227,336 @@ func TestProxyAppliesOperatorTimeout(t *testing.T) {
 	fields := result.StructuredContent.(map[string]any)
 	if fields["timed_out"] != true || fields["succeeded"] != false {
 		t.Fatal("deadline not represented by typed failure status")
+	}
+}
+
+func TestOperationDescriptionAndReadonlyIsolation(t *testing.T) {
+	t.Run("default description preserved when omitted", func(t *testing.T) {
+		cs, ctx := connectProxy(t, approvedConfig(t), fakeUpstream(func(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{StructuredContent: map[string]any{"succeeded": true, "timed_out": false}}, nil
+		}))
+		listed, err := cs.ListTools(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "Run this operator-approved fixed operation. Takes no arguments; returns status only."
+		if listed.Tools[0].Description != want {
+			t.Fatalf("description = %q, want %q", listed.Tools[0].Description, want)
+		}
+	})
+
+	t.Run("custom description and readonly isolation forwarded cleanly", func(t *testing.T) {
+		raw := `{"opq":"/operator/bin/opq","operations":[{"name":"health_check","description":"Check upstream API health\t(prod)","command":"/usr/bin/true","timeout_seconds":5,"allow_network":true,"isolation":"readonly"}]}`
+		cfg, err := readConfig(strings.NewReader(raw))
+		if err != nil {
+			t.Fatalf("readConfig: %v", err)
+		}
+		var gotArgs map[string]any
+		cs, ctx := connectProxy(t, cfg, fakeUpstream(func(_ context.Context, p *mcp.CallToolParams) (*mcp.CallToolResult, error) {
+			gotArgs, _ = p.Arguments.(map[string]any)
+			return &mcp.CallToolResult{StructuredContent: map[string]any{"succeeded": true, "timed_out": false}}, nil
+		}))
+		listed, err := cs.ListTools(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantDesc := "Check upstream API health\t(prod). Takes no arguments; returns status only."
+		if listed.Tools[0].Description != wantDesc {
+			t.Fatalf("description = %q, want %q", listed.Tools[0].Description, wantDesc)
+		}
+		if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "health_check", Arguments: map[string]any{}}); err != nil {
+			t.Fatal(err)
+		}
+		if gotArgs["isolation"] != "readonly" || gotArgs["allow_network"] != true {
+			t.Fatalf("unexpected forwarded args: %#v", gotArgs)
+		}
+		if !reflect.DeepEqual(gotArgs["args"], []string{}) || !reflect.DeepEqual(gotArgs["env"], map[string]string{}) {
+			t.Fatalf("omitted args/env should normalize to empty slice/map, got %#v", gotArgs)
+		}
+	})
+
+	t.Run("exact 512 byte description accepted", func(t *testing.T) {
+		cfg := approvedConfig(t)
+		cfg.Operations[0].Description = strings.Repeat("a", maxOperationDescriptionBytes)
+		if err := validateConfig(cfg); err != nil {
+			t.Fatalf("512-byte description rejected: %v", err)
+		}
+	})
+
+	t.Run("description rejects >512 bytes and control chars", func(t *testing.T) {
+		badDescs := map[string]struct {
+			desc    string
+			wantSub string
+		}{
+			"too_long": {strings.Repeat("a", maxOperationDescriptionBytes+1), "exceeds 512 bytes"},
+			"nul":      {"bad\x00desc", "control characters"},
+			"newline":  {"line1\nline2", "control characters"},
+			"cr":       {"line1\rline2", "control characters"},
+			"escape":   {"ansi\x1b[31m", "control characters"},
+			"del":      {"del\x7fchar", "control characters"},
+		}
+		for name, tc := range badDescs {
+			t.Run(name, func(t *testing.T) {
+				cfg := approvedConfig(t)
+				cfg.Operations[0].Description = tc.desc
+				err := validateConfig(cfg)
+				if err == nil {
+					t.Fatalf("expected error for %s", name)
+				}
+				if !strings.Contains(err.Error(), `operation "probe"`) || !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("error = %q, want operation name and %q", err.Error(), tc.wantSub)
+				}
+			})
+		}
+	})
+}
+
+func TestValidateConfigPinpointErrors(t *testing.T) {
+	base := func() config {
+		return config{
+			Opq: "/operator/bin/opq",
+			Operations: []operation{{
+				Name:           "probe",
+				Command:        "/usr/bin/true",
+				Args:           []string{},
+				Env:            map[string]string{"API_TOKEN": "example_token"},
+				TimeoutSeconds: 10,
+				AllowNetwork:   false,
+				Isolation:      "full",
+			}},
+		}
+	}
+
+	cases := []struct {
+		name      string
+		mutate    func(*config)
+		wantParts []string
+	}{
+		{
+			name:      "relative_opq",
+			mutate:    func(c *config) { c.Opq = "opq" },
+			wantParts: []string{"opq", "absolute executable path"},
+		},
+		{
+			name: "too_many_operations",
+			mutate: func(c *config) {
+				c.Operations = make([]operation, 65)
+			},
+			wantParts: []string{"too many approved operations", "65", "64"},
+		},
+		{
+			name:      "invalid_name",
+			mutate:    func(c *config) { c.Operations[0].Name = "../bad" },
+			wantParts: []string{"operations[0]", "invalid operation name", "../bad"},
+		},
+		{
+			name:      "reserved_name",
+			mutate:    func(c *config) { c.Operations[0].Name = "list_secrets" },
+			wantParts: []string{"operations[0]", "list_secrets", "reserved"},
+		},
+		{
+			name:      "duplicate_name",
+			mutate:    func(c *config) { c.Operations = append(c.Operations, c.Operations[0]) },
+			wantParts: []string{"operations[1]", "duplicate operation name", "probe"},
+		},
+		{
+			name:      "relative_command",
+			mutate:    func(c *config) { c.Operations[0].Command = "true" },
+			wantParts: []string{`operation "probe"`, "command", "absolute executable path"},
+		},
+		{
+			name:      "timeout_out_of_range",
+			mutate:    func(c *config) { c.Operations[0].TimeoutSeconds = 601 },
+			wantParts: []string{`operation "probe"`, "timeout_seconds", "1 and 600", "601"},
+		},
+		{
+			name:      "too_many_args",
+			mutate:    func(c *config) { c.Operations[0].Args = make([]string, 257) },
+			wantParts: []string{`operation "probe"`, "too many args", "257", "256"},
+		},
+		{
+			name: "too_many_env",
+			mutate: func(c *config) {
+				env := make(map[string]string, 33)
+				for i := range 33 {
+					env["V"+string(rune('A'+i%26))+string(rune('A'+i/26))] = "tok"
+				}
+				c.Operations[0].Env = env
+			},
+			wantParts: []string{`operation "probe"`, "too many env", "33", "32"},
+		},
+		{
+			name:      "unknown_isolation",
+			mutate:    func(c *config) { c.Operations[0].Isolation = "other" },
+			wantParts: []string{`operation "probe"`, "unknown isolation", "other"},
+		},
+		{
+			name:      "network_with_full",
+			mutate:    func(c *config) { c.Operations[0].AllowNetwork = true; c.Operations[0].Isolation = "full" },
+			wantParts: []string{`operation "probe"`, "allow_network=true", `isolation="full"`},
+		},
+		{
+			name:      "arg_nul",
+			mutate:    func(c *config) { c.Operations[0].Args = []string{"ok", "bad\x00arg"} },
+			wantParts: []string{`operation "probe"`, "args[1]", "NUL"},
+		},
+		{
+			name:      "invalid_env_name",
+			mutate:    func(c *config) { c.Operations[0].Env = map[string]string{"BAD=NAME": "tok"} },
+			wantParts: []string{`operation "probe"`, "invalid env var name", "BAD=NAME"},
+		},
+		{
+			name:      "invalid_secret_name",
+			mutate:    func(c *config) { c.Operations[0].Env = map[string]string{"TOK": "meta/secret"} },
+			wantParts: []string{`operation "probe"`, `env "TOK"`, "invalid secret name", "meta/secret"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(&cfg)
+			err := validateConfig(cfg)
+			if err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+			msg := err.Error()
+			for _, part := range tc.wantParts {
+				if !strings.Contains(msg, part) {
+					t.Errorf("error = %q, missing %q", msg, part)
+				}
+			}
+		})
+	}
+}
+
+func TestBoundedStartupBuffer(t *testing.T) {
+	buf := newBoundedStartupBuffer(16)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, err := buf.Write([]byte("0123456789abcdefghij"))
+			if err != nil || n != 20 {
+				t.Errorf("Write returned (%d, %v), want (20, nil)", n, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := len(buf.String()); got != 16 {
+		t.Fatalf("buffered len = %d, want 16", got)
+	}
+	buf.Stop()
+	if got := buf.String(); got != "" {
+		t.Fatalf("Stop did not clear buffer: %q", got)
+	}
+	if n, err := buf.Write([]byte("post-stop")); err != nil || n != 9 {
+		t.Fatalf("post-stop Write = (%d, %v), want (9, nil)", n, err)
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("post-stop write was captured: %q", got)
+	}
+}
+
+func TestClassifyStartupError(t *testing.T) {
+	const sentinel = "SYNTHETIC_PRIVATE_UPSTREAM_TOKEN_999"
+	cases := []struct {
+		name       string
+		connectErr error
+		stderr     string
+		wantSub    string
+	}{
+		{
+			name:       "binary_not_found",
+			connectErr: &os.PathError{Op: "fork/exec", Path: "/secret/path/" + sentinel, Err: os.ErrNotExist},
+			wantSub:    "configured opq binary not found",
+		},
+		{
+			name:       "exec_err_not_found",
+			connectErr: exec.ErrNotFound,
+			wantSub:    "configured opq binary not found",
+		},
+		{
+			name:       "permission_denied",
+			connectErr: &os.PathError{Op: "fork/exec", Path: "/secret/path/" + sentinel, Err: fs.ErrPermission},
+			wantSub:    "configured opq binary is not executable",
+		},
+		{
+			name:       "sandbox_bwrap",
+			connectErr: errors.New("eof"),
+			stderr:     "opq: opq mcp requires a working subprocess sandbox: bubblewrap (bwrap) not found " + sentinel,
+			wantSub:    "upstream subprocess sandbox unavailable (run 'opq doctor' to diagnose)",
+		},
+		{
+			name:       "sandbox_seatbelt",
+			connectErr: errors.New("eof"),
+			stderr:     "sandbox-exec probe failed (Seatbelt disabled) " + sentinel,
+			wantSub:    "upstream subprocess sandbox unavailable (run 'opq doctor' to diagnose)",
+		},
+		{
+			name:       "timeout",
+			connectErr: context.DeadlineExceeded,
+			stderr:     sentinel,
+			wantSub:    "startup handshake timed out",
+		},
+		{
+			name:       "canceled",
+			connectErr: context.Canceled,
+			stderr:     sentinel,
+			wantSub:    "startup canceled",
+		},
+		{
+			name:       "generic_handshake_failure",
+			connectErr: errors.New("protocol mismatch " + sentinel),
+			stderr:     "private failure detail: " + sentinel,
+			wantSub:    "upstream MCP handshake failed (run 'opq doctor' to diagnose)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyStartupError(tc.connectErr, tc.stderr).Error()
+			if !strings.HasPrefix(got, "cannot connect to opq:") {
+				t.Errorf("error = %q, must start with 'cannot connect to opq:'", got)
+			}
+			if !strings.Contains(got, tc.wantSub) {
+				t.Errorf("error = %q, want substring %q", got, tc.wantSub)
+			}
+			if strings.Contains(got, sentinel) {
+				t.Errorf("raw upstream bytes leaked into startup error: %q", got)
+			}
+		})
+	}
+}
+
+func TestRunClassifiesUpstreamStartupStderrWithoutLeakingBytes(t *testing.T) {
+	dir := t.TempDir()
+	fakeOpq := filepath.Join(dir, "fake-opq.sh")
+	const sentinel = "PRIVATE_UPSTREAM_BYTES_DO_NOT_ECHO"
+	script := "#!/bin/sh\necho 'opq: opq mcp requires a working subprocess sandbox: " + sentinel + "' >&2\nexit 1\n"
+	if err := os.WriteFile(fakeOpq, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(dir, "policy.json")
+	cfg := config{Opq: fakeOpq, Operations: []operation{}}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(policyPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = run(context.Background(), policyPath)
+	if err == nil {
+		t.Fatal("expected run() to fail when fake upstream exits on sandbox error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "upstream subprocess sandbox unavailable") {
+		t.Errorf("expected sandbox hint in error, got %q", msg)
+	}
+	if strings.Contains(msg, sentinel) {
+		t.Errorf("raw upstream stderr leaked into run() error: %q", msg)
 	}
 }

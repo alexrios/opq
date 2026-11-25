@@ -56,6 +56,7 @@ example performs a local smoke check and uses no credentials:
   "operations": [
     {
       "name": "local_probe",
+      "description": "Run a local smoke check without credentials.",
       "command": "/usr/bin/true",
       "args": [],
       "env": {},
@@ -67,19 +68,25 @@ example performs a local smoke check and uses no credentials:
 }
 ```
 
-The agent sees only the `local_probe` tool and calls it with `{}`. For an authenticated
+The agent sees only the `local_probe` tool and calls it with `{}`. Each operation may
+include an optional `description` (up to 512 bytes; printable characters, spaces, and
+tabs only) to help the agent pick the right tool; the proxy appends `"Takes no arguments;
+returns status only."` to keep the contract explicit. For an authenticated
 operation, use a protected consumer program that reads the credential directly from
 its environment, then set an exact mapping such as `"env": {"API_TOKEN":"provider_token"}`.
 Keep endpoint and request behavior fixed in that reviewed program or its protected
 configuration. Secret names are references; never put values in `args` or the policy.
 
 The parser rejects unknown and duplicate JSON fields, duplicate operation names,
-relative executable paths, invalid environment mappings, and unsupported limits or
-isolation combinations. `run_with_secrets`, `list_secrets`, and `audit_tail` are reserved
+relative executable paths, invalid descriptions or environment mappings, and unsupported
+limits or isolation combinations, naming the specific operation and field in the error.
+`run_with_secrets`, `list_secrets`, and `audit_tail` are reserved
 names. Calls with any arguments are rejected by both the closed input schema and a
 runtime check. Two operations can run concurrently; excess calls fail immediately.
 Each operation has its own 1–600 second deadline. Upstream initialization is bounded
-at ten seconds. Client EOF, connection failure, and SIGTERM cancel active operation
+at ten seconds; if upstream startup fails, the proxy emits a sanitized diagnostic hint
+(never raw upstream stderr) so operators can troubleshoot with `opq doctor`. Client EOF,
+connection failure, and SIGTERM cancel active operation
 requests before the server waits for shutdown. The private upstream then receives stdin
 EOF so opq can cancel and reap consuming subprocesses; the SDK has a bounded signal
 and kill fallback if that upstream does not exit.
@@ -87,7 +94,7 @@ and kill fallback if that upstream does not exit.
 ## Review the consuming program
 
 A fixed executable and argv do not validate the program's behavior. Network-enabled
-operations require `"isolation":"net"` and remain potential egress channels. Review
+operations require `"isolation":"readonly"` (or `"isolation":"net"`) and remain potential egress channels. Review
 redirect handling, proxy environment/configuration, DNS and TLS validation, native
 configuration loading, plugins, subprocess execution, and writable inputs. Disable
 redirects and ambient proxies where the workflow does not require them. The proxy
