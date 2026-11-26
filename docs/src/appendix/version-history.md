@@ -4,7 +4,54 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
-## v1.4.0 (current)
+## v1.5.0 (current)
+
+macOS encrypted local vault (`keychain-vault`) with a single open-ACL Keychain master key
+to eliminate repeated macOS Keychain password prompts across upgrades, rebuilds, and agent
+runs, plus `opq migrate` for lossless migration from legacy per-item Keychain storage.
+
+### Upgrade notes (macOS)
+
+1. Stop running `opq mcp`, policy-proxy, and `opq exec` processes before upgrading.
+2. Upgrade `opq` (`brew upgrade opq` or `go install github.com/alexrios/opq@latest`).
+3. Run `opq migrate --dry-run` (attribute-only, zero prompts) to preview existing secrets,
+   then run `opq migrate` to move all values, TTL policies, and `REVOKED` tombstones into
+   `~/.local/share/opq/vault.enc`. Existing legacy Keychain entries remain as a backup by
+   default.
+4. Verify with `opq list` and `opq doctor`, then run `opq migrate --delete-legacy` to clean
+   up legacy Keychain entries and restart any `opq mcp` servers.
+
+Linux Secret Service users require no migration.
+
+### Changes
+
+- **macOS `keychain-vault` backend:**
+  - Stores secrets and companion `meta/<name>` policy metadata in a single AES-256-GCM
+    authenticated-encrypted local vault (`<OS-account-home>/.local/share/opq/vault.enc`,
+    mode `0600`, atomic temp-file + `fsync` + rename under `vault.lock`, symlink-refused,
+    and strictly read-only on fresh installs).
+  - Encrypts the vault under a single 256-bit master key stored in the login Keychain
+    (`service="opq-vault"`, `account="master-key"`, `kSecAttrAccessibleWhenUnlocked`,
+    non-synchronizable) with an open application ACL (`SecACLSetContents` with `NULL`
+    application list), giving macOS parity with Linux Secret Service so Homebrew upgrades
+    and local rebuilds never trigger repeated Keychain password prompts.
+  - Fails closed if `vault.enc` exists while its Keychain master key is missing, on any
+    ciphertext/AAD tampering, or when built without CGO on darwin.
+- **Sandbox hardening:**
+  - macOS Seatbelt (`SandboxNet`, `SandboxNetAllowed`, `SandboxFull`) and Linux bubblewrap
+    mask the vault directory (`~/.local/share/opq`) so sandboxed AI subprocesses cannot
+    read `vault.enc`.
+- **Migration & diagnostics:**
+  - Adds `opq migrate [--dry-run] [--overwrite] [--delete-legacy]` (with `action="migrate"`
+    audit logging and bash/zsh/fish shell completions) to migrate legacy macOS Keychain
+    entries atomically under `policy.lock` while preserving TTLs, `REVOKED` tombstones,
+    and `UPDATE-PENDING` markers.
+  - `opq doctor` adds a read-only `vault` health check on macOS and detects unmigrated
+    legacy Keychain secrets (via attribute-only queries, never prompting).
+  - CLI `list`, `exec`, `get`, and `info` surface non-prompting migration hints when
+    legacy macOS Keychain items are present.
+
+## v1.4.0
 
 CLI ergonomics, diagnostic and completion commands, MCP and policy-proxy usability
 improvements, and refreshed documentation.

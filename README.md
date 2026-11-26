@@ -3,7 +3,7 @@
 [![Install with Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20alexrios%2Ftap%2Fopq-FBB040?logo=homebrew&logoColor=white)](https://github.com/alexrios/homebrew-tap)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-> **Status:** v1.4.0. Linux (Secret Service) and macOS (Keychain) supported.
+> **Status:** v1.5.0. Linux (Secret Service) and macOS (encrypted local vault + Keychain master key) supported.
 
 An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them with output redaction against accidental disclosure. Invoked as `opq`.
 
@@ -31,7 +31,7 @@ opq doctor
 Keyring backend by platform:
 
 - **Linux:** an unlocked Secret Service session (gnome-keyring / KWallet / KeePassXC).
-- **macOS:** the login Keychain (no extra install). The binary must be built with CGO enabled (the default for `go install` on macOS; needs the Xcode Command Line Tools) so it can link the Security framework.
+- **macOS:** an AES-256-GCM encrypted local vault (`~/.local/share/opq/vault.enc`, mode `0600`) whose single master key lives in the login Keychain (`opq-vault` / `master-key`, open app ACL so upgrades and rebuilds never trigger repeated Keychain password prompts). Run `opq migrate` if upgrading from an earlier release that stored secrets directly in Keychain. The binary must be built with CGO enabled (the default for `go install` on macOS; needs the Xcode Command Line Tools) so it can link the Security framework.
 
 The MCP sandbox is implemented on both Linux (via **bubblewrap**, `bwrap`) and macOS (via `sandbox-exec` / Seatbelt, built in); other platforms accept only `--sandbox=none`.
 
@@ -100,6 +100,10 @@ The full documentation lives in the mdbook, published at **<https://alexrios.git
 mise run docs        # build to docs/book/
 mise run docs:serve  # live-reload preview at http://localhost:3000
 ```
+
+## Upgrade to v1.5.0 (macOS)
+
+macOS now stores secrets in an AES-256-GCM encrypted local vault (`~/.local/share/opq/vault.enc`) keyed by a single open-ACL master key in the login Keychain (`opq-vault`), eliminating per-secret password prompts after upgrades and rebuilds. Stop running `opq mcp` servers, upgrade, run `opq migrate` to copy existing Keychain secrets (with TTL and revocation metadata preserved), verify with `opq list` and `opq doctor`, and then optionally run `opq migrate --delete-legacy`. See the [release and upgrade notes](https://alexrios.github.io/opq/appendix/version-history.html#v150-current).
 
 ## Upgrade to v1.3.0
 

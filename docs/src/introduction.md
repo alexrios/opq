@@ -12,8 +12,8 @@ receives plaintext in its environment, which may be inspectable by privileged or
 same-user processes depending on the operating system. The AI-safety properties
 build on that base.
 
-Status: v1.4.0. Supported on Linux (Secret Service) and macOS (Keychain), licensed under
-the GNU AGPL-3.0.
+Status: v1.5.0. Supported on Linux (Secret Service) and macOS (encrypted local vault +
+Keychain master key), licensed under the GNU AGPL-3.0.
 
 ## The problem
 
