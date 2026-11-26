@@ -127,6 +127,39 @@ func TestSandboxNet_MasksAuditDir(t *testing.T) {
 	}
 }
 
+// TestSandbox_MasksVaultDir locks the invariant that every non-None Seatbelt
+// profile denies reads of the encrypted local vault directory (vault.enc)
+// without creating the directory on a fresh install.
+func TestSandbox_MasksVaultDir(t *testing.T) {
+	if _, err := exec.LookPath("true"); err != nil {
+		t.Skip("true not present")
+	}
+	tmpHome := t.TempDir()
+	origHome := policyHomeDir
+	policyHomeDir = func() (string, error) { return tmpHome, nil }
+	t.Cleanup(func() { policyHomeDir = origHome })
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmpHome, "state"))
+
+	wantVaultDir, err := canonicalSandboxPath(filepath.Join(tmpHome, ".local", "share", "opq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRule := `(deny file-read* (subpath "` + wantVaultDir + `"))`
+
+	for _, profile := range []SandboxProfile{SandboxNet, SandboxNetAllowed, SandboxFull} {
+		t.Run(profile.String(), func(t *testing.T) {
+			_, gotArgs, err := WrapCommand(profile, "true", nil)
+			if err != nil {
+				t.Fatalf("WrapCommand(%s): %v", profile, err)
+			}
+			sbpl, _ := seatbeltProfile(t, gotArgs)
+			if !strings.Contains(sbpl, wantRule) {
+				t.Errorf("%s profile missing vault-dir mask %q:\n%s", profile, wantRule, sbpl)
+			}
+		})
+	}
+}
+
 // TestSandboxNet_FailsClosedOnUnresolvableAuditDir mirrors the Linux contract:
 // if the audit dir can't be resolved (no XDG_STATE_HOME and no HOME),
 // WrapCommand must fail closed with an empty argv rather than silently omit the

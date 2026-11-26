@@ -10,14 +10,15 @@ import (
 	"github.com/awnumar/memguard"
 )
 
-// Backend abstracts a secrets store. It is implemented over 99designs/keyring
-// against the platform's native store: Secret Service on Linux (backend_linux.go)
-// and the macOS Keychain on darwin (backend_darwin.go); other OSes have no
-// backend (backend_other.go). Future backends (e.g. Proton Pass) implement this
-// same interface.
+// Backend abstracts a secrets store. On Linux it is implemented over
+// 99designs/keyring against Secret Service (backend_linux.go); on macOS it uses
+// an AES-256-GCM encrypted local vault (vault.go) whose single open-ACL master
+// key is stored in the login Keychain (backend_darwin.go /
+// keychain_master_darwin.go); other OSes have no backend (backend_other.go).
+// Future backends (e.g. Proton Pass) implement this same interface.
 // Native keyring APIs do not accept contexts. Checks around each call prevent
 // starting work or returning secret bytes after cancellation, but an in-flight
-// OS keyring prompt cannot be interrupted by the caller context.
+// OS keyring call cannot be interrupted by the caller context.
 type Backend interface {
 	Name() string
 	Get(ctx context.Context, name string) (*Buffer, error)
@@ -38,9 +39,8 @@ const (
 
 // OpenDefaultBackend opens the platform-default secrets store. The
 // implementation is per-OS (backend_linux.go / backend_darwin.go /
-// backend_other.go): each opens 99designs/keyring restricted to a single
-// allowed backend so opq never silently falls back to an unencrypted file
-// store, and wraps it in keyringBackend.
+// backend_other.go): opq never silently falls back to an unencrypted file
+// store.
 
 type keyringBackend struct {
 	kr   keyring.Keyring

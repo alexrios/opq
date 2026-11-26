@@ -153,6 +153,23 @@ func buildSeatbeltProfile(profile SandboxProfile) (string, error) {
 	}
 	b.WriteString(sbplSensitivePathDeny(sbplSubpath(policyDir)))
 
+	// Mask the encrypted local vault directory across all sandbox profiles so a
+	// sandboxed subprocess can never read vault.enc (even under SandboxNetAllowed
+	// or when the OS account home lives outside /Users). Resolved via
+	// canonicalSandboxPath without creating the directory on fresh installs.
+	vDir, err := vaultDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve vault dir for sandbox mask: %w", err)
+	}
+	if li, lerr := os.Lstat(vDir); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("vault dir %q is a symlink, refusing", vDir)
+	}
+	vaultMaskPath, err := canonicalSandboxPath(vDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve vault dir for sandbox mask: %w", err)
+	}
+	b.WriteString(sbplSensitivePathDeny(sbplSubpath(vaultMaskPath)))
+
 	switch profile {
 	case SandboxNet, SandboxNetAllowed:
 		if profile == SandboxNet {

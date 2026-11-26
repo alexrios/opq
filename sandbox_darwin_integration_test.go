@@ -234,7 +234,11 @@ func TestSandboxSeatbelt_HomeReadRestrictions(t *testing.T) {
 }
 
 func TestSandboxSeatbelt_StateDirectoriesMasked(t *testing.T) {
-	withAuditTmpDir(t)
+	root := withAuditTmpDir(t)
+	origHome := policyHomeDir
+	policyHomeDir = func() (string, error) { return filepath.Join(root, "account-home"), nil }
+	t.Cleanup(func() { policyHomeDir = origHome })
+
 	auditPath, err := auditLogPath()
 	if err != nil {
 		t.Fatal(err)
@@ -243,8 +247,16 @@ func TestSandboxSeatbelt_StateDirectoriesMasked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	vDir, err := vaultDir()
+	if err != nil {
+		t.Fatal(err)
+	}
 	const marker = "opq-synthetic-private-state"
-	targets := []string{auditPath, filepath.Join(policyDir, "synthetic.txt")}
+	targets := []string{
+		auditPath,
+		filepath.Join(policyDir, "synthetic.txt"),
+		filepath.Join(vDir, vaultFileName),
+	}
 	for _, target := range targets {
 		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 			t.Fatal(err)
@@ -254,7 +266,7 @@ func TestSandboxSeatbelt_StateDirectoriesMasked(t *testing.T) {
 		}
 		out, err := runSeatbeltSandbox(t, SandboxNone, "/bin/cat", target)
 		if err != nil || out != marker {
-			t.Fatalf("state fixture control failed: %v out=%q", err, out)
+			t.Fatalf("state fixture control failed for %s: %v out=%q", target, err, out)
 		}
 	}
 	for _, profile := range []SandboxProfile{SandboxNet, SandboxNetAllowed, SandboxFull} {
@@ -262,7 +274,7 @@ func TestSandboxSeatbelt_StateDirectoriesMasked(t *testing.T) {
 			for _, target := range targets {
 				out, err := runSeatbeltSandbox(t, profile, "/bin/cat", target)
 				if err == nil || strings.Contains(out, marker) {
-					t.Fatalf("state dir readable: %v out=%q", err, out)
+					t.Fatalf("state/vault path %s readable under %s: %v out=%q", target, profile, err, out)
 				}
 			}
 		})

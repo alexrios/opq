@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -358,6 +359,26 @@ func filterVisibleSecretNames(keys []string) []string {
 		}
 		out = append(out, k)
 	}
+	return out
+}
+
+// collectLogicalSecretNames deduplicates and sorts logical secret names from a
+// raw backend keyspace containing both value keys ("foo") and companion policy
+// keys ("meta/foo", including revoked tombstones whose value key was wiped).
+func collectLogicalSecretNames(keys []string) []string {
+	seen := make(map[string]bool, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		name := k
+		if base, ok := secretNameFromMetaKey(k); ok {
+			name = base
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 

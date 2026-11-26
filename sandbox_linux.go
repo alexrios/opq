@@ -372,6 +372,13 @@ func WrapCommand(profile SandboxProfile, cmd string, args []string) (string, []s
 		}
 		bwArgs = sandboxNetArgvCommon(auditDir)
 		bwArgs = append(bwArgs, "--tmpfs", policyDir)
+		if vDir, verr := vaultDir(); verr == nil {
+			if st, serr := os.Stat(vDir); serr == nil && st.IsDir() {
+				if realVault, rerr := filepath.EvalSymlinks(vDir); rerr == nil {
+					bwArgs = append(bwArgs, "--tmpfs", realVault)
+				}
+			}
+		}
 		if profile == SandboxNet {
 			// SandboxNet adds the netns; without it (SandboxNetAllowed) the
 			// child keeps host network reachability.
