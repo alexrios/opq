@@ -117,6 +117,24 @@ func TestCLI_NewCommandsRegisteredInKong(t *testing.T) {
 				}
 			},
 		},
+		{
+			args:        []string{"migrate", "slack_token", "notion_token", "--delete-legacy"},
+			wantCommand: "migrate <names>",
+			check: func(t *testing.T, cli *CLI) {
+				if len(cli.Migrate.Names) != 2 || cli.Migrate.Names[0] != "slack_token" || cli.Migrate.Names[1] != "notion_token" || !cli.Migrate.DeleteLegacy {
+					t.Errorf("unexpected selective Migrate fields: %+v", cli.Migrate)
+				}
+			},
+		},
+		{
+			args:        []string{"list", "--status", "legacy"},
+			wantCommand: "list",
+			check: func(t *testing.T, cli *CLI) {
+				if cli.List.Status != "legacy" {
+					t.Errorf("List.Status = %q, want legacy", cli.List.Status)
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {

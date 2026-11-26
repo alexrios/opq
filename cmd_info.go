@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
+	"slices"
 	"text/tabwriter"
 	"time"
 
@@ -55,12 +55,7 @@ func defaultInfoDeps() infoDeps {
 }
 
 func (c *InfoCmd) Run() error {
-	ctx := context.Background()
-	err := runInfo(ctx, c.Name, c.JSON, defaultInfoDeps())
-	if err != nil && validSecretName(c.Name) && strings.Contains(err.Error(), "not found") && legacyKeychainHasSecret(ctx, c.Name) {
-		return fmt.Errorf("%w (found in legacy macOS Keychain; run 'opq migrate')", err)
-	}
-	return err
+	return runInfo(context.Background(), c.Name, c.JSON, defaultInfoDeps())
 }
 
 // runInfo inspects metadata for a single secret without ever reading its
@@ -113,6 +108,30 @@ func runInfo(ctx context.Context, name string, asJSON bool, deps infoDeps) error
 		}
 	}
 	if !hasValue && !hasMeta {
+		if mig, ok := backend.(legacyMigrator); ok {
+			if legacyKeys, lerr := mig.ListLegacyKeys(ctx); lerr == nil {
+				legacyHasVal := slices.Contains(legacyKeys, name)
+				legacyHasMeta := slices.Contains(legacyKeys, mk)
+				if legacyHasVal || legacyHasMeta {
+					_ = deps.appendAudit(AuditEvent{Action: ActionList, SecretName: name, Caller: callerTag()})
+					info := secretInfo{
+						Name:     name,
+						Backend:  "keychain-legacy",
+						Status:   "legacy",
+						HasValue: legacyHasVal,
+					}
+					if asJSON {
+						enc := json.NewEncoder(deps.stdout)
+						enc.SetIndent("", "  ")
+						if err := enc.Encode(info); err != nil {
+							return fmt.Errorf("encode secret info: %w", err)
+						}
+						return nil
+					}
+					return infoRenderText(deps.stdout, info, deps.now().UTC(), deps.isTTY && !deps.noColor)
+				}
+			}
+		}
 		return fmt.Errorf("secret %q not found; run 'opq list' to see stored secrets", name)
 	}
 
@@ -212,6 +231,8 @@ func infoRenderText(w io.Writer, info secretInfo, now time.Time, useColor bool) 
 		fmt.Fprintf(tw, "Hint:\trun 'opq prune' to remove expired secrets or 'opq set %s' to rotate\n", info.Name)
 	case "REVOKED":
 		fmt.Fprintf(tw, "Hint:\tvalue wiped; run 'opq delete %s' to clear tombstone or 'opq set %s' to store a new value\n", info.Name, info.Name)
+	case "legacy":
+		fmt.Fprintf(tw, "Hint:\tstored in legacy macOS Keychain; auto-migrates on first use ('opq exec' / MCP), or run 'opq migrate %s'\n", info.Name)
 	}
 
 	return tw.Flush()

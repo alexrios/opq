@@ -230,7 +230,7 @@ func doctorCheckKeyring(ctx context.Context, deps doctorDeps) (doctorCheck, Back
 				Status:  doctorWarn,
 				Summary: fmt.Sprintf("%s (%d %s; %d legacy Keychain %s pending migration)", backend.Name(), len(visible), doctorPlural(len(visible), "secret", "secrets"), legacyN, doctorPlural(legacyN, "secret", "secrets")),
 				Remediation: []string{
-					fmt.Sprintf("run 'opq migrate' to move %d legacy macOS Keychain %s into the encrypted local vault", legacyN, doctorPlural(legacyN, "secret", "secrets")),
+					fmt.Sprintf("%d legacy macOS Keychain %s will auto-migrate on first use, or run 'opq migrate [name...]' to migrate now", legacyN, doctorPlural(legacyN, "secret", "secrets")),
 				},
 				Details: details,
 			}, backend, keys

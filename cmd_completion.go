@@ -79,7 +79,7 @@ _opq_completions() {
             return 0
             ;;
         --status)
-            COMPREPLY=( $(compgen -W "all active expired revoked pending" -- "$cur") )
+            COMPREPLY=( $(compgen -W "all active expired revoked pending legacy" -- "$cur") )
             return 0
             ;;
         --caller)
@@ -147,7 +147,7 @@ _opq_completions() {
     fi
 
     case "$cmd" in
-        set|get|info|delete|revoke)
+        set|get|info|delete|revoke|migrate)
             COMPREPLY=( $(compgen -W "$(_opq_secret_names)" -- "$cur") )
             ;;
         completion)
@@ -227,7 +227,7 @@ _opq() {
                     _arguments \
                         '(-l --long)'{-l,--long}'[Show detailed status and timestamps]' \
                         '--json[Output as JSON]' \
-                        '--status[Filter by status]:status:(all active expired revoked pending)' \
+                        '--status[Filter by status]:status:(all active expired revoked pending legacy)' \
                         '--help[Show help]'
                     ;;
                 info)
@@ -280,7 +280,8 @@ _opq() {
                         '--dry-run[Preview legacy Keychain secrets without modifying storage]' \
                         '--overwrite[Overwrite secrets that already exist in the vault]' \
                         '--delete-legacy[Remove migrated copies from the legacy macOS Keychain]' \
-                        '--help[Show help]'
+                        '--help[Show help]' \
+                        '*:secret:_opq_secret_names'
                     ;;
                 completion)
                     _arguments \
@@ -352,7 +353,7 @@ complete -c opq -f -n '__fish_seen_subcommand_from get' -a '(__opq_secret_names)
 # list
 complete -c opq -f -n '__fish_seen_subcommand_from list' -s l -l long -d 'Show detailed status and timestamps'
 complete -c opq -f -n '__fish_seen_subcommand_from list' -l json -d 'Output as JSON'
-complete -c opq -f -n '__fish_seen_subcommand_from list' -l status -x -a 'all active expired revoked pending' -d 'Filter by status'
+complete -c opq -f -n '__fish_seen_subcommand_from list' -l status -x -a 'all active expired revoked pending legacy' -d 'Filter by status'
 complete -c opq -f -n '__fish_seen_subcommand_from list' -l help -d 'Show help'
 
 # info
@@ -397,6 +398,7 @@ complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l dry-run -d 'Previ
 complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l overwrite -d 'Overwrite secrets that already exist in the vault'
 complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l delete-legacy -d 'Remove migrated copies from the legacy macOS Keychain'
 complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l help -d 'Show help'
+complete -c opq -f -n '__fish_seen_subcommand_from migrate' -a '(__opq_secret_names)'
 
 # completion
 complete -c opq -f -n '__fish_seen_subcommand_from completion' -l help -d 'Show help'

@@ -63,9 +63,6 @@ func (c *GetCmd) Run() error {
 	val, err := resolveSecret(ctx, backend, c.Name, time.Now().UTC())
 	if err != nil {
 		_ = AppendAudit(AuditEvent{Action: ActionDenied, SecretName: c.Name, Caller: callerTag(), Message: sanitizePolicyErr(err)})
-		if errors.Is(err, ErrSecretNotFound) && legacyKeychainHasSecret(ctx, c.Name) {
-			return fmt.Errorf("%w (found in legacy macOS Keychain; run 'opq migrate' to move secrets into the encrypted vault)", err)
-		}
 		return err
 	}
 	defer val.Destroy()

@@ -13,7 +13,7 @@ import (
 type ListCmd struct {
 	Long   bool   `name:"long" short:"l" help:"Show detailed metadata columns (status, created, expires/revoked). Never reads secret values."`
 	JSON   bool   `name:"json" help:"Output a JSON array of secret metadata. Never includes secret values."`
-	Status string `name:"status" enum:"all,active,expired,revoked,pending" default:"all" help:"Filter secrets by status: all, active, expired, revoked, or pending."`
+	Status string `name:"status" enum:"all,active,expired,revoked,pending,legacy" default:"all" help:"Filter secrets by status: all, active, expired, revoked, pending, or legacy."`
 }
 
 // listJSONEntry is the structured JSON representation emitted by `opq list --json`.
@@ -41,10 +41,10 @@ func validateListStatusFilter(status string) (string, error) {
 		return "all", nil
 	}
 	switch status {
-	case "all", "active", "expired", "revoked", "pending":
+	case "all", "active", "expired", "revoked", "pending", "legacy":
 		return status, nil
 	default:
-		return "", fmt.Errorf("invalid --status %q (want all|active|expired|revoked|pending)", status)
+		return "", fmt.Errorf("invalid --status %q (want all|active|expired|revoked|pending|legacy)", status)
 	}
 }
 
@@ -90,7 +90,7 @@ func (c *ListCmd) Run() error {
 	}
 	if uiIsTTY(os.Stdout) && !c.JSON {
 		if n, err := legacyKeychainCount(ctx); err == nil && n > 0 {
-			fmt.Fprintf(os.Stderr, "note: %d legacy macOS Keychain secret(s) not yet migrated; run 'opq migrate'\n", n)
+			fmt.Fprintf(os.Stderr, "note: %d legacy macOS Keychain secret(s) will auto-migrate on first use (or run 'opq migrate [name...]')\n", n)
 		}
 	}
 	return nil
@@ -118,19 +118,34 @@ func (c *ListCmd) runWith(ctx context.Context, backend Backend, stdout, stderr i
 	// companion "meta/<name>" policy items. Build the display set: every real
 	// secret, plus any name that exists only as a tombstone (its value was
 	// wiped by `opq revoke` but the record survives).
-	seen := map[string]bool{}
+	vaultSeen := map[string]bool{}
 	var names []string
-	add := func(n string) {
-		if !seen[n] {
-			seen[n] = true
+	addVault := func(n string) {
+		if !vaultSeen[n] {
+			vaultSeen[n] = true
 			names = append(names, n)
 		}
 	}
 	for _, k := range keys {
 		if name, ok := secretNameFromMetaKey(k); ok {
-			add(name)
+			addVault(name)
 		} else {
-			add(k)
+			addVault(k)
+		}
+	}
+
+	// On macOS keychain-vault, also include unmigrated legacy Keychain secret
+	// names via attribute-only listing (never reading data or prompting). Vault
+	// entries always take precedence over legacy names.
+	legacyOnly := map[string]bool{}
+	if mig, ok := backend.(legacyMigrator); ok {
+		if legacyKeys, lerr := mig.ListLegacyKeys(ctx); lerr == nil {
+			for _, ln := range collectLogicalSecretNames(legacyKeys) {
+				if !vaultSeen[ln] && !legacyOnly[ln] {
+					legacyOnly[ln] = true
+					names = append(names, ln)
+				}
+			}
 		}
 	}
 	sort.Strings(names)
@@ -138,9 +153,19 @@ func (c *ListCmd) runWith(ctx context.Context, backend Backend, stdout, stderr i
 	allRows := make([]listRow, 0, len(names))
 	filtered := make([]listRow, 0, len(names))
 	for _, n := range names {
-		// NEVER read the secret value itself; only companion policy metadata.
-		m, merr := loadMeta(ctx, backend, n)
-		row := classifyListRow(n, m, merr, now)
+		var row listRow
+		if legacyOnly[n] {
+			// NEVER read legacy Keychain metadata/values during list (zero prompts).
+			row = listRow{
+				name:      n,
+				category:  "legacy",
+				rawStatus: "legacy",
+			}
+		} else {
+			// NEVER read the secret value itself; only companion policy metadata.
+			m, merr := loadMeta(ctx, backend, n)
+			row = classifyListRow(n, m, merr, now)
+		}
 		allRows = append(allRows, row)
 		if filter == "all" || row.category == filter {
 			filtered = append(filtered, row)
@@ -251,6 +276,8 @@ func listTTYStatusCell(r listRow, now time.Time, styler uiStyler) uiCell {
 		return uiCell{text: "REVOKED", style: styler.red}
 	case "expired":
 		return uiCell{text: "EXPIRED", style: styler.yellow}
+	case "legacy":
+		return uiCell{text: "legacy (auto-migrates on use)", style: styler.dim}
 	default:
 		if r.meta.HasExpiry() {
 			return uiCell{text: uiFormatExpiry(r.meta.ExpiresAt, now)}
@@ -269,6 +296,8 @@ func listLongStatusCell(r listRow, styler uiStyler) (string, func(string) string
 		return "REVOKED", styler.red
 	case "expired":
 		return "EXPIRED", styler.yellow
+	case "legacy":
+		return "legacy", styler.dim
 	default:
 		return "active", styler.green
 	}
@@ -280,6 +309,8 @@ func listLongExpiryCell(r listRow, now time.Time) string {
 		return "metadata unreadable"
 	case "pending":
 		return "incomplete update (retry set or delete)"
+	case "legacy":
+		return "auto-migrates on first use"
 	case "revoked":
 		if r.meta != nil && !r.meta.RevokedAt.IsZero() {
 			return "revoked " + uiFormatUTC(r.meta.RevokedAt)

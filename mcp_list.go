@@ -34,8 +34,14 @@ func handleListSecrets(ctx context.Context, _ *mcp.CallToolRequest, _ listSecret
 	if err != nil {
 		return aiErr("backend_error"), listSecretsOutput{}, nil
 	}
-	// backend.List returns raw keys including companion "meta/" items; the AI
-	// must never see the scheme or a revoked secret's surviving tombstone.
+	if mig, ok := backend.(legacyMigrator); ok {
+		if legacyKeys, lerr := mig.ListLegacyKeys(ctx); lerr == nil && len(legacyKeys) > 0 {
+			names = mergeKeysWithLegacy(names, legacyKeys)
+		}
+	}
+	// backend.List (and legacy attribute listing) returns raw keys including
+	// companion "meta/" items; the AI must never see the scheme or a revoked
+	// secret's surviving tombstone.
 	visible := filterVisibleSecretNames(names)
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(visible, "\n")}},

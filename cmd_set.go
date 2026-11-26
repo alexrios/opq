@@ -92,12 +92,16 @@ func trimTrailingNewlines(b []byte) []byte {
 // existingSecretState captures a secret's current presence and policy metadata
 // WITHOUT ever reading the plaintext secret value.
 type existingSecretState struct {
-	hasKey  bool
-	meta    *SecretMeta
-	metaErr error
+	hasKey   bool
+	isLegacy bool
+	meta     *SecretMeta
+	metaErr  error
 }
 
 func (s existingSecretState) isLiveAt(now time.Time) bool {
+	if s.isLegacy {
+		return true
+	}
 	if !s.hasKey || s.metaErr != nil {
 		return false
 	}
@@ -109,7 +113,8 @@ func (s existingSecretState) isLiveAt(now time.Time) bool {
 
 // inspectExistingSecret checks key presence (via List) and companion metadata
 // (via loadMeta) under a shared policy lock. It NEVER calls backend.Get on the
-// secret key itself.
+// secret key itself, and on macOS checks legacy Keychain presence using
+// attribute-only listing (zero prompts).
 func inspectExistingSecret(ctx context.Context, backend Backend, name string) (existingSecretState, error) {
 	unlock, err := lockPolicy(ctx, false)
 	if err != nil {
@@ -123,10 +128,19 @@ func inspectExistingSecret(ctx context.Context, backend Backend, name string) (e
 	}
 	hasKey := slices.Contains(keys, name)
 	meta, metaErr := loadMeta(ctx, backend, name)
+	isLegacy := false
+	if !hasKey && meta == nil && metaErr == nil {
+		if mig, ok := backend.(legacyMigrator); ok {
+			if legacyKeys, lerr := mig.ListLegacyKeys(ctx); lerr == nil {
+				isLegacy = slices.Contains(legacyKeys, name) || slices.Contains(legacyKeys, metaKey(name))
+			}
+		}
+	}
 	return existingSecretState{
-		hasKey:  hasKey,
-		meta:    meta,
-		metaErr: metaErr,
+		hasKey:   hasKey,
+		isLegacy: isLegacy,
+		meta:     meta,
+		metaErr:  metaErr,
 	}, nil
 }
 
@@ -149,6 +163,9 @@ func (c *SetCmd) validateFlags() (time.Duration, error) {
 
 func checkSetPreconditions(name string, existing existingSecretState, now time.Time, noClobber, keepTTL bool) (time.Time, error) {
 	if noClobber {
+		if existing.isLegacy {
+			return time.Time{}, fmt.Errorf("secret %q already exists in legacy macOS Keychain (omit --no-clobber to overwrite or run 'opq migrate %s')", name, name)
+		}
 		if existing.hasKey && existing.metaErr != nil {
 			return time.Time{}, fmt.Errorf("secret %q already exists with unreadable metadata; refusing --no-clobber (run 'opq delete %s' to clear)", name, name)
 		}
@@ -157,6 +174,9 @@ func checkSetPreconditions(name string, existing existingSecretState, now time.T
 		}
 	}
 	if keepTTL {
+		if existing.isLegacy {
+			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: secret %q is still in legacy macOS Keychain; run 'opq migrate %s' first or pass --ttl", name, name)
+		}
 		if existing.metaErr != nil {
 			return time.Time{}, fmt.Errorf("cannot use --keep-ttl: unreadable metadata for %q: %w", name, existing.metaErr)
 		}
@@ -182,6 +202,8 @@ func checkSetPreconditions(name string, existing existingSecretState, now time.T
 
 func printSetExistingNote(stderr io.Writer, name string, existing existingSecretState, now time.Time, ttl time.Duration, keepTTL bool) {
 	switch {
+	case existing.isLegacy:
+		fmt.Fprintf(stderr, "note: replacing legacy macOS Keychain secret %q into encrypted vault\n", name)
 	case existing.metaErr != nil:
 		fmt.Fprintf(stderr, "note: secret %q has unreadable metadata; storing will replace it\n", name)
 	case existing.meta != nil && existing.meta.Pending:

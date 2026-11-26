@@ -206,3 +206,44 @@ func TestMigrate_OverwriteClearsStaleMetadataAndDeletesLegacy(t *testing.T) {
 		t.Fatalf("legacy item not deleted: %v", lKeys)
 	}
 }
+
+func TestMigrate_SelectiveNames(t *testing.T) {
+	ctx := t.Context()
+	legacy := newMemBackend(t)
+	vault, _ := newTestVaultBackend(t, nil)
+
+	mustSet(t, legacy, "keep_legacy", "VAL_KEEP")
+	mustSet(t, legacy, "move_me", "VAL_MOVE")
+
+	deps := migrateDeps{
+		lockPolicy:  func(context.Context, bool) (func(), error) { return func() {}, nil },
+		appendAudit: func(AuditEvent) error { return nil },
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := &MigrateCmd{Names: []string{"move_me"}, DeleteLegacy: true}
+	if err := cmd.runWith(ctx, legacy, vault, &stdout, &stderr, deps); err != nil {
+		t.Fatalf("selective migrate failed: %v", err)
+	}
+
+	got, err := vault.Get(ctx, "move_me")
+	if err != nil || string(got.Bytes()) != "VAL_MOVE" {
+		t.Fatalf("move_me not migrated: err=%v", err)
+	}
+	got.Destroy()
+	if _, err := vault.Get(ctx, "keep_legacy"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("keep_legacy should not have been migrated: err=%v", err)
+	}
+	if _, err := legacy.Get(ctx, "keep_legacy"); err != nil {
+		t.Fatalf("keep_legacy should still be in legacy: %v", err)
+	}
+	if _, err := legacy.Get(ctx, "move_me"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("move_me should have been removed from legacy: %v", err)
+	}
+
+	// Requesting a nonexistent name returns an error.
+	stdout.Reset()
+	stderr.Reset()
+	if err := (&MigrateCmd{Names: []string{"does_not_exist"}}).runWith(ctx, legacy, vault, &stdout, &stderr, deps); err == nil {
+		t.Fatal("expected error for missing selective migrate name")
+	}
+}
