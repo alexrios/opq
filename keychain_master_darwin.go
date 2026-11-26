@@ -235,6 +235,82 @@ static void opq_zero_and_free(void *ptr, CFIndex len) {
 		free(ptr);
 	}
 }
+
+// opq_keychain_delete_item removes a generic-password item by fetching its
+// SecKeychainItemRef (attributes/ref only, never decrypting data) and calling
+// SecKeychainItemDelete. Unlike SecItemDelete—which fails with
+// errSecInvalidOwnerEdit (-25244) on legacy items created by an older binary
+// CDHash—SecKeychainItemDelete succeeds across binaries with zero prompts,
+// matching Apple's `/usr/bin/security delete-generic-password`.
+static OSStatus opq_keychain_delete_item(
+	const char *keychainPath,
+	const char *service,
+	const char *account
+) {
+	CFStringRef cfService = CFStringCreateWithCString(kCFAllocatorDefault, service, kCFStringEncodingUTF8);
+	CFStringRef cfAccount = CFStringCreateWithCString(kCFAllocatorDefault, account, kCFStringEncodingUTF8);
+	if (!cfService || !cfAccount) {
+		if (cfService) CFRelease(cfService);
+		if (cfAccount) CFRelease(cfAccount);
+		return errSecAllocate;
+	}
+
+	SecKeychainRef kcRef = NULL;
+	CFArrayRef searchList = NULL;
+	OSStatus status = errSecSuccess;
+	if (keychainPath != NULL && keychainPath[0] != '\0') {
+		status = SecKeychainOpen(keychainPath, &kcRef);
+		if (status != errSecSuccess) {
+			CFRelease(cfService);
+			CFRelease(cfAccount);
+			return status;
+		}
+		const void *values[1] = { kcRef };
+		searchList = CFArrayCreate(kCFAllocatorDefault, values, 1, &kCFTypeArrayCallBacks);
+		if (!searchList) {
+			CFRelease(kcRef);
+			CFRelease(cfService);
+			CFRelease(cfAccount);
+			return errSecAllocate;
+		}
+	}
+
+	CFMutableDictionaryRef query = CFDictionaryCreateMutable(
+		kCFAllocatorDefault, 0,
+		&kCFTypeDictionaryKeyCallBacks,
+		&kCFTypeDictionaryValueCallBacks
+	);
+	if (!query) {
+		if (searchList) CFRelease(searchList);
+		if (kcRef) CFRelease(kcRef);
+		CFRelease(cfService);
+		CFRelease(cfAccount);
+		return errSecAllocate;
+	}
+
+	CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
+	CFDictionarySetValue(query, kSecAttrService, cfService);
+	CFDictionarySetValue(query, kSecAttrAccount, cfAccount);
+	CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
+	CFDictionarySetValue(query, kSecReturnRef, kCFBooleanTrue);
+	if (searchList != NULL) {
+		CFDictionarySetValue(query, kSecMatchSearchList, searchList);
+	}
+
+	CFTypeRef ref = NULL;
+	status = SecItemCopyMatching(query, &ref);
+	if (status == errSecSuccess && ref != NULL) {
+		status = SecKeychainItemDelete((SecKeychainItemRef)ref);
+		CFRelease(ref);
+	}
+
+	CFRelease(query);
+	if (searchList) CFRelease(searchList);
+	if (kcRef) CFRelease(kcRef);
+	CFRelease(cfService);
+	CFRelease(cfAccount);
+	return status;
+}
 */
 import "C"
 
@@ -356,6 +432,34 @@ func (s *keychainMasterKeyStore) Create(ctx context.Context, key *memguard.Locke
 	}
 	if status != C.errSecSuccess {
 		return fmt.Errorf("macOS Keychain store master key failed (OSStatus %d)", int(status))
+	}
+	return ctx.Err()
+}
+
+// deleteKeychainGenericPassword removes a generic-password item from the macOS
+// Keychain using SecKeychainItemDelete so cross-binary cleanup succeeds with
+// zero password prompts (avoiding SecItemDelete's -25244 error across CDHashes).
+func deleteKeychainGenericPassword(ctx context.Context, keychainPath, service, account string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cService := C.CString(service)
+	defer C.free(unsafe.Pointer(cService))
+	cAccount := C.CString(account)
+	defer C.free(unsafe.Pointer(cAccount))
+
+	var cPath *C.char
+	if keychainPath != "" {
+		cPath = C.CString(keychainPath)
+		defer C.free(unsafe.Pointer(cPath))
+	}
+
+	status := C.opq_keychain_delete_item(cPath, cService, cAccount)
+	if status == C.errSecItemNotFound {
+		return ErrSecretNotFound
+	}
+	if status != C.errSecSuccess {
+		return fmt.Errorf("macOS Keychain delete item failed (OSStatus %d)", int(status))
 	}
 	return ctx.Err()
 }

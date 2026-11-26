@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 
 	"github.com/99designs/keyring"
 )
@@ -31,18 +30,35 @@ import (
 //
 // The Security framework link requires CGO_ENABLED=1 on darwin; builds without
 // CGO fail here with an actionable error instead of degrading to plaintext.
+// legacyKeychainBackend wraps keyringBackend for reading/listing legacy macOS
+// Keychain items while overriding Delete to use SecKeychainItemDelete so
+// cross-binary deletion succeeds without errSecInvalidOwnerEdit (-25244) or
+// password prompts.
+type legacyKeychainBackend struct {
+	*keyringBackend
+	keychainPath string
+}
+
+func (b *legacyKeychainBackend) Delete(ctx context.Context, name string) error {
+	return deleteKeychainGenericPassword(ctx, b.keychainPath, serviceName, name)
+}
+
 func OpenDefaultBackend() (Backend, error) {
 	keys, err := defaultKeychainMasterKeyStore()
 	if err != nil {
 		return nil, err
 	}
-	return newVaultBackend("keychain-vault", vaultDir, keys), nil
+	vb := newVaultBackend("keychain-vault", vaultDir, keys)
+	if legacy, lerr := openLegacyKeychainBackend(); lerr == nil {
+		vb.legacy = legacy
+	}
+	return vb, nil
 }
 
 // openLegacyKeychainBackend opens the pre-vault macOS Keychain backend that
 // stored each secret directly as a generic-password item under service "opq".
-// Used only by `opq migrate` and attribute-only legacy detection (which never
-// decrypts data or triggers Keychain password prompts).
+// Used by `opq migrate`, attribute-only legacy discovery, and on-demand lazy
+// migration.
 func openLegacyKeychainBackend() (Backend, error) {
 	kr, err := keyring.Open(keyring.Config{
 		ServiceName:                    serviceName,
@@ -57,7 +73,9 @@ func openLegacyKeychainBackend() (Backend, error) {
 		}
 		return nil, fmt.Errorf("open legacy keyring: %w", err)
 	}
-	return &keyringBackend{kr: kr, name: "keychain-legacy"}, nil
+	return &legacyKeychainBackend{
+		keyringBackend: &keyringBackend{kr: kr, name: "keychain-legacy"},
+	}, nil
 }
 
 // legacyKeychainSecretNames lists secret names present in the legacy macOS
@@ -74,17 +92,6 @@ func legacyKeychainSecretNames(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return collectLogicalSecretNames(keys), nil
-}
-
-// legacyKeychainHasSecret reports whether name (or its companion meta/<name>)
-// exists in the legacy macOS Keychain store. Uses attribute-only listing so it
-// never prompts for a password; returns false on any lookup error.
-func legacyKeychainHasSecret(ctx context.Context, name string) bool {
-	names, err := legacyKeychainSecretNames(ctx)
-	if err != nil {
-		return false
-	}
-	return slices.Contains(names, name)
 }
 
 // legacyKeychainCount reports how many legacy secrets remain in the macOS

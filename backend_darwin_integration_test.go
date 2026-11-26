@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	gokeychain "github.com/99designs/go-keychain"
 	"github.com/99designs/keyring"
@@ -314,5 +316,208 @@ func main() {
 	}
 	if !strings.Contains(string(negOut), "OSStatus=-25293") && !strings.Contains(string(negOut), "OSStatus=-25308") {
 		t.Fatalf("negative control failed with unexpected output %q (want OSStatus=-25293 or -25308)", string(negOut))
+	}
+}
+
+// TestKeychainLegacyDelete_CrossBinaryZeroPrompt proves empirically on macOS
+// that a separately compiled binary (different CDHash) with user interaction
+// disabled (SecKeychainSetUserInteractionAllowed(false)) can delete legacy
+// per-app-ACL items via SecKeychainItemDelete with ZERO prompts and ZERO
+// errors (whereas SecItemDelete fails with errSecInvalidOwnerEdit / -25244).
+func TestKeychainLegacyDelete_CrossBinaryZeroPrompt(t *testing.T) {
+	ctx := t.Context()
+	kcPath, kcPass := newTestKeychainFile(t)
+
+	// 1. Add two legacy per-binary-ACL items from the test binary.
+	for _, acc := range []string{"legacy_secret", "meta/legacy_secret"} {
+		item := gokeychain.NewItem()
+		item.SetSecClass(gokeychain.SecClassGenericPassword)
+		item.SetService(serviceName)
+		item.SetAccount(acc)
+		item.SetLabel("opq:" + acc)
+		item.SetData([]byte("legacy-data-" + acc))
+		item.UseKeychain(gokeychain.NewWithPath(kcPath))
+		item.SetAccessible(gokeychain.AccessibleWhenUnlocked)
+		item.SetAccess(&gokeychain.Access{Label: "opq:" + acc, TrustedApplications: nil})
+		if err := gokeychain.AddItem(item); err != nil {
+			t.Fatalf("add legacy item %s: %v", acc, err)
+		}
+	}
+
+	// 2. Compile a separate helper binary (distinct CDHash) that disables all
+	//    user interaction and deletes both items via SecKeychainItemDelete.
+	helperDir := t.TempDir()
+	helperSrc := filepath.Join(helperDir, "main.go")
+	helperBin := filepath.Join(helperDir, "deleter-bin")
+	const src = `package main
+/*
+#cgo LDFLAGS: -framework CoreFoundation -framework Security
+#cgo CFLAGS: -Wno-deprecated-declarations
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#include <stdlib.h>
+#include <string.h>
+
+static OSStatus delete_item_noninteractive(const char *kcPath, const char *pw, const char *service, const char *account) {
+	OSStatus st = SecKeychainSetUserInteractionAllowed(false);
+	if (st != errSecSuccess) return st;
+	SecKeychainRef kc = NULL;
+	st = SecKeychainOpen(kcPath, &kc);
+	if (st != errSecSuccess) return st;
+	st = SecKeychainUnlock(kc, (UInt32)strlen(pw), pw, true);
+	if (st != errSecSuccess) { CFRelease(kc); return st; }
+
+	const void *vals[1] = { kc };
+	CFArrayRef list = CFArrayCreate(kCFAllocatorDefault, vals, 1, &kCFTypeArrayCallBacks);
+	CFStringRef cfSvc = CFStringCreateWithCString(kCFAllocatorDefault, service, kCFStringEncodingUTF8);
+	CFStringRef cfAcc = CFStringCreateWithCString(kCFAllocatorDefault, account, kCFStringEncodingUTF8);
+	CFMutableDictionaryRef q = CFDictionaryCreateMutable(
+		kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks
+	);
+	CFDictionarySetValue(q, kSecClass, kSecClassGenericPassword);
+	CFDictionarySetValue(q, kSecAttrService, cfSvc);
+	CFDictionarySetValue(q, kSecAttrAccount, cfAcc);
+	CFDictionarySetValue(q, kSecMatchLimit, kSecMatchLimitOne);
+	CFDictionarySetValue(q, kSecReturnRef, kCFBooleanTrue);
+	CFDictionarySetValue(q, kSecMatchSearchList, list);
+
+	CFTypeRef ref = NULL;
+	st = SecItemCopyMatching(q, &ref);
+	if (st == errSecSuccess && ref != NULL) {
+		st = SecKeychainItemDelete((SecKeychainItemRef)ref);
+		CFRelease(ref);
+	}
+	CFRelease(q); CFRelease(cfSvc); CFRelease(cfAcc); CFRelease(list); CFRelease(kc);
+	return st;
+}
+*/
+import "C"
+import (
+	"fmt"
+	"os"
+	"unsafe"
+)
+func main() {
+	cPath := C.CString(os.Args[1])
+	cPw := C.CString(os.Args[2])
+	cSvc := C.CString(os.Args[3])
+	cAcc := C.CString(os.Args[4])
+	defer C.free(unsafe.Pointer(cPath))
+	defer C.free(unsafe.Pointer(cPw))
+	defer C.free(unsafe.Pointer(cSvc))
+	defer C.free(unsafe.Pointer(cAcc))
+	st := C.delete_item_noninteractive(cPath, cPw, cSvc, cAcc)
+	if st != C.errSecSuccess {
+		fmt.Fprintf(os.Stderr, "OSStatus=%d\n", int(st))
+		os.Exit(2)
+	}
+}
+`
+	if err := os.WriteFile(helperSrc, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.CommandContext(ctx, "go", "build", "-o", helperBin, helperSrc)
+	build.Env = append(os.Environ(), "CGO_ENABLED=1")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("compile deleter helper: %v\n%s", err, out)
+	}
+
+	for _, acc := range []string{"legacy_secret", "meta/legacy_secret"} {
+		if out, err := exec.CommandContext(ctx, helperBin, kcPath, kcPass, serviceName, acc).CombinedOutput(); err != nil {
+			t.Fatalf("separate binary failed to delete legacy item %s non-interactively: %v\n%s", acc, err, out)
+		}
+	}
+
+	// Verify both items are gone from the throwaway keychain.
+	q := gokeychain.NewItem()
+	q.SetSecClass(gokeychain.SecClassGenericPassword)
+	q.SetService(serviceName)
+	q.SetMatchLimit(gokeychain.MatchLimitAll)
+	q.SetReturnAttributes(true)
+	q.SetMatchSearchList(gokeychain.NewWithPath(kcPath))
+	rem, err := gokeychain.QueryItem(q)
+	if err != nil {
+		t.Fatalf("query remaining items: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("expected 0 remaining items after cross-binary delete, got %d", len(rem))
+	}
+}
+
+// TestKeychainVault_LazyMigrationAndDelete_RealKeychain verifies full lazy
+// migration and legacy deletion end-to-end against a real throwaway macOS
+// Keychain (both legacy per-item store and open-ACL master key).
+func TestKeychainVault_LazyMigrationAndDelete_RealKeychain(t *testing.T) {
+	ctx := t.Context()
+	withTempPolicyAndAuditHome(t)
+	now := time.Now().UTC()
+
+	kcBase := filepath.Join(t.TempDir(), "opq-lazy-real")
+	kcPath := kcBase + ".keychain"
+	kr, err := keyring.Open(keyring.Config{
+		ServiceName:                    serviceName,
+		AllowedBackends:                []keyring.BackendType{keyring.KeychainBackend},
+		KeychainName:                   kcBase,
+		KeychainTrustApplication:       true,
+		KeychainAccessibleWhenUnlocked: true,
+		KeychainPasswordFunc:           func(string) (string, error) { return "opq-test-pw", nil },
+	})
+	if err != nil {
+		t.Fatalf("open throwaway legacy keyring: %v", err)
+	}
+	legacy := &legacyKeychainBackend{
+		keyringBackend: &keyringBackend{kr: kr, name: "keychain-legacy-test"},
+		keychainPath:   kcPath,
+	}
+
+	// Seed two legacy items directly in the throwaway keychain.
+	mustSet(t, legacy, "active_legacy", "sk-real-legacy-val")
+	expAt := now.Add(12 * time.Hour).Truncate(time.Second)
+	if err := storeMeta(ctx, legacy, "active_legacy", &SecretMeta{V: secretMetaVersion, CreatedAt: now.Truncate(time.Second), ExpiresAt: expAt}); err != nil {
+		t.Fatal(err)
+	}
+	mustSet(t, legacy, "unused_legacy", "sk-unused-to-delete")
+
+	vDir := filepath.Join(t.TempDir(), "vault")
+	store := &keychainMasterKeyStore{
+		keychainPath: kcPath,
+		service:      vaultMasterKeyService,
+		account:      vaultMasterKeyAccount,
+	}
+	vb := newVaultBackend("keychain-vault-test", func() (string, error) { return vDir, nil }, store)
+	vb.legacy = legacy
+
+	// 1. Lazy resolve active_legacy -> migrates value + TTL into vault.enc and removes legacy copy!
+	buf, err := resolveSecret(ctx, vb, "active_legacy", now)
+	if err != nil {
+		t.Fatalf("resolveSecret active_legacy: %v", err)
+	}
+	if string(buf.Bytes()) != "sk-real-legacy-val" {
+		t.Fatalf("got %q, want sk-real-legacy-val", buf.Bytes())
+	}
+	buf.Destroy()
+
+	gotMeta, err := loadMeta(ctx, vb, "active_legacy")
+	if err != nil || gotMeta == nil || !gotMeta.ExpiresAt.Equal(expAt) {
+		t.Fatalf("migrated metadata = %+v (err=%v), want ExpiresAt=%v", gotMeta, err, expAt)
+	}
+	lKeys, err := legacy.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(lKeys, "active_legacy") || slices.Contains(lKeys, metaKey("active_legacy")) {
+		t.Fatalf("active_legacy still present in legacy Keychain after lazy migration: %v", lKeys)
+	}
+
+	// 2. deleteSecret on unused_legacy removes it from real Keychain via SecKeychainItemDelete!
+	if err := deleteSecret(ctx, vb, "unused_legacy"); err != nil {
+		t.Fatalf("deleteSecret unused_legacy: %v", err)
+	}
+	lKeys, err = legacy.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lKeys) != 0 {
+		t.Fatalf("expected empty legacy Keychain, remaining: %v", lKeys)
 	}
 }

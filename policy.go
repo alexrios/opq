@@ -118,10 +118,13 @@ func deleteMeta(ctx context.Context, backend Backend, name string) error {
 }
 
 // resolveSecret is the single read path for plaintext secret values, so TTL and
-// revocation are enforced everywhere a value could escape. It never mutates the
-// keyring: expiry only refuses; wiping is left to revoke/prune. Revoked is
-// checked before expired so a deliberately-killed secret reports the precise
-// ErrSecretRevoked.
+// revocation are enforced everywhere a value could escape. On backends that
+// support legacyMigrator (macOS keychain-vault), an unmigrated legacy Keychain
+// secret is migrated on demand into vault.enc on its first read under an
+// exclusive policy lock, then subjected to the same TTL/revocation checks.
+// Normal reads are read-only: expiry only refuses; wiping is left to
+// revoke/prune. Revoked is checked before expired so a deliberately-killed
+// secret reports the precise ErrSecretRevoked.
 func resolveSecret(ctx context.Context, backend Backend, name string, now time.Time) (*Buffer, error) {
 	started := time.Now()
 	// Defense in depth: a valid name can't contain '/', so it can't reach the
@@ -134,33 +137,91 @@ func resolveSecret(ctx context.Context, backend Backend, name string, now time.T
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
-	meta, err := loadMeta(ctx, backend, name)
+	buf, meta, err := resolveSecretLocked(ctx, backend, name, now, started)
+	unlock()
+	if err == nil {
+		return buf, nil
+	}
+	if !errors.Is(err, ErrSecretNotFound) || meta != nil {
+		return nil, err
+	}
+
+	// Secret is absent from the primary store (and has no tombstone/policy).
+	// On macOS keychain-vault, check attribute-only if it still lives in the
+	// legacy Keychain and lazily migrate it once on first use.
+	mig, ok := backend.(legacyMigrator)
+	if !ok {
+		return nil, ErrSecretNotFound
+	}
+	legacyKeys, lerr := mig.ListLegacyKeys(ctx)
+	if lerr != nil {
+		return nil, fmt.Errorf("check legacy keychain: %w", lerr)
+	}
+	if !slices.Contains(legacyKeys, name) && !slices.Contains(legacyKeys, metaKey(name)) {
+		return nil, ErrSecretNotFound
+	}
+
+	unlockEx, err := lockPolicy(ctx, true)
 	if err != nil {
 		return nil, err
 	}
+	defer unlockEx()
+
+	// Re-check vault under the exclusive lock in case another caller migrated
+	// or updated the secret while we waited.
+	buf, meta, err = resolveSecretLocked(ctx, backend, name, now, started)
+	if err == nil {
+		return buf, nil
+	}
+	if !errors.Is(err, ErrSecretNotFound) || meta != nil {
+		return nil, err
+	}
+
+	migrated, merr := mig.MigrateOneFromLegacy(ctx, name, true)
+	if merr != nil {
+		return nil, merr
+	}
+	if !migrated {
+		return nil, ErrSecretNotFound
+	}
+	_ = AppendAuditContext(ctx, AuditEvent{
+		Action:     ActionMigrate,
+		SecretName: name,
+		Caller:     "auto",
+		Message:    "lazy_migrated",
+	})
+
+	buf, _, err = resolveSecretLocked(ctx, backend, name, now, started)
+	return buf, err
+}
+
+func resolveSecretLocked(ctx context.Context, backend Backend, name string, now, started time.Time) (*Buffer, *SecretMeta, error) {
+	meta, err := loadMeta(ctx, backend, name)
+	if err != nil {
+		return nil, nil, err
+	}
 	if meta != nil && meta.Pending {
-		return nil, ErrSecretUpdatePending
+		return nil, meta, ErrSecretUpdatePending
 	}
 	if meta.IsRevoked() {
-		return nil, ErrSecretRevoked
+		return nil, meta, ErrSecretRevoked
 	}
 	if meta.IsExpiredAt(now.Add(time.Since(started))) {
-		return nil, ErrSecretExpired
+		return nil, meta, ErrSecretExpired
 	}
 	buf, err := backend.Get(ctx, name)
 	if err != nil {
-		return nil, err
+		return nil, meta, err
 	}
 	if err := ctx.Err(); err != nil {
 		buf.Destroy()
-		return nil, err
+		return nil, meta, err
 	}
 	if meta.IsExpiredAt(now.Add(time.Since(started))) {
 		buf.Destroy()
-		return nil, ErrSecretExpired
+		return nil, meta, ErrSecretExpired
 	}
-	return buf, nil
+	return buf, meta, nil
 }
 
 // policyHomeDir comes from the OS account database, never HOME/XDG_STATE_HOME.
@@ -260,6 +321,12 @@ func storeSecret(ctx context.Context, backend Backend, name string, value *Buffe
 	if err != nil {
 		return fmt.Errorf("finish secret update (reads remain blocked; retry set or delete): %w", err)
 	}
+	// If the secret previously lived in the legacy macOS Keychain, remove the
+	// stale copy (zero-prompt SecKeychainItemDelete) so a future delete cannot
+	// resurrect the old value.
+	if mig, ok := backend.(legacyMigrator); ok {
+		_ = mig.DeleteLegacy(ctx, name)
+	}
 	return nil
 }
 
@@ -274,11 +341,38 @@ func deleteSecretLocked(ctx context.Context, backend Backend, name string) error
 		return err
 	}
 
-	err = backend.Delete(ctx, name)
-	if err != nil && (!errors.Is(err, ErrSecretNotFound) || !metaExisted) {
-		return err
+	valErr := backend.Delete(ctx, name)
+	if valErr != nil && !errors.Is(valErr, ErrSecretNotFound) {
+		return valErr
 	}
-	return deleteMeta(ctx, backend, name)
+	vaultExisted := valErr == nil || metaExisted
+	if metaExisted {
+		if err := deleteMeta(ctx, backend, name); err != nil {
+			return err
+		}
+	}
+
+	// Also clean up any legacy macOS Keychain copy (zero-prompt
+	// SecKeychainItemDelete) so deleting an unmigrated or previously-migrated
+	// secret never resurrects it on a later read.
+	legacyExisted := false
+	if mig, ok := backend.(legacyMigrator); ok {
+		legacyKeys, lerr := mig.ListLegacyKeys(ctx)
+		if lerr != nil {
+			return fmt.Errorf("check legacy keychain: %w", lerr)
+		}
+		if slices.Contains(legacyKeys, name) || slices.Contains(legacyKeys, metaKey(name)) {
+			legacyExisted = true
+			if derr := mig.DeleteLegacy(ctx, name); derr != nil {
+				return fmt.Errorf("delete legacy keychain copy: %w", derr)
+			}
+		}
+	}
+
+	if !vaultExisted && !legacyExisted {
+		return ErrSecretNotFound
+	}
+	return nil
 }
 
 func deleteSecret(ctx context.Context, backend Backend, name string) error {
@@ -300,16 +394,32 @@ func revokeSecret(ctx context.Context, backend Backend, name string, now time.Ti
 	// Metadata only supplies optional timestamps; it must not gate emergency deletion.
 	existing, metaErr := loadMeta(ctx, backend, name)
 	err = backend.Delete(ctx, name)
-	if err != nil {
-		if !errors.Is(err, ErrSecretNotFound) {
-			return err
+	vaultFound := err == nil
+	if err != nil && !errors.Is(err, ErrSecretNotFound) {
+		return err
+	}
+
+	// Emergency revocation must also wipe any copy still in the legacy macOS
+	// Keychain (zero-prompt SecKeychainItemDelete).
+	legacyFound := false
+	if mig, ok := backend.(legacyMigrator); ok {
+		legacyKeys, lerr := mig.ListLegacyKeys(ctx)
+		if lerr != nil {
+			return fmt.Errorf("check legacy keychain: %w", lerr)
 		}
-		if existing == nil {
-			if metaErr != nil {
-				return fmt.Errorf("value absent; revocation metadata unreadable: %w", metaErr)
+		if slices.Contains(legacyKeys, name) || slices.Contains(legacyKeys, metaKey(name)) {
+			legacyFound = true
+			if derr := mig.DeleteLegacy(ctx, name); derr != nil {
+				return fmt.Errorf("wipe legacy keychain copy: %w", derr)
 			}
-			return err
 		}
+	}
+
+	if !vaultFound && !legacyFound && existing == nil {
+		if metaErr != nil {
+			return fmt.Errorf("value absent; revocation metadata unreadable: %w", metaErr)
+		}
+		return ErrSecretNotFound
 	}
 	tomb := &SecretMeta{V: secretMetaVersion, RevokedAt: now}
 	if existing != nil {

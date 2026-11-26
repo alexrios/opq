@@ -85,6 +85,16 @@ func vaultDir() (string, error) {
 	return filepath.Join(home, ".local", "share", "opq"), nil
 }
 
+// legacyMigrator is an optional Backend capability (implemented by vaultBackend
+// on macOS) supporting zero-prompt attribute-only discovery of unmigrated
+// legacy Keychain entries, atomic on-demand migration of a single secret on
+// first use, and zero-prompt cleanup of legacy copies.
+type legacyMigrator interface {
+	ListLegacyKeys(ctx context.Context) ([]string, error)
+	MigrateOneFromLegacy(ctx context.Context, name string, deleteLegacy bool) (bool, error)
+	DeleteLegacy(ctx context.Context, name string) error
+}
+
 // vaultBackend implements Backend over a single AES-256-GCM encrypted local
 // file (vault.enc) whose 32-byte master key comes from masterKeyProvider.
 //
@@ -98,6 +108,7 @@ type vaultBackend struct {
 	name    string
 	dirFunc func() (string, error)
 	keys    masterKeyProvider
+	legacy  Backend
 	mu      sync.RWMutex
 }
 
@@ -113,6 +124,90 @@ func newVaultBackend(name string, dirFunc func() (string, error), keys masterKey
 }
 
 func (b *vaultBackend) Name() string { return b.name }
+
+// ListLegacyKeys enumerates raw keys in the legacy macOS Keychain using an
+// attribute-only query that never decrypts secret values or triggers prompts.
+func (b *vaultBackend) ListLegacyKeys(ctx context.Context) ([]string, error) {
+	if b.legacy == nil {
+		return nil, nil
+	}
+	return b.legacy.List(ctx)
+}
+
+// DeleteLegacy removes name and meta/<name> from the legacy macOS Keychain
+// using SecKeychainItemDelete (attribute-based, zero prompts). Missing items
+// are ignored so deletion is idempotent.
+func (b *vaultBackend) DeleteLegacy(ctx context.Context, name string) error {
+	if b.legacy == nil {
+		return nil
+	}
+	return deleteLegacyEntry(ctx, b.legacy, name, true, true)
+}
+
+// MigrateOneFromLegacy moves a single secret (and its companion meta/<name>
+// policy item, if any) from the legacy Keychain into vault.enc. Caller MUST
+// hold exclusive policy.lock. Returns (true, nil) if anything was migrated, or
+// (false, nil) if the secret does not exist in legacy Keychain.
+func (b *vaultBackend) MigrateOneFromLegacy(ctx context.Context, name string, deleteLegacy bool) (bool, error) {
+	if b.legacy == nil {
+		return false, nil
+	}
+	legacyKeys, err := b.legacy.List(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list legacy keychain: %w", err)
+	}
+	mk := metaKey(name)
+	hasVal := slices.Contains(legacyKeys, name)
+	hasMeta := slices.Contains(legacyKeys, mk)
+	if !hasVal && !hasMeta {
+		return false, nil
+	}
+	if err := copySecretFromLegacyLocked(ctx, b.legacy, b, name, hasVal, hasMeta); err != nil {
+		if errors.Is(err, ErrSecretNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if deleteLegacy {
+		// Secret is already durably written to vault.enc; best-effort remove
+		// the legacy copy so future deletes cannot resurrect it and doctor's
+		// pending count drops immediately.
+		_ = deleteLegacyEntry(ctx, b.legacy, name, hasVal, hasMeta)
+	}
+	return true, nil
+}
+
+// mergeKeysWithLegacy merges vault raw keys with unmigrated legacy raw keys.
+// Vault state is authoritative per logical secret name: if a name already has
+// a value or companion meta/<name> record in the vault (including a REVOKED
+// tombstone), all legacy keys for that name are ignored.
+func mergeKeysWithLegacy(vaultKeys, legacyKeys []string) []string {
+	if len(legacyKeys) == 0 {
+		return vaultKeys
+	}
+	vaultLogical := make(map[string]bool, len(vaultKeys))
+	for _, k := range vaultKeys {
+		if base, ok := secretNameFromMetaKey(k); ok {
+			vaultLogical[base] = true
+		} else {
+			vaultLogical[k] = true
+		}
+	}
+	merged := make([]string, 0, len(vaultKeys)+len(legacyKeys))
+	merged = append(merged, vaultKeys...)
+	for _, lk := range legacyKeys {
+		logical := lk
+		if base, ok := secretNameFromMetaKey(lk); ok {
+			logical = base
+		}
+		if vaultLogical[logical] {
+			continue
+		}
+		merged = append(merged, lk)
+	}
+	slices.Sort(merged)
+	return slices.Compact(merged)
+}
 
 func (b *vaultBackend) Get(ctx context.Context, name string) (*Buffer, error) {
 	if err := ctx.Err(); err != nil {
