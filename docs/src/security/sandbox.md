@@ -141,9 +141,9 @@ The profiles are `(allow default)` with targeted denies:
 
 | Profile | Network | Filesystem | Credential masks |
 | --- | --- | --- | --- |
-| `SandboxNet` | `(deny network*)` | `(deny file-write*)` (read-only host) | deny-read and deny Unix-socket connections to `$HOME/.gnupg`, `.ssh`, `.docker/run/docker.sock`, `$SSH_AUTH_SOCK`, `/var/run/docker.sock`, and the state dirs |
+| `SandboxNet` | `(deny network*)` | `(deny file-write*)` (read-only host) | deny-read and deny Unix-socket connections to `$HOME/.gnupg`, `.ssh`, `.docker/run/docker.sock`, `$SSH_AUTH_SOCK`, `/var/run/docker.sock`, the encrypted vault dir (`~/.local/share/opq`), and the state dirs |
 | `SandboxNetAllowed` | IP networking allowed; protected Unix sockets denied | identical to `SandboxNet` | identical to `SandboxNet` |
-| `SandboxFull` | `(deny network*)` | `(deny file-write*)` + deny-read `/Users`, `/private/var/root`, `/tmp`, `/private/tmp`, `/private/var/tmp`, `/private/var/folders` | (covered by the `/Users` deny) |
+| `SandboxFull` | `(deny network*)` | `(deny file-write*)` + deny-read `/Users`, `/private/var/root`, `/tmp`, `/private/tmp`, `/private/var/tmp`, `/private/var/folders`, policy dir, and vault dir | (covered by the `/Users`, policy-dir, and vault-dir denies) |
 
 `(deny network*)` also blocks AF_UNIX `connect(2)`, so credential agents reachable by
 socket are closed under `SandboxNet` without a per-socket bind mask.

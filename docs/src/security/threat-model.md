@@ -59,7 +59,12 @@ the exploit behind each):
 `opq` does not defend against:
 
 - Root or kernel attacker. Compromise of the logged-in keyring session is total
-  compromise.
+  compromise. On both Linux (Secret Service) and macOS (where the single `opq-vault`
+  Keychain master key uses an open application ACL so unsigned/upgraded binaries do not
+  trigger repeated password prompts), any unsandboxed process running as the operator's
+  UID can access stored credentials; sandboxed subprocesses launched by `opq mcp` or
+  `opq exec --sandbox` are explicitly blocked from reading `vault.enc` (macOS Seatbelt)
+  and the D-Bus keyring socket (Linux bubblewrap).
 - Side channels in the legitimate consuming subprocess.
 - A malicious subprocess exfiltrating via a non-network path the sandbox does not cover
   (loopback service, kernel keyring, custom Unix socket).

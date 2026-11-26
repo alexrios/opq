@@ -1,9 +1,11 @@
 # Adding a Backend
 
 `opq` stores secrets through a `Backend` interface (`backend.go`). It ships two
-implementations over `99designs/keyring`: the Linux Secret Service backend (libsecret over
-D-Bus) and the macOS Keychain backend (login keychain via the Security framework). The
-interface is shaped so additional backends drop in without touching anything else.
+platform backends: the Linux Secret Service backend (libsecret over D-Bus via
+`99designs/keyring`) and the macOS `keychain-vault` backend (an AES-256-GCM encrypted
+local vault in `vault.go` keyed by a single open-ACL master key in the login Keychain
+via `keychain_master_darwin.go`). The interface is shaped so additional backends drop in
+without touching anything else.
 
 ## The interface
 

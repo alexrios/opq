@@ -109,13 +109,16 @@ servers, containers, WSL, and locked-down hosts.
 
 | Requirement | Why | Notes |
 | --- | --- | --- |
-| The login Keychain | Where secrets are stored. | Used by default; nothing to install. opq stores generic-password items namespaced under the service `opq`. The keychain must be unlocked (it is, while you are logged in). |
-| A CGO-enabled build | The Keychain backend links the Security framework via cgo. | `go install` enables CGO by default on macOS; you need the Xcode Command Line Tools (`xcode-select --install`). A `CGO_ENABLED=0` build fails at first keyring access with an actionable error. |
+| The login Keychain | Protects the vault master key. | `opq` encrypts secrets and policy metadata in `~/.local/share/opq/vault.enc` (AES-256-GCM, mode `0600`) using a single 256-bit master key stored in the login Keychain under service `opq-vault` (`master-key`) with an open application ACL. The keychain must be unlocked (it is, while you are logged in). |
+| A CGO-enabled build | The Keychain master-key store links the Security framework via cgo. | `go install` enables CGO by default on macOS; you need the Xcode Command Line Tools (`xcode-select --install`). A `CGO_ENABLED=0` build fails at first keyring access with an actionable error. |
 | `sandbox-exec` | The MCP subprocess sandbox and `opq exec --sandbox`. | Ships with macOS at `/usr/bin/sandbox-exec`; no install needed. |
 
-The first time `opq` writes a secret, macOS may prompt once to allow the binary to access
-the keychain; allow it so later reads (including `opq exec` and the MCP server) run
-without prompting.
+Because the single vault master key uses an open application ACL (matching Linux Secret
+Service's session model), upgrades via Homebrew and local rebuilds do not trigger repeated
+Keychain password prompts. If you previously stored secrets with an older release of `opq`
+(which saved one Keychain item per secret under service `opq`), run `opq migrate` once to
+move them—along with their TTL and revocation metadata—into the encrypted vault, then
+verify with `opq doctor` and optionally clean up with `opq migrate --delete-legacy`.
 
 ## Troubleshooting: the bubblewrap startup probe
 

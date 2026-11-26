@@ -15,7 +15,8 @@ do not read secret values, and `opq audit` is a read-only view that does not log
 | `opq revoke <name>` | Wipe a secret's value immediately and leave a revoked tombstone. |
 | `opq prune [--dry-run] [--include-revoked]` | Delete expired secrets (and optionally `REVOKED` tombstones). `--dry-run` previews. |
 | `opq audit [-n N] [--all] [--json] [--caller ...] [--action ...] [--secret ...]` | Inspect audit-log entries (aligned table on TTY, JSONL on pipe or `--json`). |
-| `opq doctor [--json]` | Run read-only health checks on binary, keyring, OS sandbox, audit log, and policy state. |
+| `opq doctor [--json]` | Run read-only health checks on binary, keyring/vault, OS sandbox, audit log, and policy state. |
+| `opq migrate [--dry-run] [--overwrite] [--delete-legacy]` | Migrate legacy macOS Keychain items (`service="opq"`) into the encrypted local vault while preserving TTL and revocation metadata. |
 | `opq completion <bash\|zsh\|fish>` | Print a shell completion script for subcommands, flags, and secret names. |
 | `opq mcp` | Run as a Model Context Protocol server over stdio. |
 
@@ -215,6 +216,28 @@ Runs a read-only diagnostic health check of the `opq` runtime environment and re
 
 Pass `--json` for structured output. Exits `1` if any critical check has status `FAIL`;
 `WARN` items exit `0`.
+
+## `opq migrate`
+
+```sh
+opq migrate [--dry-run] [--overwrite] [--delete-legacy]
+```
+
+macOS-only migration helper for moving secrets created by earlier releases (which stored
+one Keychain item per secret under service `opq`) into the AES-256-GCM encrypted local
+vault (`~/.local/share/opq/vault.enc`, keyed by a single open-ACL master key in Keychain).
+Values, TTLs, `REVOKED` tombstones, and `UPDATE-PENDING` markers are preserved atomically
+under `policy.lock`.
+
+| Flag | Behavior |
+| --- | --- |
+| `--dry-run` | Preview which legacy Keychain items would be migrated or skipped using attribute-only listing (never reads secret values or prompts for passwords). |
+| `--overwrite` | Replace secrets that already exist in the vault (default skips existing entries so re-runs are idempotent). |
+| `--delete-legacy` | Remove each migrated secret and its metadata from the legacy Keychain after verifying it is stored in the vault. |
+
+By default, `opq migrate` keeps legacy Keychain entries intact as a backup. Verify with
+`opq list` and `opq doctor`, then run `opq migrate --delete-legacy` to remove them. On
+Linux and other platforms, `opq migrate` is a no-op.
 
 ## `opq completion`
 

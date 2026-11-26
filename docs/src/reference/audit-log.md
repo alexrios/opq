@@ -49,6 +49,7 @@ opq audit --json | jq .                     # force raw JSONL output on a TTY
 | `delete` | A secret was removed. |
 | `revoke` | A secret was revoked: its value wiped, a tombstone left. |
 | `prune` | Expired secrets were deleted (`opq prune`). |
+| `migrate` | Legacy macOS Keychain items were migrated into the encrypted local vault (`opq migrate`). |
 | `list` | Names were listed. |
 | `exec_inject` | A secret was injected into a CLI `opq exec` child. |
 | `mcp_run` | The MCP `run_with_secrets` tool ran a subprocess. |

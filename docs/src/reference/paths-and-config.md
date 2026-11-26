@@ -11,11 +11,13 @@ well-known paths, tuned through a small set of environment variables.
 | `…/opq/audit.log.1` | One historical rotation, kept when the active log passes 10 MiB. |
 | `…/opq/audit.lock` | The cross-process audit flock file (never rotated). |
 | `<OS-account-home>/.local/state/opq-policy/policy.lock` | Policy/value transaction lock. Its location comes from the OS account database, independently of `HOME` and `XDG_STATE_HOME`. |
+| `<OS-account-home>/.local/share/opq/vault.enc` | macOS AES-256-GCM encrypted local vault (mode `0600`), with sibling `vault.lock` (`0600`). Its location comes from the OS account database and is masked from sandboxed subprocesses. |
 
-Secrets are not stored on disk by `opq`; they live in the OS keyring under the `opq`
-service name (the Secret Service / libsecret collection `opq` on Linux; generic-password
-items under Keychain service `opq` on macOS). Policy metadata is a companion keyring item
-keyed `meta/<name>`.
+On Linux, secrets are not stored on disk by `opq`; they live in the OS Secret Service /
+libsecret collection `opq`. On macOS, secrets and companion `meta/<name>` policy metadata
+live in `<OS-account-home>/.local/share/opq/vault.enc`, encrypted at rest with a single
+256-bit master key stored in the login Keychain under service `opq-vault` / account
+`master-key` (never synchronized to iCloud, readable only while the keychain is unlocked).
 
 ## Environment variables
 
