@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -54,7 +55,12 @@ func defaultInfoDeps() infoDeps {
 }
 
 func (c *InfoCmd) Run() error {
-	return runInfo(context.Background(), c.Name, c.JSON, defaultInfoDeps())
+	ctx := context.Background()
+	err := runInfo(ctx, c.Name, c.JSON, defaultInfoDeps())
+	if err != nil && validSecretName(c.Name) && strings.Contains(err.Error(), "not found") && legacyKeychainHasSecret(ctx, c.Name) {
+		return fmt.Errorf("%w (found in legacy macOS Keychain; run 'opq migrate')", err)
+	}
+	return err
 }
 
 // runInfo inspects metadata for a single secret without ever reading its

@@ -64,6 +64,8 @@ type doctorDeps struct {
 	goos            string
 	goarch          string
 	openBackend     func() (Backend, error)
+	vaultDir        func() (string, error)
+	legacyCount     func(context.Context) (int, error)
 	verifySandbox   func() error
 	auditLogPath    func() (string, error)
 	policyLockDir   func() (string, error)
@@ -75,7 +77,7 @@ type doctorDeps struct {
 }
 
 func defaultDoctorDeps() doctorDeps {
-	return doctorDeps{
+	deps := doctorDeps{
 		version:         resolveVersion,
 		goos:            runtime.GOOS,
 		goarch:          runtime.GOARCH,
@@ -89,6 +91,11 @@ func defaultDoctorDeps() doctorDeps {
 		isTTY:           term.IsTerminal(int(os.Stdout.Fd())),
 		noColor:         os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb",
 	}
+	if runtime.GOOS == "darwin" {
+		deps.vaultDir = vaultDir
+		deps.legacyCount = legacyKeychainCount
+	}
+	return deps
 }
 
 func (c *DoctorCmd) Run() error {
@@ -129,11 +136,16 @@ func runDoctor(ctx context.Context, asJSON bool, deps doctorDeps) error {
 	checks := []doctorCheck{
 		binaryCheck,
 		keyringCheck,
+	}
+	if deps.vaultDir != nil {
+		checks = append(checks, doctorCheckVault(deps))
+	}
+	checks = append(checks,
 		sandboxCheck,
 		auditCheck,
 		policyCheck,
 		metaCheck,
-	}
+	)
 
 	failCount := 0
 	for _, ch := range checks {
@@ -206,15 +218,212 @@ func doctorCheckKeyring(ctx context.Context, deps doctorDeps) (doctorCheck, Back
 	}
 
 	visible := filterVisibleSecretNames(keys)
+	details := map[string]any{
+		"backend":      backend.Name(),
+		"secret_count": len(visible),
+	}
+	if deps.legacyCount != nil {
+		if legacyN, lerr := deps.legacyCount(ctx); lerr == nil && legacyN > 0 {
+			details["legacy_secret_count"] = legacyN
+			return doctorCheck{
+				Name:    "keyring",
+				Status:  doctorWarn,
+				Summary: fmt.Sprintf("%s (%d %s; %d legacy Keychain %s pending migration)", backend.Name(), len(visible), doctorPlural(len(visible), "secret", "secrets"), legacyN, doctorPlural(legacyN, "secret", "secrets")),
+				Remediation: []string{
+					fmt.Sprintf("run 'opq migrate' to move %d legacy macOS Keychain %s into the encrypted local vault", legacyN, doctorPlural(legacyN, "secret", "secrets")),
+				},
+				Details: details,
+			}, backend, keys
+		}
+	}
 	return doctorCheck{
 		Name:    "keyring",
 		Status:  doctorOK,
 		Summary: fmt.Sprintf("%s (%d %s)", backend.Name(), len(visible), doctorPlural(len(visible), "secret", "secrets")),
-		Details: map[string]any{
-			"backend":      backend.Name(),
-			"secret_count": len(visible),
-		},
+		Details: details,
 	}, backend, keys
+}
+
+func doctorCheckVault(deps doctorDeps) doctorCheck {
+	dir, err := deps.vaultDir()
+	if err != nil {
+		return doctorCheck{
+			Name:    "vault",
+			Status:  doctorFail,
+			Summary: fmt.Sprintf("cannot resolve vault dir: %v", err),
+		}
+	}
+	vaultPath := filepath.Join(dir, vaultFileName)
+
+	li, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if cerr := doctorCheckCreatableDir(dir); cerr != nil {
+				return doctorCheck{
+					Name:        "vault",
+					Status:      doctorFail,
+					Summary:     fmt.Sprintf("vault dir %s cannot be created: %v", dir, cerr),
+					Remediation: []string{fmt.Sprintf("ensure the parent of %s exists and is writable", dir)},
+					Details: map[string]any{
+						"path":      vaultPath,
+						"dir":       dir,
+						"exists":    false,
+						"creatable": false,
+					},
+				}
+			}
+			return doctorCheck{
+				Name:    "vault",
+				Status:  doctorOK,
+				Summary: fmt.Sprintf("%s (not created yet)", vaultPath),
+				Details: map[string]any{
+					"path":      vaultPath,
+					"dir":       dir,
+					"exists":    false,
+					"creatable": true,
+				},
+			}
+		}
+		return doctorCheck{
+			Name:    "vault",
+			Status:  doctorFail,
+			Summary: fmt.Sprintf("cannot inspect vault dir %s: %v", dir, err),
+		}
+	}
+
+	if li.Mode()&os.ModeSymlink != 0 {
+		return doctorCheck{
+			Name:        "vault",
+			Status:      doctorFail,
+			Summary:     fmt.Sprintf("vault dir %s is a symlink (refused)", dir),
+			Remediation: []string{fmt.Sprintf("remove symlink %s and create a regular 0700 directory", dir)},
+		}
+	}
+	if !li.IsDir() {
+		return doctorCheck{
+			Name:        "vault",
+			Status:      doctorFail,
+			Summary:     fmt.Sprintf("vault dir %s is not a directory", dir),
+			Remediation: []string{fmt.Sprintf("remove or move %s so opq can create a 0700 directory", dir)},
+		}
+	}
+	if perm := li.Mode().Perm(); perm != 0o700 {
+		return doctorCheck{
+			Name:        "vault",
+			Status:      doctorFail,
+			Summary:     fmt.Sprintf("vault dir %s has mode %04o (expected 0700)", dir, perm),
+			Remediation: []string{fmt.Sprintf("run 'chmod 700 %s'", dir)},
+			Details: map[string]any{
+				"path":     vaultPath,
+				"dir":      dir,
+				"dir_mode": fmt.Sprintf("%04o", perm),
+			},
+		}
+	}
+
+	lockPath := filepath.Join(dir, vaultLockName)
+	if lfi, lerr := os.Lstat(lockPath); lerr == nil {
+		if lfi.Mode()&os.ModeSymlink != 0 {
+			return doctorCheck{
+				Name:        "vault",
+				Status:      doctorFail,
+				Summary:     fmt.Sprintf("vault lock %s is a symlink (refused)", lockPath),
+				Remediation: []string{fmt.Sprintf("remove symlink %s", lockPath)},
+			}
+		}
+		if !lfi.Mode().IsRegular() {
+			return doctorCheck{
+				Name:        "vault",
+				Status:      doctorFail,
+				Summary:     fmt.Sprintf("vault lock %s is not a regular file", lockPath),
+				Remediation: []string{fmt.Sprintf("remove non-regular file %s", lockPath)},
+			}
+		}
+		if lperm := lfi.Mode().Perm(); lperm != 0o600 {
+			return doctorCheck{
+				Name:        "vault",
+				Status:      doctorFail,
+				Summary:     fmt.Sprintf("vault lock %s has mode %04o (expected 0600)", lockPath, lperm),
+				Remediation: []string{fmt.Sprintf("run 'chmod 600 %s'", lockPath)},
+			}
+		}
+	} else if !os.IsNotExist(lerr) {
+		return doctorCheck{
+			Name:    "vault",
+			Status:  doctorFail,
+			Summary: fmt.Sprintf("cannot inspect vault lock %s: %v", lockPath, lerr),
+		}
+	}
+
+	fi, err := os.Lstat(vaultPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return doctorCheck{
+				Name:    "vault",
+				Status:  doctorOK,
+				Summary: fmt.Sprintf("%s (not created yet)", vaultPath),
+				Details: map[string]any{
+					"path":     vaultPath,
+					"dir":      dir,
+					"dir_mode": "0700",
+					"exists":   false,
+				},
+			}
+		}
+		return doctorCheck{
+			Name:    "vault",
+			Status:  doctorFail,
+			Summary: fmt.Sprintf("cannot inspect vault file %s: %v", vaultPath, err),
+		}
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return doctorCheck{
+			Name:        "vault",
+			Status:      doctorFail,
+			Summary:     fmt.Sprintf("vault file %s is a symlink (refused)", vaultPath),
+			Remediation: []string{fmt.Sprintf("remove symlink %s", vaultPath)},
+		}
+	}
+	if !fi.Mode().IsRegular() {
+		return doctorCheck{
+			Name:        "vault",
+			Status:      doctorFail,
+			Summary:     fmt.Sprintf("vault file %s is not a regular file", vaultPath),
+			Remediation: []string{fmt.Sprintf("remove non-regular file %s", vaultPath)},
+		}
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		return doctorCheck{
+			Name:        "vault",
+			Status:      doctorFail,
+			Summary:     fmt.Sprintf("vault file %s has mode %04o (expected 0600)", vaultPath, perm),
+			Remediation: []string{fmt.Sprintf("run 'chmod 600 %s'", vaultPath)},
+			Details: map[string]any{
+				"path": vaultPath,
+				"mode": fmt.Sprintf("%04o", perm),
+			},
+		}
+	}
+	if fi.Size() > vaultMaxFileSize {
+		return doctorCheck{
+			Name:    "vault",
+			Status:  doctorFail,
+			Summary: fmt.Sprintf("%s exceeds %s size limit (%s)", vaultPath, doctorFormatBytes(vaultMaxFileSize), doctorFormatBytes(fi.Size())),
+		}
+	}
+	return doctorCheck{
+		Name:    "vault",
+		Status:  doctorOK,
+		Summary: fmt.Sprintf("%s (mode 0600, %s)", vaultPath, doctorFormatBytes(fi.Size())),
+		Details: map[string]any{
+			"path":       vaultPath,
+			"dir":        dir,
+			"exists":     true,
+			"dir_mode":   "0700",
+			"mode":       "0600",
+			"size_bytes": fi.Size(),
+		},
+	}
 }
 
 func doctorKeyringRemediation(goos string, err error) []string {
@@ -231,7 +440,7 @@ func doctorKeyringRemediation(goos string, err error) []string {
 		}
 		return []string{
 			"unlock your macOS login Keychain ('security unlock-keychain login.keychain-db') or open Keychain Access",
-			"if opq was rebuilt or moved, allow access when macOS prompts for the Keychain ACL",
+			"verify the 'opq-vault' master key exists in your login Keychain if vault.enc is already present",
 		}
 	case "linux":
 		return []string{

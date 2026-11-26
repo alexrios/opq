@@ -58,6 +58,7 @@ const (
 	ActionNetworkAllowed    = "network_allowed"
 	ActionRevoke            = "revoke"
 	ActionPrune             = "prune"
+	ActionMigrate           = "migrate"
 )
 
 // Gate-failure reason taxonomy. Mirrors sanitizeBackendErr: only stable

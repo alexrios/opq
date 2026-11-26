@@ -99,6 +99,24 @@ func TestCLI_NewCommandsRegisteredInKong(t *testing.T) {
 				}
 			},
 		},
+		{
+			args:        []string{"migrate"},
+			wantCommand: "migrate",
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Migrate.DryRun || cli.Migrate.Overwrite || cli.Migrate.DeleteLegacy {
+					t.Errorf("unexpected Migrate defaults: %+v", cli.Migrate)
+				}
+			},
+		},
+		{
+			args:        []string{"migrate", "--dry-run", "--overwrite", "--delete-legacy"},
+			wantCommand: "migrate",
+			check: func(t *testing.T, cli *CLI) {
+				if !cli.Migrate.DryRun || !cli.Migrate.Overwrite || !cli.Migrate.DeleteLegacy {
+					t.Errorf("unexpected Migrate flags: %+v", cli.Migrate)
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {

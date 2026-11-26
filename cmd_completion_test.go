@@ -10,7 +10,7 @@ import (
 func TestCompletion_AllShellsContainCommandsFlagsAndSafeDynamicLookup(t *testing.T) {
 	subcommands := []string{
 		"set", "get", "list", "info", "delete", "revoke",
-		"prune", "exec", "audit", "doctor", "completion", "mcp",
+		"prune", "exec", "audit", "doctor", "migrate", "completion", "mcp",
 	}
 	flags := []string{
 		"help", "version",
@@ -18,6 +18,7 @@ func TestCompletion_AllShellsContainCommandsFlagsAndSafeDynamicLookup(t *testing
 		"plaintext",
 		"long", "json", "status",
 		"dry-run", "include-revoked",
+		"overwrite", "delete-legacy",
 		"env", "sandbox", "no-redact",
 		"tail", "all", "caller", "action", "secret",
 	}

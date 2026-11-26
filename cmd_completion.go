@@ -52,7 +52,7 @@ _opq_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="set get list info delete revoke prune exec audit doctor completion mcp"
+    local commands="set get list info delete revoke prune exec audit doctor migrate completion mcp"
     local global_flags="--help --version"
 
     cmd=""
@@ -87,7 +87,7 @@ _opq_completions() {
             return 0
             ;;
         --action)
-            COMPREPLY=( $(compgen -W "set get delete revoke prune list exec_inject mcp_run audit_tail redaction_disabled network_allowed denied" -- "$cur") )
+            COMPREPLY=( $(compgen -W "set get delete revoke prune migrate list exec_inject mcp_run audit_tail redaction_disabled network_allowed denied" -- "$cur") )
             return 0
             ;;
         --secret)
@@ -137,6 +137,9 @@ _opq_completions() {
                 ;;
             doctor)
                 flags="--json --help"
+                ;;
+            migrate)
+                flags="--dry-run --overwrite --delete-legacy --help"
                 ;;
         esac
         COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
@@ -188,6 +191,7 @@ _opq() {
         'exec:Run a command with secrets injected as environment variables'
         'audit:Show recent audit-log entries'
         'doctor:Check keyring, sandbox, audit log, and policy health'
+        'migrate:Migrate legacy macOS Keychain secrets into the encrypted local vault'
         'completion:Generate shell completion script'
         'mcp:Run as a Model Context Protocol server over stdio'
     )
@@ -262,13 +266,20 @@ _opq() {
                         '--all[Show all available entries]' \
                         '--json[Output raw JSONL]' \
                         '--caller[Filter by caller]:caller:(cli mcp)' \
-                        '--action[Filter by audit action]:action:(set get delete revoke prune list exec_inject mcp_run audit_tail redaction_disabled network_allowed denied)' \
+                        '--action[Filter by audit action]:action:(set get delete revoke prune migrate list exec_inject mcp_run audit_tail redaction_disabled network_allowed denied)' \
                         '--secret[Filter by secret name]:secret:_opq_secret_names' \
                         '--help[Show help]'
                     ;;
                 doctor)
                     _arguments \
                         '--json[Output health check results as JSON]' \
+                        '--help[Show help]'
+                    ;;
+                migrate)
+                    _arguments \
+                        '--dry-run[Preview legacy Keychain secrets without modifying storage]' \
+                        '--overwrite[Overwrite secrets that already exist in the vault]' \
+                        '--delete-legacy[Remove migrated copies from the legacy macOS Keychain]' \
                         '--help[Show help]'
                     ;;
                 completion)
@@ -303,7 +314,7 @@ function __opq_secret_names
 end
 
 function __opq_no_subcommand
-    not __fish_seen_subcommand_from set get list info delete revoke prune exec audit doctor completion mcp
+    not __fish_seen_subcommand_from set get list info delete revoke prune exec audit doctor migrate completion mcp
 end
 
 # Global flags
@@ -321,6 +332,7 @@ complete -c opq -f -n __opq_no_subcommand -a prune -d 'Delete expired secrets'
 complete -c opq -f -n __opq_no_subcommand -a exec -d 'Run a command with secrets injected as environment variables'
 complete -c opq -f -n __opq_no_subcommand -a audit -d 'Show recent audit-log entries'
 complete -c opq -f -n __opq_no_subcommand -a doctor -d 'Check keyring, sandbox, audit log, and policy health'
+complete -c opq -f -n __opq_no_subcommand -a migrate -d 'Migrate legacy macOS Keychain secrets into the encrypted local vault'
 complete -c opq -f -n __opq_no_subcommand -a completion -d 'Generate shell completion script'
 complete -c opq -f -n __opq_no_subcommand -a mcp -d 'Run as a Model Context Protocol server over stdio'
 
@@ -372,13 +384,19 @@ complete -c opq -f -n '__fish_seen_subcommand_from audit' -s n -l tail -r -d 'Nu
 complete -c opq -f -n '__fish_seen_subcommand_from audit' -l all -d 'Show all available entries'
 complete -c opq -f -n '__fish_seen_subcommand_from audit' -l json -d 'Output raw JSONL'
 complete -c opq -f -n '__fish_seen_subcommand_from audit' -l caller -x -a 'cli mcp' -d 'Filter by caller'
-complete -c opq -f -n '__fish_seen_subcommand_from audit' -l action -x -a 'set get delete revoke prune list exec_inject mcp_run audit_tail redaction_disabled network_allowed denied' -d 'Filter by audit action'
+complete -c opq -f -n '__fish_seen_subcommand_from audit' -l action -x -a 'set get delete revoke prune migrate list exec_inject mcp_run audit_tail redaction_disabled network_allowed denied' -d 'Filter by audit action'
 complete -c opq -f -n '__fish_seen_subcommand_from audit' -l secret -x -a '(__opq_secret_names)' -d 'Filter by secret name'
 complete -c opq -f -n '__fish_seen_subcommand_from audit' -l help -d 'Show help'
 
 # doctor
 complete -c opq -f -n '__fish_seen_subcommand_from doctor' -l json -d 'Output health check results as JSON'
 complete -c opq -f -n '__fish_seen_subcommand_from doctor' -l help -d 'Show help'
+
+# migrate
+complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l dry-run -d 'Preview legacy Keychain secrets without modifying storage'
+complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l overwrite -d 'Overwrite secrets that already exist in the vault'
+complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l delete-legacy -d 'Remove migrated copies from the legacy macOS Keychain'
+complete -c opq -f -n '__fish_seen_subcommand_from migrate' -l help -d 'Show help'
 
 # completion
 complete -c opq -f -n '__fish_seen_subcommand_from completion' -l help -d 'Show help'

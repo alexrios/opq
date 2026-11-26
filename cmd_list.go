@@ -85,7 +85,15 @@ func (c *ListCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	return c.runWith(ctx, backend, os.Stdout, os.Stderr, uiIsTTY(os.Stdout), time.Now().UTC())
+	if err := c.runWith(ctx, backend, os.Stdout, os.Stderr, uiIsTTY(os.Stdout), time.Now().UTC()); err != nil {
+		return err
+	}
+	if uiIsTTY(os.Stdout) && !c.JSON {
+		if n, err := legacyKeychainCount(ctx); err == nil && n > 0 {
+			fmt.Fprintf(os.Stderr, "note: %d legacy macOS Keychain secret(s) not yet migrated; run 'opq migrate'\n", n)
+		}
+	}
+	return nil
 }
 
 func (c *ListCmd) runWith(ctx context.Context, backend Backend, stdout, stderr io.Writer, stdoutIsTTY bool, now time.Time) error {

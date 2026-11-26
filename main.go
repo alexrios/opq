@@ -29,6 +29,7 @@ type CLI struct {
 	Exec       ExecCmd          `cmd:"" help:"Run a command with secrets injected as environment variables."`
 	Audit      AuditCmd         `cmd:"" help:"Show recent audit-log entries."`
 	Doctor     DoctorCmd        `cmd:"" help:"Check keyring, sandbox, audit log, and secret policy health."`
+	Migrate    MigrateCmd       `cmd:"" help:"Migrate legacy macOS Keychain secrets into the encrypted local vault."`
 	Completion CompletionCmd    `cmd:"" help:"Generate shell completion script for bash, zsh, or fish."`
 	MCP        MCPCmd           `cmd:"mcp" help:"Run as a Model Context Protocol server over stdio."`
 }

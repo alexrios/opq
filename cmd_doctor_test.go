@@ -900,3 +900,111 @@ func TestDoctor_DefaultDepsDisablesColorOnDumbTerm(t *testing.T) {
 		t.Error("defaultDoctorDeps().noColor = true with TERM=xterm-256color and unset NO_COLOR, want false")
 	}
 }
+
+func TestDoctor_VaultAndLegacyMigrationChecks(t *testing.T) {
+	t.Run("fresh vault is OK and read-only", func(t *testing.T) {
+		mb := newMemBackend(t)
+		deps, buf, root := newTestDoctorDeps(t, mb)
+		vDir := filepath.Join(root, "share", "opq")
+		deps.vaultDir = func() (string, error) { return vDir, nil }
+		deps.legacyCount = func(context.Context) (int, error) { return 0, nil }
+
+		if err := runDoctor(t.Context(), true, deps); err != nil {
+			t.Fatalf("runDoctor failed: %v", err)
+		}
+		var report doctorReport
+		if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+			t.Fatal(err)
+		}
+		vc := findDoctorCheck(t, report, "vault")
+		if vc.Status != doctorOK || !strings.Contains(vc.Summary, "(not created yet)") {
+			t.Errorf("unexpected fresh vault check: %+v", vc)
+		}
+		if _, err := os.Lstat(vDir); !os.IsNotExist(err) {
+			t.Errorf("doctor must not create vault dir, stat err = %v", err)
+		}
+	})
+
+	t.Run("legacy Keychain secrets trigger WARN with opq migrate remediation", func(t *testing.T) {
+		mb := newMemBackend(t)
+		deps, buf, root := newTestDoctorDeps(t, mb)
+		deps.vaultDir = func() (string, error) { return filepath.Join(root, "share", "opq"), nil }
+		deps.legacyCount = func(context.Context) (int, error) { return 4, nil }
+
+		if err := runDoctor(t.Context(), true, deps); err != nil {
+			t.Fatalf("WARN-only doctor must exit 0, got: %v", err)
+		}
+		var report doctorReport
+		if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+			t.Fatal(err)
+		}
+		if !report.Healthy {
+			t.Error("report.Healthy = false on WARN-only report, want true")
+		}
+		kr := findDoctorCheck(t, report, "keyring")
+		if kr.Status != doctorWarn || !strings.Contains(kr.Summary, "4 legacy Keychain secrets pending migration") {
+			t.Errorf("unexpected keyring check: %+v", kr)
+		}
+		if !strings.Contains(strings.Join(kr.Remediation, "\n"), "opq migrate") {
+			t.Errorf("expected 'opq migrate' remediation, got %+v", kr.Remediation)
+		}
+	})
+
+	t.Run("loose vault.enc permissions fail", func(t *testing.T) {
+		mb := newMemBackend(t)
+		deps, buf, root := newTestDoctorDeps(t, mb)
+		vDir := filepath.Join(root, "share", "opq")
+		if err := os.MkdirAll(vDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(vDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		vPath := filepath.Join(vDir, vaultFileName)
+		if err := os.WriteFile(vPath, []byte("enc"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(vPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		deps.vaultDir = func() (string, error) { return vDir, nil }
+
+		if err := runDoctor(t.Context(), true, deps); err == nil {
+			t.Fatal("expected error on 0644 vault.enc")
+		}
+		var report doctorReport
+		if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+			t.Fatal(err)
+		}
+		vc := findDoctorCheck(t, report, "vault")
+		if vc.Status != doctorFail || !strings.Contains(vc.Summary, "0644") {
+			t.Errorf("unexpected vault check: %+v", vc)
+		}
+	})
+
+	t.Run("symlink vault dir fails", func(t *testing.T) {
+		mb := newMemBackend(t)
+		deps, buf, root := newTestDoctorDeps(t, mb)
+		realDir := filepath.Join(root, "real-vault")
+		if err := os.MkdirAll(realDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := filepath.Join(root, "link-vault")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatal(err)
+		}
+		deps.vaultDir = func() (string, error) { return linkDir, nil }
+
+		if err := runDoctor(t.Context(), true, deps); err == nil {
+			t.Fatal("expected error on symlink vault dir")
+		}
+		var report doctorReport
+		if err := json.Unmarshal(buf.Bytes(), &report); err != nil {
+			t.Fatal(err)
+		}
+		vc := findDoctorCheck(t, report, "vault")
+		if vc.Status != doctorFail || !strings.Contains(vc.Summary, "symlink") {
+			t.Errorf("unexpected vault check: %+v", vc)
+		}
+	})
+}
