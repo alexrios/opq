@@ -115,10 +115,10 @@ servers, containers, WSL, and locked-down hosts.
 
 Because the single vault master key uses an open application ACL (matching Linux Secret
 Service's session model), upgrades via Homebrew and local rebuilds do not trigger repeated
-Keychain password prompts. If you previously stored secrets with an older release of `opq`
-(which saved one Keychain item per secret under service `opq`), run `opq migrate` once to
-move them—along with their TTL and revocation metadata—into the encrypted vault, then
-verify with `opq doctor` and optionally clean up with `opq migrate --delete-legacy`.
+Keychain password prompts. Secrets previously stored by an older release of `opq` remain
+visible in `opq list` and MCP `list_secrets` (via zero-prompt attribute queries) and
+**auto-migrate on first use** into `vault.enc` (and can also be migrated selectively with
+`opq migrate [name...]` or removed without prompts via `opq delete <name>`).
 
 ## Troubleshooting: the bubblewrap startup probe
 

@@ -4,7 +4,30 @@
 review closing confirmed exploits. This appendix records that history so the reasoning
 behind each control is preserved.
 
-## v1.5.0 (current)
+## v1.5.1 (current)
+
+Lazy on-demand macOS Keychain migration, selective `opq migrate [name...]`, and
+cross-binary zero-prompt legacy Keychain deletion.
+
+### Changes
+
+- **Lazy on-demand migration:** On macOS `keychain-vault`, `resolveSecret` (`opq exec`,
+  `opq get`, and MCP `run_with_secrets`) automatically migrates an unmigrated legacy
+  Keychain secret (value + companion `meta/<name>`) into `vault.enc` on its first use,
+  removes the legacy copy, and immediately enforces TTL and revocation policies. Unused or
+  expired legacy items never prompt upfront.
+- **Zero-prompt cross-binary legacy deletion:** Legacy Keychain deletions now use
+  `SecItemCopyMatching(kSecReturnRef)` + `SecKeychainItemDelete` instead of
+  `SecItemDelete`, avoiding `errSecInvalidOwnerEdit (-25244)` across binary upgrades and
+  allowing `opq migrate --delete-legacy`, `opq delete`, `opq revoke`, and `opq set` to
+  clean up legacy Keychain items without password prompts or secret resurrection.
+- **Seamless visibility & selective migration:**
+  - `opq list` (including `--status legacy`), `opq info`, and MCP `list_secrets` include
+    unmigrated legacy secrets using attribute-only queries (zero prompts; vault entries
+    and revoked tombstones always take precedence).
+  - `opq migrate [name...]` accepts optional secret names for selective migration.
+
+## v1.5.0
 
 macOS encrypted local vault (`keychain-vault`) with a single open-ACL Keychain master key
 to eliminate repeated macOS Keychain password prompts across upgrades, rebuilds, and agent

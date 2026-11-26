@@ -3,7 +3,7 @@
 [![Install with Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20alexrios%2Ftap%2Fopq-FBB040?logo=homebrew&logoColor=white)](https://github.com/alexrios/homebrew-tap)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-> **Status:** v1.5.0. Linux (Secret Service) and macOS (encrypted local vault + Keychain master key) supported.
+> **Status:** v1.5.1. Linux (Secret Service) and macOS (encrypted local vault + Keychain master key) supported.
 
 An **AI-safe secrets CLI**: stores secrets in your OS keyring and lets programs (and AI agents) use them with output redaction against accidental disclosure. Invoked as `opq`.
 
@@ -101,9 +101,9 @@ mise run docs        # build to docs/book/
 mise run docs:serve  # live-reload preview at http://localhost:3000
 ```
 
-## Upgrade to v1.5.0 (macOS)
+## Upgrade to v1.5.x (macOS)
 
-macOS now stores secrets in an AES-256-GCM encrypted local vault (`~/.local/share/opq/vault.enc`) keyed by a single open-ACL master key in the login Keychain (`opq-vault`), eliminating per-secret password prompts after upgrades and rebuilds. Stop running `opq mcp` servers, upgrade, run `opq migrate` to copy existing Keychain secrets (with TTL and revocation metadata preserved), verify with `opq list` and `opq doctor`, and then optionally run `opq migrate --delete-legacy`. See the [release and upgrade notes](https://alexrios.github.io/opq/appendix/version-history.html#v150-current).
+macOS now stores secrets in an AES-256-GCM encrypted local vault (`~/.local/share/opq/vault.enc`) keyed by a single open-ACL master key in the login Keychain (`opq-vault`), eliminating per-secret password prompts after upgrades and rebuilds. Existing legacy Keychain secrets remain visible in `opq list` and MCP `list_secrets` with zero prompts and **auto-migrate on first use** (`opq exec` / `run_with_secrets`), or can be migrated selectively via `opq migrate [name...]`. See the [release and upgrade notes](https://alexrios.github.io/opq/appendix/version-history.html#v151-current).
 
 ## Upgrade to v1.3.0
 
